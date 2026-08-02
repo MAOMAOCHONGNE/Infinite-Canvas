@@ -2494,6 +2494,7 @@ function canvasListUrlForProject(projectId){
 
 function addNode(node){
     if(!ensureCanvas()) return;
+    pushUndo();
     nodes.push(node);
     render();
     scheduleSave();

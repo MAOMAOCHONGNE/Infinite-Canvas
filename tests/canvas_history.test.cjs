@@ -92,3 +92,17 @@ test('normal and smart canvases load and route through the shared history module
         assert.match(source, /performRedo/);
     }
 });
+
+test('normal canvas records history before adding a node', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'static', 'js', 'canvas.js'), 'utf8');
+    const start = source.indexOf('function addNode(node)');
+    const end = source.indexOf('function defaultPoint', start);
+    const addNodeSource = source.slice(start, end);
+
+    assert.notEqual(start, -1, 'addNode must exist');
+    assert.match(addNodeSource, /pushUndo\(\);/);
+    assert.ok(
+        addNodeSource.indexOf('pushUndo();') < addNodeSource.indexOf('nodes.push(node)'),
+        'history must be recorded before the node array changes',
+    );
+});
