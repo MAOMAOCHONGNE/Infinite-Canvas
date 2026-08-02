@@ -106,3 +106,23 @@ test('normal canvas records history before adding a node', () => {
         'history must be recorded before the node array changes',
     );
 });
+
+test('normal canvas records history before moving a node', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'static', 'js', 'canvas.js'), 'utf8');
+    const start = source.indexOf('function onNodeDrag(e)');
+    const end = source.indexOf('function startNodeResize', start);
+    const moveSource = source.slice(start, end);
+
+    assert.match(moveSource, /pushUndo\(\);/);
+    assert.ok(moveSource.indexOf('pushUndo();') < moveSource.indexOf('dragNode.node.x ='));
+});
+
+test('normal canvas records history before resizing a node', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'static', 'js', 'canvas.js'), 'utf8');
+    const start = source.indexOf('function onNodeResize(e)');
+    const end = source.indexOf('function startLink', start);
+    const resizeSource = source.slice(start, end);
+
+    assert.match(resizeSource, /pushUndo\(\);/);
+    assert.ok(resizeSource.indexOf('pushUndo();') < resizeSource.indexOf('resizeNode.node.w ='));
+});

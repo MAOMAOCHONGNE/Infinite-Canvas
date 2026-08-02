@@ -14162,7 +14162,7 @@ function startNodeDrag(e, node){
         [...selected].forEach(id => collect(nodes.find(n => n.id === id)));
     }
     const children = [...collected.values()];
-    dragNode = {node: dragTarget, children, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y};
+    dragNode = {node: dragTarget, children, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y, historyCaptured:false};
     document.body.classList.add('canvas-node-drag');
     window.onmousemove = onNodeDrag;
     window.onmouseup = endDrag;
@@ -14171,6 +14171,10 @@ function onNodeDrag(e){
     if(!dragNode) return;
     const dx = (e.clientX - dragNode.sx) / viewport.scale;
     const dy = (e.clientY - dragNode.sy) / viewport.scale;
+    if(!dragNode.historyCaptured && (dx !== 0 || dy !== 0)){
+        pushUndo();
+        dragNode.historyCaptured = true;
+    }
     dragNode.node.x = dragNode.ox + dx;
     dragNode.node.y = dragNode.oy + dy;
     const el = nodesEl.querySelector(`.node[data-id="${dragNode.node.id}"]`);
@@ -14202,7 +14206,8 @@ function startNodeResize(e, node){
         sx:e.clientX,
         sy:e.clientY,
         sw:(rect?.width ? rect.width / viewport.scale : node.w || defaultNodeSize(node.type).w),
-        sh:(rect?.height ? rect.height / viewport.scale : node.h || defaultNodeSize(node.type).h || 160)
+        sh:(rect?.height ? rect.height / viewport.scale : node.h || defaultNodeSize(node.type).h || 160),
+        historyCaptured:false
     };
     document.body.classList.add('canvas-node-resize');
     window.onmousemove = onNodeResize;
@@ -14210,9 +14215,15 @@ function startNodeResize(e, node){
 }
 function onNodeResize(e){
     if(!resizeNode) return;
+    const dx = (e.clientX - resizeNode.sx) / viewport.scale;
+    const dy = (e.clientY - resizeNode.sy) / viewport.scale;
+    if(!resizeNode.historyCaptured && (dx !== 0 || dy !== 0)){
+        pushUndo();
+        resizeNode.historyCaptured = true;
+    }
     const min = defaultNodeSize(resizeNode.node.type);
-    const nextW = Math.max(Math.min(min.w, 220), resizeNode.sw + (e.clientX - resizeNode.sx) / viewport.scale);
-    const nextH = Math.max(96, resizeNode.sh + (e.clientY - resizeNode.sy) / viewport.scale);
+    const nextW = Math.max(Math.min(min.w, 220), resizeNode.sw + dx);
+    const nextH = Math.max(96, resizeNode.sh + dy);
     resizeNode.node.w = Math.round(nextW);
     resizeNode.node.h = Math.round(nextH);
     const el = nodesEl.querySelector(`.node[data-id="${resizeNode.node.id}"]`);
