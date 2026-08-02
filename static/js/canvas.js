@@ -454,7 +454,7 @@ let activeCanvasWorkflowCategoryId = '';
 const activeCanvasTaskPolls = new Set();
 let hoveredConnectionId = '';
 let lastMouseBoard = {x: 0, y: 0};
-let undoStack = [];
+let canvasHistory = null;
 const UNDO_MAX = 30;
 const cascadeRunningIds = new Set();
 const cascadeStopIds = new Set();
@@ -13770,19 +13770,37 @@ function connectSelectionToGenerator(kind, genId){
     syncGeneratorInputs();
 }
 
-function pushUndo(){
-    if(!canvas) return;
-    undoStack.push({nodes:JSON.parse(JSON.stringify(serializableCanvasNodes())), connections:JSON.parse(JSON.stringify(connections))});
-    if(undoStack.length > UNDO_MAX) undoStack.shift();
+function snapshotForHistory(){
+    return {nodes:JSON.parse(JSON.stringify(serializableCanvasNodes())), connections:JSON.parse(JSON.stringify(connections))};
 }
-function performUndo(){
-    if(!canvas || !undoStack.length) return;
-    const state = undoStack.pop();
+function restoreHistorySnapshot(state){
     nodes = state.nodes;
     connections = state.connections;
     selected.clear();
     render();
     scheduleSave();
+}
+function getCanvasHistory(){
+    if(!canvasHistory){
+        canvasHistory = window.CanvasHistory.createSnapshotHistory({
+            limit:UNDO_MAX,
+            capture:snapshotForHistory,
+            restore:restoreHistorySnapshot
+        });
+    }
+    return canvasHistory;
+}
+function pushUndo(){
+    if(!canvas) return;
+    getCanvasHistory().record();
+}
+function performUndo(){
+    if(!canvas) return;
+    getCanvasHistory().undo();
+}
+function performRedo(){
+    if(!canvas) return;
+    getCanvasHistory().redo();
 }
 function cloneNode(n, dx, dy){
     const copy = JSON.parse(JSON.stringify(serializableCanvasNode(n)));
@@ -15025,10 +15043,14 @@ window.addEventListener('keydown', e => {
             }, 90);
         }
     }
-    if((e.ctrlKey || e.metaKey) && key === 'z') {
+    const historyAction = window.CanvasHistory.historyShortcutAction(e);
+    if(historyAction) {
         const tag = document.activeElement?.tagName;
         if(tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement?.isContentEditable) return;
-        e.preventDefault(); performUndo();
+        e.preventDefault();
+        if(historyAction === 'redo') performRedo();
+        else performUndo();
+        return;
     }
     if(e.key === 'Delete' || e.key === 'Backspace') {
         const tag = document.activeElement?.tagName;

@@ -154,7 +154,6 @@ let lastNodePasteAt = 0;
 let suppressNodeClickUntil = 0;
 let textSelectionGuard = null;
 const UNDO_LIMIT = 40;
-const undoStack = [];
 let undoSuppressed = false;
 let pendingUndoSnapshot = null;
 let runningHubWorkflowCache = {};
@@ -185,8 +184,7 @@ function smartCascadePathForCtx(ctx=null){
 function capturePendingUndo(){ pendingUndoSnapshot = snapshotForUndo(); }
 function commitPendingUndo(){
     if(pendingUndoSnapshot){
-        undoStack.push(pendingUndoSnapshot);
-        if(undoStack.length > UNDO_LIMIT) undoStack.shift();
+        smartCanvasHistory.record(pendingUndoSnapshot);
         pendingUndoSnapshot = null;
     }
 }
@@ -200,27 +198,39 @@ function snapshotForUndo(){
         selectedImage: {...selectedImage}
     };
 }
+function restoreUndoSnapshot(snap){
+    undoSuppressed = true;
+    try {
+        nodes = snap.nodes;
+        if(canvas) canvas.connections = snap.connections;
+        selectedId = snap.selectedId;
+        selectedIds = snap.selectedIds;
+        selectedImage = snap.selectedImage;
+        activeComposerSubject = null;
+        lastComposerNodeId = '';
+        render();
+        scheduleSave();
+    } finally {
+        undoSuppressed = false;
+    }
+}
+const smartCanvasHistory = window.CanvasHistory.createSnapshotHistory({
+    limit:UNDO_LIMIT,
+    capture:snapshotForUndo,
+    restore:restoreUndoSnapshot
+});
 function pushUndo(){
     if(undoSuppressed) return;
     if(!canvas) return;
-    undoStack.push(snapshotForUndo());
-    if(undoStack.length > UNDO_LIMIT) undoStack.shift();
+    smartCanvasHistory.record();
 }
 function performUndo(){
-    if(!undoStack.length){ toast(tr('smart.toastNoUndo')); return; }
-    const snap = undoStack.pop();
-    undoSuppressed = true;
-    nodes = snap.nodes;
-    if(canvas) canvas.connections = snap.connections;
-    selectedId = snap.selectedId;
-    selectedIds = snap.selectedIds;
-    selectedImage = snap.selectedImage;
-    activeComposerSubject = null;
-    lastComposerNodeId = '';
-    render();
-    scheduleSave();
-    undoSuppressed = false;
+    if(!smartCanvasHistory.undo()){ toast(tr('smart.toastNoUndo')); return; }
     toast(tr('smart.toastUndone'));
+}
+function performRedo(){
+    if(!smartCanvasHistory.redo()){ toast(tr('smart.toastNoRedo')); return; }
+    toast(tr('smart.toastRedone'));
 }
 let comfyWorkflowCache = {};
 let cropState = null;
@@ -16312,9 +16322,11 @@ window.addEventListener('keydown', e => {
         closeImageEditor();
         return;
     }
-    if((e.ctrlKey || e.metaKey) && key === 'z' && !isEditableTarget(e.target)){
+    const historyAction = window.CanvasHistory.historyShortcutAction(e);
+    if(historyAction && !isEditableTarget(e.target)){
         e.preventDefault();
-        performUndo();
+        if(historyAction === 'redo') performRedo();
+        else performUndo();
         return;
     }
     if((e.key === 'Delete' || e.key === 'Backspace') && (selectedId || selectedIds.length) && !isEditableTarget(e.target)){
