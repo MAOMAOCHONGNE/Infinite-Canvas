@@ -6361,10 +6361,10 @@ function duplicateForAltDrag(node, preserveConnections=false){
         canvas.connections = nextConnections;
     }
     nodes.push(...copies);
-    selectedId = '';
-    selectedIds = [];
-    selectedImage = {nodeId:'', index:-1};
     const dragCopy = copies.find(c => c.id === idMap.get(node.id)) || copies[0];
+    selectedId = copies.length === 1 ? dragCopy.id : '';
+    selectedIds = copies.length > 1 ? copies.map(copy => copy.id) : [];
+    selectedImage = {nodeId:'', index:-1};
     render();
     scheduleSave();
     return dragCopy;
@@ -9905,7 +9905,12 @@ function bindNodeEvents(){
             if(document.activeElement?.blur) document.activeElement.blur();
             let node = nodes.find(n => n.id === id);
             if(!node) return;
-            if(e.altKey) node = duplicateForAltDrag(node, e.shiftKey);
+            let historyCaptured = false;
+            if(e.altKey){
+                const sourceId = node.id;
+                node = duplicateForAltDrag(node, e.shiftKey);
+                historyCaptured = node.id !== sourceId;
+            }
             let dragIds = selectedIds.includes(node.id) ? selectedIds.slice() : [node.id];
             if(isSmartGroupNode(node)){
                 const memberIds = smartGroupMembers(node).map(member => member.id);
@@ -9915,9 +9920,9 @@ function bindNodeEvents(){
                 const n = nodes.find(x => x.id === dragId);
                 return n ? {id:n.id, ox:Number(n.x) || 0, oy:Number(n.y) || 0} : null;
             }).filter(Boolean);
-            dragState = {id:node.id, startX:e.clientX, startY:e.clientY, ox:node.x || 0, oy:node.y || 0, group, groupIds:group.map(item => item.id), ctrlGroup:Boolean(e.ctrlKey)};
+            dragState = {id:node.id, startX:e.clientX, startY:e.clientY, ox:node.x || 0, oy:node.y || 0, group, groupIds:group.map(item => item.id), ctrlGroup:Boolean(e.ctrlKey), historyCaptured};
             document.body.classList.add('smart-node-drag');
-            capturePendingUndo();
+            if(!historyCaptured) capturePendingUndo();
         };
         el.querySelectorAll('.node-port').forEach(port => {
             port.addEventListener('mousedown', e => {
@@ -18008,7 +18013,7 @@ window.onmouseup = e => {
             stateChanged = true;
             render();
         }
-        if(stateChanged) commitPendingUndo();
+        if(stateChanged && !dragState.historyCaptured) commitPendingUndo();
         else discardPendingUndo();
         if(stateChanged || dragState.thumbDetached) suppressNodeClickUntil = Date.now() + 180;
         clearDropHighlight();

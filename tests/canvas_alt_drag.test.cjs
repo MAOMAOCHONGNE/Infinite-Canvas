@@ -102,3 +102,52 @@ test('classic canvas loads duplication helper and records one undo before Alt cl
     assert.match(dragSource, /duplicated\.selectedCopyIds\.forEach/);
     assert.match(dragSource, /historyCaptured:Boolean\(e\.altKey\)/);
 });
+
+test('smart canvas keeps every Alt-drag copy selected so the whole copy set moves', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'static', 'js', 'smart-canvas.js'), 'utf8');
+    const start = source.indexOf('function duplicateForAltDrag(node, preserveConnections=false)');
+    const end = source.indexOf('function shellPoint(event)', start);
+    const duplicateSource = source.slice(start, end);
+    const runFixture = new Function(`
+        let selectedId = '';
+        let selectedIds = ['a', 'b', 'c', 'd', 'e'];
+        let selectedImage = {nodeId:'', index:-1};
+        const nodes = selectedIds.map((id, index) => ({id, x:index * 100, y:index * 20}));
+        const canvas = {connections:[]};
+        const isNodeSelected = id => selectedId === id || selectedIds.includes(id);
+        const selectedNodeIds = () => selectedIds.length ? selectedIds.slice() : (selectedId ? [selectedId] : []);
+        const pushUndo = () => {};
+        const cloneSmartNode = node => ({...node, id:'copy-' + node.id});
+        const render = () => {};
+        const scheduleSave = () => {};
+        ${duplicateSource}
+        const anchor = duplicateForAltDrag(nodes[2]);
+        const dragIds = selectedIds.includes(anchor.id) ? selectedIds.slice() : [anchor.id];
+        const group = dragIds.map(id => nodes.find(node => node.id === id));
+        group.forEach(node => { node.x += 75; node.y += 40; });
+        return {anchorId:anchor.id, selectedId, selectedIds, groupIds:group.map(node => node.id), copies:nodes.slice(5)};
+    `);
+    const result = runFixture();
+
+    assert.equal(result.selectedId, '');
+    assert.equal(result.selectedIds.length, 5);
+    assert.deepEqual(result.groupIds, result.selectedIds);
+    assert.ok(result.selectedIds.includes(result.anchorId));
+    assert.deepEqual(result.copies.map(node => [node.x, node.y]), [
+        [75, 40], [175, 60], [275, 80], [375, 100], [475, 120]
+    ]);
+});
+
+test('smart Alt-drag records duplication and movement as one undo gesture', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'static', 'js', 'smart-canvas.js'), 'utf8');
+    const bindStart = source.indexOf('const beginNodeDrag = e =>');
+    const bindEnd = source.indexOf("el.querySelectorAll('.node-port')", bindStart);
+    const dragStartSource = source.slice(bindStart, bindEnd);
+    const mouseUpStart = source.indexOf('window.onmouseup = e =>');
+    const mouseUpEnd = source.indexOf("shell.addEventListener('wheel'", mouseUpStart);
+    const mouseUpSource = source.slice(mouseUpStart, mouseUpEnd);
+
+    assert.match(dragStartSource, /historyCaptured = node\.id !== sourceId/);
+    assert.match(dragStartSource, /if\(!historyCaptured\) capturePendingUndo\(\)/);
+    assert.match(mouseUpSource, /if\(stateChanged && !dragState\.historyCaptured\) commitPendingUndo\(\)/);
+});
