@@ -14798,44 +14798,24 @@ function cloneNode(n, dx, dy){
     return copy;
 }
 function duplicateNodesForAltDrag(node, preserveConnections=false){
-    const copy = cloneNode(node, 0, 0);
-    const sourceIds = new Set([node.id]);
-    const idMap = new Map([[node.id, copy.id]]);
-    const copies = [copy];
-    const isGroup = node.type === 'group' || node.type === 'promptGroup';
-    if(isGroup && node.items?.length){
-        const childCopies = node.items
-            .map(id => nodes.find(n => n.id === id))
-            .filter(Boolean)
-            .map(child => {
-                const childCopy = cloneNode(child, 0, 0);
-                sourceIds.add(child.id);
-                idMap.set(child.id, childCopy.id);
-                copies.push(childCopy);
-                return childCopy;
-            });
-        copy.items = copy.items.map(id => idMap.get(id) || id);
-        nodes.push(...childCopies, copy);
-    } else {
-        nodes.push(copy);
-    }
-    if(preserveConnections){
-        const copiedConnections = (connections || [])
-            .filter(conn => sourceIds.has(conn.to))
-            .map(conn => ({
-                ...conn,
-                id:uid('c'),
-                from:idMap.get(conn.from) || conn.from,
-                to:idMap.get(conn.to) || conn.to
-            }))
-            .filter(conn => conn.from && conn.to && conn.from !== conn.to);
-        copiedConnections.forEach(conn => {
-            if(canConnect(conn.from, conn.to) && !connections.some(c => c.from === conn.from && c.to === conn.to)){
-                connections.push(conn);
-            }
-        });
-    }
-    return copy;
+    const selectedIds = selected.has(node.id) ? [...selected] : [node.id];
+    const duplicated = window.CanvasDuplication.duplicateSelection({
+        nodes,
+        connections,
+        selectedIds,
+        anchorId:node.id,
+        preserveExternalIncoming:preserveConnections,
+        cloneNode:source => cloneNode(source, 0, 0),
+        createConnectionId:() => uid('c')
+    });
+    nodes.push(...duplicated.copies);
+    duplicated.copiedConnections.forEach(connection => {
+        if(canConnect(connection.from, connection.to)
+            && !connections.some(existing => existing.from === connection.from && existing.to === connection.to)){
+            connections.push(connection);
+        }
+    });
+    return duplicated;
 }
 function copySelectedNodes(){
     if(!canvas || !selected.size) return;
@@ -15121,14 +15101,14 @@ function startNodeDrag(e, node){
     let dragTarget = node;
     if(e.altKey){
         setKnifeMode(false);
-        const copy = duplicateNodesForAltDrag(node, e.shiftKey);
+        pushUndo();
+        const duplicated = duplicateNodesForAltDrag(node, e.shiftKey);
+        if(!duplicated.anchorCopy) return;
         selected.clear();
-        selected.add(copy.id);
-        dragTarget = copy;
-        if(e.shiftKey){
-            sanitizeConnections();
-            syncGeneratorInputs();
-        }
+        duplicated.selectedCopyIds.forEach(id => selected.add(id));
+        dragTarget = duplicated.anchorCopy;
+        sanitizeConnections();
+        syncGeneratorInputs();
         render();
     }
     const isGroup = dragTarget.type === 'group' || dragTarget.type === 'promptGroup';
@@ -15148,7 +15128,7 @@ function startNodeDrag(e, node){
         [...selected].forEach(id => collect(nodes.find(n => n.id === id)));
     }
     const children = [...collected.values()];
-    dragNode = {node: dragTarget, children, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y, historyCaptured:false};
+    dragNode = {node: dragTarget, children, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y, historyCaptured:Boolean(e.altKey)};
     document.body.classList.add('canvas-node-drag');
     window.onmousemove = onNodeDrag;
     window.onmouseup = endDrag;
