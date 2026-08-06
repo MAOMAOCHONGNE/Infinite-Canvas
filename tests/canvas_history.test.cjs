@@ -117,6 +117,19 @@ test('normal canvas records history before moving a node', () => {
     assert.ok(moveSource.indexOf('pushUndo();') < moveSource.indexOf('dragNode.node.x ='));
 });
 
+test('normal canvas releases editor focus before dragging or resizing a node', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'static', 'js', 'canvas.js'), 'utf8');
+    const dragStart = source.indexOf('function startNodeDrag(e, node)');
+    const dragEnd = source.indexOf('function onNodeDrag(e)', dragStart);
+    const resizeStart = source.indexOf('function startNodeResize(e, node)');
+    const resizeEnd = source.indexOf('function onNodeResize(e)', resizeStart);
+    const dragSource = source.slice(dragStart, dragEnd);
+    const resizeSource = source.slice(resizeStart, resizeEnd);
+
+    assert.match(dragSource, /document\.activeElement\.blur\(\)/);
+    assert.match(resizeSource, /document\.activeElement\.blur\(\)/);
+});
+
 test('normal canvas records history before resizing a node', () => {
     const source = fs.readFileSync(path.join(ROOT, 'static', 'js', 'canvas.js'), 'utf8');
     const start = source.indexOf('function onNodeResize(e)');

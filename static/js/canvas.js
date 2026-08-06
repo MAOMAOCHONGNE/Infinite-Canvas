@@ -15098,6 +15098,7 @@ function startNodeDrag(e, node){
     if(startKnifeDrag(e)) return;
     e.preventDefault();
     e.stopPropagation();
+    if(document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     let dragTarget = node;
     if(e.altKey){
         setKnifeMode(false);
@@ -15165,6 +15166,7 @@ function onNodeDrag(e){
 function startNodeResize(e, node){
     e.preventDefault();
     e.stopPropagation();
+    if(document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     const el = nodesEl.querySelector(`.node[data-id="${node.id}"]`);
     const rect = el?.getBoundingClientRect();
     resizeNode = {
