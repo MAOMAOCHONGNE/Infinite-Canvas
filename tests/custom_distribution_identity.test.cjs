@@ -43,15 +43,23 @@ test('backend updater exposes and accepts only the custom GitHub channel', () =>
     assert.doesNotMatch(updateEndpoint, /source_order\.append|other\s*=\s*"modelscope"/);
 });
 
-test('main page identifies qianse70 while retaining a visible original-author credit', () => {
+test('main page identifies qianse70 and keeps the upstream project link', () => {
     const html = fs.readFileSync(INDEX_PATH, 'utf8');
     const i18n = fs.readFileSync(COMMON_I18N_PATH, 'utf8');
     assert.match(html, /<title>qianse70 · Infinite Canvas<\/title>/);
     assert.match(html, /const PROJECT_URL = 'https:\/\/github\.com\/MAOMAOCHONGNE\/Infinite-Canvas'/);
     assert.match(html, /<div class="author-name-lite">qianse70<\/div>/);
-    assert.match(html, /class="author-credit-lite"[^]*href="https:\/\/github\.com\/hero8152\/Infinite-Canvas"[^]*原作者：wuli大雄/);
-    assert.match(i18n, /"common\.project":\s*\{\s*zh:\s*"定制版主页",\s*en:\s*"Custom Project"\s*\}/);
+    assert.match(html, /class="author-credit-lite"[^]*href="https:\/\/github\.com\/hero8152\/Infinite-Canvas"[^]*>基于 Infinite Canvas<\/a>/);
+    assert.doesNotMatch(html, /原作者：wuli大雄/);
+    assert.match(i18n, /"common\.project":\s*\{\s*zh:\s*"浅色主页",\s*en:\s*"Qianse Home"\s*\}/);
     assert.doesNotMatch(html, /space\.bilibili\.com\/78652351|xiaohongshu\.com\/user\/profile\/6433c34c|youtube\.com\/@[^"']*dx|x\.com\/dx8152/);
+});
+
+test('Infinite Canvas navigation keeps its four-square shape with a vivid gradient', () => {
+    const html = fs.readFileSync(INDEX_PATH, 'utf8');
+    assert.match(html, /class="nav-item canvas-nav-item"[^]*?<linearGradient id="canvas-nav-gradient"/);
+    assert.match(html, /stop-color="#ec00ff"[^]*stop-color="#7c00ff"[^]*stop-color="#0057ff"/);
+    assert.equal((html.match(/<rect x="(?:3|14)" y="(?:3|14)" width="7" height="7"><\/rect>/g) || []).length, 4);
 });
 
 test('browser update flow has no ModelScope selector or automatic fallback', () => {
@@ -67,11 +75,11 @@ test('browser update flow has no ModelScope selector or automatic fallback', () 
 
 test('custom version and update notes form one release identity', () => {
     const version = read('VERSION').trim();
-    const notes = read(path.join('static', 'update-notes.json'));
+    const notes = JSON.parse(read(path.join('static', 'update-notes.json')));
     const main = fs.readFileSync(MAIN_PATH, 'utf8');
-    assert.equal(version, '2026.08.12-custom.1');
-    assert.match(notes, /"version"\s*:\s*"2026\.08\.12-custom\.1"/);
-    assert.match(notes, /qianse70/);
+    assert.match(version, /^\d{4}\.\d{2}\.\d{2}-custom\.\d+$/);
+    assert.equal(notes.version, version);
+    assert.deepEqual(notes.items, [{ type: 'fix', text: '优化bug' }]);
     assert.match(main, /"edition":\s*CUSTOM_MAINTAINER/);
     assert.match(main, /"update_channel":\s*CUSTOM_UPDATE_BRANCH/);
     assert.match(main, /"upstream_repo_url":\s*UPSTREAM_REPO_URL/);

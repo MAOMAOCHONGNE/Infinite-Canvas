@@ -1,18 +1,10 @@
 {
-  "version": "2026.08.12-custom.1",
+  "version": "2026.08.12-custom.2",
   "updated_at": "2026-08-12T00:00:00+08:00",
   "items": [
     {
-      "type": "custom",
-      "text": "建立 qianse70 定制版身份，并保留原作者 wuli大雄及上游项目署名。"
-    },
-    {
-      "type": "safety",
-      "text": "版本检测和一键更新只使用 MAOMAOCHONGNE/Infinite-Canvas 的 my-custom 分支，不再回退到原作者更新源。"
-    },
-    {
-      "type": "privacy",
-      "text": "增加本地 API、画布、素材、历史记录和生成文件的 GitHub 发布忽略规则。"
+      "type": "fix",
+      "text": "优化bug"
     }
   ]
 }

@@ -27,6 +27,8 @@ import math
 import shlex
 import functools
 import html
+import ipaddress
+import socket
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
@@ -2022,7 +2024,16 @@ def update_allowed_file(path: str) -> bool:
     path = str(path or "").replace("\\", "/").lstrip("/")
     if not path or any(part in {"", ".", ".."} for part in path.split("/")):
         return False
-    return path in {"main.py", "VERSION"} or path.startswith("static/")
+    root_files = {
+        "main.py",
+        "VERSION",
+        "README.md",
+        "新手运行与使用教程.md",
+        "启动服务.bat",
+        "停止服务.bat",
+        "stop-infinite-canvas.ps1",
+    }
+    return path in root_files or path.startswith("static/")
 
 # 缓存 GitHub Tree API 响应（含 ETag），减少 60 次/h 限流压力
 GITHUB_TREE_CACHE: Dict[str, Any] = {"etag": "", "data": None, "expires_at": 0.0}
@@ -20086,8 +20097,76 @@ def run_workflow(name: str, payload: WorkflowRunRequest):
     )
     return generate(req)
 
+def get_preferred_lan_ipv4() -> Optional[str]:
+    """Return a likely user-facing LAN IPv4 address without network traffic."""
+    candidates: List[str] = []
+    try:
+        address_info = socket.getaddrinfo(
+            socket.gethostname(),
+            None,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+        )
+        candidates.extend(item[4][0] for item in address_info)
+    except OSError:
+        pass
+
+    unique_candidates: List[ipaddress.IPv4Address] = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            address = ipaddress.IPv4Address(candidate)
+        except ipaddress.AddressValueError:
+            continue
+        if (
+            address in seen
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_unspecified
+        ):
+            continue
+        seen.add(address)
+        unique_candidates.append(address)
+
+    # Home/office networks most commonly use these RFC1918 ranges. Prefer
+    # 192.168/16 and 10/8 over 172.16/12 because Hyper-V/WSL often creates
+    # extra 172.x adapters that nearby devices cannot reach.
+    preferred_ranges = (
+        ipaddress.IPv4Network("192.168.0.0/16"),
+        ipaddress.IPv4Network("10.0.0.0/8"),
+        ipaddress.IPv4Network("172.16.0.0/12"),
+    )
+    for network in preferred_ranges:
+        for address in unique_candidates:
+            if address in network:
+                return str(address)
+    return str(unique_candidates[0]) if unique_candidates else None
+
+
+def print_access_urls(lan_ipv4: Optional[str], port: int = 3000) -> None:
+    lines = [f"Visit: http://127.0.0.1:{port}/"]
+    if lan_ipv4:
+        lines.append(f"   LAN: http://{lan_ipv4}:{port}/")
+    else:
+        lines.append("   LAN: No active LAN IPv4 address detected.")
+
+    color_prefix = ""
+    color_suffix = ""
+    if sys.stdout.isatty():
+        try:
+            from colorama import Fore, Style, just_fix_windows_console
+            just_fix_windows_console()
+            color_prefix = Fore.LIGHTMAGENTA_EX
+            color_suffix = Style.RESET_ALL
+        except (ImportError, AttributeError):
+            pass
+    print(color_prefix + "\n".join(lines) + color_suffix, flush=True)
+
+
 if __name__ == "__main__":
     import uvicorn
+    lan_ipv4 = get_preferred_lan_ipv4()
+    print_access_urls(lan_ipv4)
     # 关闭服务端协议级 WebSocket ping：部分客户端（如 PS UXP 面板）不会自动回 pong，
     # 默认 20s ping/20s 超时会把这些连接每隔一会儿就踢掉造成"频繁断连"。
     # 客户端有自己的应用层心跳 + 断线重连兜底，这里禁用协议 ping 更稳。
