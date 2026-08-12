@@ -1,11 +1,3 @@
-# qianse70 · Infinite Canvas 定制版
-
-本仓库由 **qianse70** 维护，更新通道为 `MAOMAOCHONGNE/Infinite-Canvas` 的 `my-custom` 分支。
-
-本项目基于 [hero8152/Infinite-Canvas](https://github.com/hero8152/Infinite-Canvas) 二次开发，原作者：**wuli大雄**。本定制版继续遵守仓库中的 LICENSE：保持开源、注明来源作者，商业使用需取得原作者授权。
-
-## 上游项目说明
-
 Supports comfyui/API calls/modelscope calls
 
 配套的chrome采集插件已经上线：https://chromewebstore.google.com/detail/infinite-canvas-%E5%9B%BE%E5%83%8F%E8%A7%86%E9%A2%91%E6%96%87%E5%AD%97%E6%8A%93%E5%8F%96%E5%B7%A5/ajfhnbklbmpfaaookhfakohabnpmlcic?authuser=0&hl=en
