@@ -69,8 +69,8 @@ test('custom version and update notes form one release identity', () => {
     const version = read('VERSION').trim();
     const notes = read(path.join('static', 'update-notes.json'));
     const main = fs.readFileSync(MAIN_PATH, 'utf8');
-    assert.equal(version, '2026.08.09-custom.1');
-    assert.match(notes, /"version"\s*:\s*"2026\.08\.09-custom\.1"/);
+    assert.equal(version, '2026.08.12-custom.1');
+    assert.match(notes, /"version"\s*:\s*"2026\.08\.12-custom\.1"/);
     assert.match(notes, /qianse70/);
     assert.match(main, /"edition":\s*CUSTOM_MAINTAINER/);
     assert.match(main, /"update_channel":\s*CUSTOM_UPDATE_BRANCH/);
