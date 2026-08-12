@@ -445,7 +445,7 @@ function unique(values){
 }
 function normalizeRhEntries(values, kind){
     const seen = new Set();
-    return (Array.isArray(values) ? values : []).map(raw => {
+    return (Array.isArray(values) ? values : []).map((raw, sourceIndex) => {
         const parsed = parseRunningHubRunRef(raw?.appId || raw?.workflowId || raw?.id || '');
         const id = String(parsed?.id || raw?.id || raw?.appId || raw?.workflowId || '').trim();
         if(!id || seen.has(id)) return null;
@@ -456,7 +456,8 @@ function normalizeRhEntries(values, kind){
             title:String(raw?.title || raw?.name || fallback).trim(),
             note:String(raw?.note || raw?.description || '').trim(),
             thumbnail:String(raw?.thumbnail || '').trim(),
-            enabled:raw?.enabled !== false
+            enabled:raw?.enabled !== false,
+            sortOrder:Number.isFinite(Number(raw?.sortOrder ?? raw?.sort_order)) ? Math.max(0, Math.trunc(Number(raw.sortOrder ?? raw.sort_order))) : sourceIndex
         };
         if(raw?.hidden === true) entry.hidden = true;
         if(Array.isArray(raw?.fields)) entry.fields = raw.fields.map(normalizeRhWorkflowField);
@@ -470,7 +471,13 @@ function normalizeRhEntries(values, kind){
             entry.optionalImageMode = String(raw?.optionalImageMode || 'prune-workflow');
         }
         return entry;
-    }).filter(Boolean);
+    }).filter(Boolean).sort((a, b) => a.sortOrder - b.sortOrder);
+}
+
+function assignRhEntrySortOrders(entries){
+    const transfer = window.RunningHubConfigTransfer;
+    if(transfer?.assignOrders) return transfer.assignOrders(entries || []);
+    return (entries || []).map((entry, index) => ({...entry, sortOrder:index}));
 }
 function parseRunningHubRunRef(value){
     const text = String(value || '').trim();
@@ -905,6 +912,7 @@ async function createRhEntryFromPaste(){
             enabled:true
         });
     }
+    item[listKey] = assignRhEntrySortOrders(item[listKey]);
     if(rhPasteInput) rhPasteInput.value = '';
     renderRunningHubCards();
     setStatus(exists ? '这个 RunningHub 项目已经存在' : '已创建 RunningHub 卡片，正在保存...');
@@ -948,6 +956,7 @@ async function removeRhEntry(kind, index){
     } else {
         item[listKey].splice(index, 1);
     }
+    item[listKey] = assignRhEntrySortOrders(item[listKey]);
     renderRunningHubCards();
     setStatus('已删除，正在保存...');
     if(kind === 'workflow' && entryId){
@@ -1011,6 +1020,198 @@ function pickRhThumbnail(kind, index){
         }
     };
     input.click();
+}
+
+function rhTransferApi(){
+    const api = window.RunningHubConfigTransfer;
+    if(!api) throw new Error('RunningHub 配置工具未加载，请刷新页面后重试');
+    return api;
+}
+
+function rhDownloadJson(payload, filename){
+    const blob = new Blob([JSON.stringify(payload, null, 2) + '\n'], {type:'application/json;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function rhExportFilename(label){
+    const safe = String(label || 'runninghub-config').trim().replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, '-').slice(0, 80) || 'runninghub-config';
+    const date = new Date().toISOString().slice(0, 10);
+    return `${safe}-${date}.json`;
+}
+
+function exportRunningHubConfig(kind='', index=-1){
+    const item = provider();
+    if(!item || item.id !== 'runninghub') return;
+    ensureRunningHubLists(item);
+    try {
+        const api = rhTransferApi();
+        let apps = item.rh_apps.filter(entry => entry?.hidden !== true);
+        let workflows = item.rh_workflows.filter(entry => entry?.hidden !== true);
+        let scope = 'all';
+        let label = 'RunningHub-全部配置';
+        if(kind === 'app'){
+            const entry = item.rh_apps[index];
+            if(!entry) throw new Error('找不到要导出的 AI 应用');
+            apps = [entry];
+            workflows = [];
+            scope = 'single';
+            label = entry.title || `AI应用-${entry.id}`;
+        } else if(kind === 'workflow'){
+            const entry = item.rh_workflows[index];
+            if(!entry) throw new Error('找不到要导出的工作流');
+            apps = [];
+            workflows = [entry];
+            scope = 'single';
+            label = entry.title || `工作流-${entry.id}`;
+        }
+        const payload = api.buildExport({apps, workflows, scope});
+        rhDownloadJson(payload, rhExportFilename(label));
+        setStatus(`已导出 ${payload.apps.length} 个 AI 应用、${payload.workflows.length} 个工作流（不含 Key 和缩略图）`);
+    } catch(err) {
+        alert(err.message || '导出失败');
+    }
+}
+
+async function saveImportedRunningHubWorkflows(workflows){
+    const failures = [];
+    for(const config of workflows || []){
+        try {
+            const res = await fetch(`/api/runninghub/workflows/${encodeURIComponent(config.workflowId || config.id)}`, {
+                method:'PUT',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({
+                    workflowId:config.workflowId || config.id,
+                    title:config.title,
+                    description:config.note || '',
+                    fields:(config.fields || []).map(normalizeRhWorkflowField),
+                    workflowJson:config.workflowJson || {},
+                    optionalImageMode:config.optionalImageMode || 'prune-workflow',
+                    raw:{}
+                })
+            });
+            const data = await res.json();
+            if(!res.ok || data.success === false) throw new Error(data.detail || '保存失败');
+        } catch(err) {
+            failures.push(`${config.title || config.id}: ${err.message || '保存失败'}`);
+        }
+    }
+    return failures;
+}
+
+function importRunningHubConfig(){
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.onchange = async () => {
+        const file = input.files?.[0];
+        if(!file) return;
+        if(file.size > 10 * 1024 * 1024){
+            alert('配置文件超过 10MB，已拒绝导入');
+            return;
+        }
+        const item = provider();
+        if(!item || item.id !== 'runninghub') return;
+        ensureRunningHubLists(item);
+        try {
+            const api = rhTransferApi();
+            const imported = api.parseImport(await file.text());
+            const appIds = new Set(item.rh_apps.map(entry => String(entry.id || entry.appId || '')));
+            const workflowIds = new Set(item.rh_workflows.map(entry => String(entry.id || entry.workflowId || '')));
+            const conflictCount = imported.apps.filter(entry => appIds.has(entry.id)).length
+                + imported.workflows.filter(entry => workflowIds.has(entry.id)).length;
+            const overwrite = conflictCount
+                ? confirm(`发现 ${conflictCount} 个相同 ID。\n\n点击“确定”：用导入配置覆盖同 ID 项目。\n点击“取消”：保留现有项目，只导入新的项目。`)
+                : false;
+            const merged = api.mergeConfig(
+                {apps:item.rh_apps, workflows:item.rh_workflows},
+                imported,
+                {overwrite}
+            );
+            item.rh_apps = merged.apps.entries;
+            item.rh_workflows = merged.workflows.entries;
+            const changedWorkflowIds = new Set(merged.workflows.changedIds);
+            const workflowsToPersist = item.rh_workflows.filter(entry => changedWorkflowIds.has(String(entry.workflowId || entry.id || '')));
+            renderRunningHubCards();
+            setStatus('正在导入并保存 RunningHub 配置...');
+            const saved = await saveProviders();
+            if(!saved) throw new Error('卡片配置保存失败');
+            const failures = await saveImportedRunningHubWorkflows(workflowsToPersist);
+            const importedCount = merged.apps.changedIds.length + merged.workflows.changedIds.length;
+            const skippedCount = merged.apps.skippedIds.length + merged.workflows.skippedIds.length;
+            if(failures.length){
+                alert(`卡片已导入，但 ${failures.length} 个工作流主数据保存失败：\n${failures.join('\n')}`);
+                setStatus(`已导入 ${importedCount} 项，${failures.length} 个工作流主数据保存失败`);
+            } else {
+                setStatus(`导入完成：${importedCount} 项，跳过 ${skippedCount} 项`);
+            }
+            broadcastStudioApiChange('providers-changed');
+        } catch(err) {
+            alert(err.message || '导入失败');
+            setStatus(err.message || '导入失败');
+            renderEditor();
+        }
+    };
+    input.click();
+}
+
+let rhEntryDragState = null;
+
+function clearRhEntryDragMarkers(){
+    document.querySelectorAll('.rh-config-card.rh-dragging, .rh-config-card.rh-drag-before, .rh-config-card.rh-drag-after').forEach(card => {
+        card.classList.remove('rh-dragging', 'rh-drag-before', 'rh-drag-after');
+    });
+}
+
+function startRhEntryDrag(event, kind, index){
+    rhEntryDragState = {kind, index};
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', `${kind}:${index}`);
+    event.currentTarget?.closest('.rh-config-card')?.classList.add('rh-dragging');
+}
+
+function overRhEntryDrag(event, kind, index){
+    if(!rhEntryDragState || rhEntryDragState.kind !== kind) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    const card = event.currentTarget;
+    document.querySelectorAll('.rh-config-card.rh-drag-before, .rh-config-card.rh-drag-after').forEach(node => {
+        if(node !== card) node.classList.remove('rh-drag-before', 'rh-drag-after');
+    });
+    const after = event.clientY > card.getBoundingClientRect().top + card.getBoundingClientRect().height / 2;
+    card.classList.toggle('rh-drag-before', !after);
+    card.classList.toggle('rh-drag-after', after);
+}
+
+async function dropRhEntryDrag(event, kind, targetIndex){
+    event.preventDefault();
+    const state = rhEntryDragState;
+    if(!state || state.kind !== kind){ clearRhEntryDragMarkers(); return; }
+    const item = provider();
+    if(!item || item.id !== 'runninghub'){ clearRhEntryDragMarkers(); return; }
+    const listKey = kind === 'app' ? 'rh_apps' : 'rh_workflows';
+    const after = event.currentTarget?.classList.contains('rh-drag-after') === true;
+    try {
+        item[listKey] = rhTransferApi().reorderEntries(item[listKey], state.index, targetIndex, after);
+        renderRunningHubCards();
+        setStatus('顺序已调整，正在保存...');
+        const ok = await saveProviders();
+        setStatus(ok ? '顺序已保存' : '顺序调整完成，但自动保存失败');
+    } finally {
+        rhEntryDragState = null;
+        clearRhEntryDragMarkers();
+    }
+}
+
+function endRhEntryDrag(){
+    rhEntryDragState = null;
+    clearRhEntryDragMarkers();
 }
 async function openRhWorkflowEditor(index){
     const item = provider();
@@ -2159,7 +2360,7 @@ function renderRhEntryList(target, list, kind){
         return;
     }
     target.innerHTML = list.map((entry, index) => `
-        <div class="rh-config-card">
+        <div class="rh-config-card" ondragover="overRhEntryDrag(event,'${kind}',${entry._rhIndex ?? index})" ondrop="dropRhEntryDrag(event,'${kind}',${entry._rhIndex ?? index})">
             <button class="rh-thumb" type="button" onclick="pickRhThumbnail('${kind}', ${entry._rhIndex ?? index})" title="上传缩略图">
                 ${renderRhEntryThumbnail(kind, entry)}
             </button>
@@ -2172,6 +2373,8 @@ function renderRhEntryList(target, list, kind){
                 <textarea oninput="updateRhEntry('${kind}', ${entry._rhIndex ?? index}, 'note', this.value)" placeholder="备注、用途、参数说明">${escapeHtml(entry.note || '')}</textarea>
             </div>
             <div class="rh-card-actions">
+                <button class="rh-card-action rh-drag-handle" type="button" draggable="true" ondragstart="startRhEntryDrag(event,'${kind}',${entry._rhIndex ?? index})" ondragend="endRhEntryDrag()" title="拖动排序"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></button>
+                <button class="rh-card-action" type="button" onclick="exportRunningHubConfig('${kind}', ${entry._rhIndex ?? index})" title="导出这个配置"><i data-lucide="download" class="w-3.5 h-3.5"></i></button>
                 ${kind === 'workflow'
                     ? `<button class="rh-card-action" type="button" onclick="openRhWorkflowEditor(${entry._rhIndex ?? index})" title="编辑工作流"><i data-lucide="settings-2" class="w-3.5 h-3.5"></i></button>`
                     : `<button class="rh-card-action" type="button" onclick="openRhAppEditor(${entry._rhIndex ?? index})" title="编辑应用参数"><i data-lucide="settings-2" class="w-3.5 h-3.5"></i></button>`}

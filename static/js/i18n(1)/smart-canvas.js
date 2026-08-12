@@ -28,6 +28,7 @@
         "smart.tplAdd": { zh: "新增", en: "Add" },
         "smart.tplDone": { zh: "完成", en: "Done" },
         "smart.tplRename": { zh: "重命名", en: "Rename" },
+        "smart.tplDragSort": { zh: "拖动排序", en: "Drag to reorder" },
         "smart.tplSaveCurrent": { zh: "存当前", en: "Save current" },
         "smart.tplNewTemplate": { zh: "新模板", en: "New template" },
         "smart.tplNewTemplateName": { zh: "新模板", en: "New template" },

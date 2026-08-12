@@ -301,6 +301,8 @@ const outputCompareResult = document.getElementById('outputCompareResult');
 const outputCompareOriginal = document.getElementById('outputCompareOriginal');
 const outputCompareOriginalWrap = document.getElementById('outputCompareOriginalWrap');
 const outputCompareSlider = document.getElementById('outputCompareSlider');
+const outputCompareFillBtn = document.getElementById('outputCompareFillBtn');
+const outputCompareDefaultBtn = document.getElementById('outputCompareDefaultBtn');
 const outputResolution = document.getElementById('outputResolution');
 const outputDownloadBtn = document.getElementById('outputDownloadBtn');
 const outputDownloadAllBtn = document.getElementById('outputDownloadAllBtn');
@@ -323,9 +325,13 @@ const canvasAssetLibrarySelect = document.getElementById('canvasAssetLibrarySele
 const canvasAssetCategorySelect = document.getElementById('canvasAssetCategorySelect');
 const canvasAssetAddCategoryBtn = document.getElementById('canvasAssetAddCategoryBtn');
 const canvasAssetDropZone = document.getElementById('canvasAssetDropZone');
+const canvasAssetStatus = document.getElementById('canvasAssetStatus');
 const canvasAssetGrid = document.getElementById('canvasAssetGrid');
 const canvasAssetHoverPreview = document.getElementById('canvasAssetHoverPreview');
 const workflowTransferToggle = document.getElementById('workflowTransferToggle');
+const canvasShortcutToggle = document.getElementById('canvasShortcutToggle');
+const canvasShortcutModal = document.getElementById('canvasShortcutModal');
+const canvasShortcutList = document.getElementById('canvasShortcutList');
 const canvasLogToggle = document.getElementById('canvasLogToggle');
 const workflowTransferModal = document.getElementById('workflowTransferModal');
 const workflowTransferSub = document.getElementById('workflowTransferSub');
@@ -345,6 +351,16 @@ function revealCanvasAssetControls(){
 revealCanvasAssetControls();
 const logModal = document.getElementById('logModal');
 const logList = document.getElementById('logList');
+const canvasShortcutController = window.CanvasShortcutsHelp?.mountShortcutHelp({
+    modal:canvasShortcutModal,
+    toggle:canvasShortcutToggle,
+    list:canvasShortcutList,
+    profile:'classic',
+    keyboardTarget:window,
+    onOpen:refreshIcons,
+});
+function openCanvasShortcuts(){ canvasShortcutController?.open(); }
+function closeCanvasShortcuts(){ canvasShortcutController?.close(); }
 const errorModal = document.getElementById('errorModal');
 const errorTitle = document.getElementById('errorTitle');
 const errorMessage = document.getElementById('errorMessage');
@@ -363,6 +379,7 @@ let linksRenderQueued = false;
 let zoomPreviewState = null;
 let resizeNode = null;
 let llmPaneDrag = null;
+let promptSplitResize = null;
 let tempLink = null;
 let knifeActive = false;
 let knifePoint = null;
@@ -375,6 +392,11 @@ let menuPoint = null;
 let linkCreateState = null;
 let internalDrag = false;
 let selected = new Set();
+const SpatialFrames = window.CanvasSpatialFrames;
+function isCanvasFrameNode(node){ return Boolean(SpatialFrames?.isFrameNode(node)); }
+function canvasNodeElement(id){
+    return nodesEl?.querySelector?.(`[data-id="${CSS.escape(String(id || ''))}"]`) || null;
+}
 let saveTimer = null;
 let creatingCanvas = false;
 let createCanvasKind = 'classic';
@@ -383,12 +405,20 @@ let pendingDeleteCanvasId = null;
 let pendingPurgeCanvasId = null;
 let emojiPickerCanvasId = null;
 let canvasMetaAnchorId = '';
+let canvasTaskRuntimeId = '';
+const canvasLLMSubmissionPromises = new Set();
 let canvasSortMode = (() => { try { return localStorage.getItem('canvasSortMode') || 'recent'; } catch(e){ return 'recent'; } })();
 const CANVAS_LIST_PROJECT_KEY = 'canvasListCurrentProjectId';
 const CANVAS_COLOR_OPTIONS = ['red','orange','amber','green','teal','blue','violet','pink','slate'];
 // 先绑定返回，避免编辑器后续初始化较慢时丢失来源项目。
-backToManagerBtn?.addEventListener('click', () => {
+backToManagerBtn?.addEventListener('click', async () => {
+    await waitForCanvasLLMSubmissions();
     window.location.href = canvasListUrlForProject(canvas?.project || requestedCanvasListProject() || rememberedCanvasListProject());
+});
+window.addEventListener('beforeunload', event => {
+    if(!canvasLLMSubmissionPromises.size) return;
+    event.preventDefault();
+    event.returnValue = '';
 });
 let localCanvasDirty = false;
 let savingCanvasNow = false;
@@ -424,6 +454,7 @@ let outputPreviewZoom = 1;
 let outputPreviewPan = {x: 0, y: 0};
 let outputPreviewPanDrag = null;
 let currentOutputCompareUrl = '';
+let outputCompareDisplayMode = 'default';
 let currentOutputMeta = null;
 let currentOutputLightboxOutId = '';
 let currentOutputLightboxUrl = '';
@@ -459,6 +490,7 @@ let managerSelectedPromptIds = new Set();
 let activeCanvasWorkflowCategoryId = '';
 const activeCanvasTaskPolls = new Set();
 let hoveredConnectionId = '';
+let classicCascadePreview = null;
 let lastMouseBoard = {x: 0, y: 0};
 let canvasHistory = null;
 const UNDO_MAX = 30;
@@ -470,6 +502,10 @@ let cropState = null;
 let cropDrag = null;
 let cropAspectPreset = 'free';
 let cropAspectRatio = null;
+const DEFAULT_OUTPAINT_BACKGROUND = '#808080';
+let outpaintAspectPreset = 'free';
+let outpaintAspectRatio = null;
+let outpaintBackgroundColor = DEFAULT_OUTPAINT_BACKGROUND;
 let imageEditMode = 'crop';
 let imageEditModeTouched = false;
 let imageResizeScale = 0.5;
@@ -510,11 +546,14 @@ function renderCanvasIcon(icon, size = 14) {
     return `<i data-lucide="${escapeHtml(icon)}" style="width:${size}px;height:${size}px"></i>`;
 }
 
+const ADAPTIVE_RATIO_TOOLS = window.AdaptiveImageRatio || null;
 const SIZE_MAP = {
     square: { '1k':'1024x1024', '2k':'2048x2048', '4k':'4096x4096' },
     portrait: { '1k':'1024x1536', '2k':'1360x2048', '4k':'2352x3520' },
     portrait43: { '1k':'1008x1344', '2k':'1536x2048', '4k':'2448x3264' },
     landscape43: { '1k':'1344x1008', '2k':'2048x1536', '4k':'3264x2448' },
+    portrait45: { '1k':'1024x1280', '2k':'1600x2000', '4k':'2560x3200' },
+    landscape54: { '1k':'1280x1024', '2k':'2000x1600', '4k':'3200x2560' },
     landscape: { '1k':'1536x1024', '2k':'2048x1360', '4k':'3520x2352' },
     story: { '1k':'720x1280', '2k':'1152x2048', '4k':'2160x3840' },
     wide: { '1k':'1280x720', '2k':'2048x1152', '4k':'3840x2160' },
@@ -527,6 +566,8 @@ const API_RATIO_VALUES = {
     landscape:'3:2',
     portrait43:'3:4',
     landscape43:'4:3',
+    portrait45:'4:5',
+    landscape54:'5:4',
     story:'9:16',
     wide:'16:9',
     ultrawide:'21:9',
@@ -825,6 +866,41 @@ function isGptImageAutoSizeModel(model){
 function defaultApiImageResolution(model){
     return isGptImageAutoSizeModel(resolveImageModel(model)) ? '4k' : '1k';
 }
+function defaultClassicApiGeneratorResolution(model){
+    return isGptImageAutoSizeModel(resolveImageModel(model)) ? '2k' : defaultApiImageResolution(model);
+}
+function classicApiQualityOptionsHtml(){
+    return `
+        <option value="auto">自动</option>
+        <option value="low">低</option>
+        <option value="medium">中</option>
+        <option value="high">高</option>
+    `;
+}
+function normalizeClassicApiCount(value, fallback=1){
+    const fallbackNumber = Number(fallback);
+    const safeFallback = Number.isFinite(fallbackNumber)
+        ? Math.max(1, Math.min(10, Math.trunc(fallbackNumber)))
+        : 1;
+    const number = Number(value);
+    if(!Number.isFinite(number)) return safeFallback;
+    return Math.max(1, Math.min(10, Math.trunc(number)));
+}
+function classicApiCountControlHtml(node){
+    const count = normalizeClassicApiCount(node?.count);
+    const options = [1, 2, 4, 9]
+        .map(value => `<option value="${value}">${value}张</option>`)
+        .join('');
+    return `
+        <div class="gen-count-row editable-count select-lite">
+            <input class="gen-count-input" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" value="${count}" autocomplete="off" aria-label="生成张数">
+            <select class="gen-count-preset-select" aria-label="选择生成张数">
+                <option value="" selected disabled hidden></option>
+                ${options}
+            </select>
+        </div>
+    `;
+}
 function normalizedImageQuality(value){
     const quality = String(value || 'auto').trim().toLowerCase();
     return ['low','medium','high'].includes(quality) ? quality : '';
@@ -996,7 +1072,12 @@ function apiImageSize(ratioValue, resolutionValue, customRatioValue = '', custom
     if(resolutionValue === 'auto') return 'auto';
     if(resolutionValue === 'custom') return String(customSizeValue || '').trim();
     const resolutionKey = resolutionValue || '1k';
-    if(ratioValue === 'custom' || ratioValue === 'source'){
+    if(ratioValue === 'source'){
+        const matchedRatio = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatioValue(customRatioValue) || '1:1';
+        const adaptiveSize = ADAPTIVE_RATIO_TOOLS?.pixelSizeForRatio(matchedRatio, resolutionKey);
+        if(adaptiveSize) return adaptiveSize;
+    }
+    if(ratioValue === 'custom'){
         const parsed = parseRatioValue(customRatioValue);
         const longSide = RES_LONG_SIDE[resolutionKey] || 1024;
         if(parsed){
@@ -1046,7 +1127,8 @@ async function generatorSizeForRun(gen, refs){
         if(ref?.url){
             try {
                 const dims = await getImageDimensions(ref.url);
-                const parts = ratioPartsFromDimensions(dims.width, dims.height);
+                const matchedRatio = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(dims.width, dims.height) || '';
+                const parts = ADAPTIVE_RATIO_TOOLS?.ratioParts(matchedRatio) || ratioPartsFromDimensions(dims.width, dims.height);
                 gen.customRatioWidth = String(parts.width);
                 gen.customRatioHeight = String(parts.height);
                 gen.customRatio = `${parts.width}:${parts.height}`;
@@ -1057,6 +1139,23 @@ async function generatorSizeForRun(gen, refs){
         ? 'square'
         : (gen.ratio ?? 'square');
     return apiImageSize(ratio, gen.resolution || defaultApiImageResolution(gen.model), gen.customRatio || '', gen.customSize || '');
+}
+function adaptiveRatioForGeneratorRun(gen){
+    if(gen?.ratio !== 'source' || ['auto','custom'].includes(String(gen.resolution || '').toLowerCase())) return '';
+    return ADAPTIVE_RATIO_TOOLS?.closestSupportedRatioValue(gen.customRatio) || '1:1';
+}
+async function prepareGeneratorImageRequest(gen, refs){
+    const size = await generatorSizeForRun(gen, refs);
+    const adaptiveRatio = adaptiveRatioForGeneratorRun(gen);
+    const referenceImages = refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX).map(ref => (
+        adaptiveRatio ? {...ref, stretch_aspect_ratio:adaptiveRatio} : ref
+    ));
+    return {
+        size,
+        adaptiveRatio,
+        aspectRatio:adaptiveRatio || API_RATIO_VALUES[gen.ratio] || (gen.ratio === 'custom' ? String(gen.customRatio || '').trim() : ''),
+        referenceImages
+    };
 }
 function normalizeApiNodeLayout(node){
     if(!node || node.type !== 'generator') return;
@@ -1413,6 +1512,140 @@ function scheduleSave(){
 function scheduleViewportSave(){
     saveLocalViewport();
 }
+function canvasLLMTaskIsPending(node){
+    const status = String(node?.llmTask?.status || '').toLowerCase();
+    return Boolean(node?.llmTask?.id && ['queued', 'running'].includes(status));
+}
+function syncCanvasLLMTaskRuntimeState(node, runtimeId=canvasTaskRuntimeId){
+    if(!node || node.type !== 'llm') return false;
+    const task = node.llmTask && typeof node.llmTask === 'object' ? node.llmTask : null;
+    if(canvasLLMTaskIsPending(node)){
+        if(runtimeId && task.runtimeId && task.runtimeId !== runtimeId){
+            task.status = 'failed';
+            task.error = langIsEn()
+                ? 'The LLM task stopped because the local service restarted. Please retry.'
+                : '本地服务已重启，LLM 任务已停止，请重新运行。';
+            node.running = false;
+            node.runStatus = 'failed';
+            node.runError = task.error;
+            return true;
+        }
+        node.running = true;
+        node.runStatus = 'running';
+        node.runError = '';
+        return false;
+    }
+    node.running = false;
+    if(task?.status === 'failed'){
+        node.runStatus = 'failed';
+        node.runError = task.error || node.runError || tr('canvas.generationFailed');
+    }
+    return false;
+}
+function syncCanvasLLMTaskRuntimeStates(list=nodes, runtimeId=canvasTaskRuntimeId){
+    let changed = false;
+    (list || []).forEach(node => {
+        if(syncCanvasLLMTaskRuntimeState(node, runtimeId)) changed = true;
+    });
+    return changed;
+}
+function mergeRemoteCanvasLLMTaskResults(remoteNodes=[]){
+    const remoteById = new Map((remoteNodes || []).map(node => [node?.id, node]));
+    nodes.forEach(local => {
+        const localTaskId = String(local?.llmTask?.id || '');
+        if(!localTaskId) return;
+        const remote = remoteById.get(local.id);
+        if(!remote) return;
+        const remoteTaskId = String(remote?.llmTask?.id || '');
+        if(remoteTaskId && remoteTaskId !== localTaskId) return;
+        if(remoteTaskId === localTaskId){
+            local.llmTask = JSON.parse(JSON.stringify(remote.llmTask));
+            syncCanvasLLMTaskRuntimeState(local);
+            return;
+        }
+        const completedMode = String(local?.llmTask?.mode || 'node').toLowerCase();
+        if(completedMode !== 'chat'){
+            local.outputText = remote.outputText || '';
+            local.llmResultKey = remote.llmResultKey || '';
+            local.llmResultMemory = Array.isArray(remote.llmResultMemory) ? JSON.parse(JSON.stringify(remote.llmResultMemory)) : [];
+        }
+        local.messages = Array.isArray(remote.messages) ? JSON.parse(JSON.stringify(remote.messages)) : (local.messages || []);
+        local.runStatus = remote.runStatus || 'done';
+        local.runError = remote.runError || '';
+        delete local.llmTask;
+        local.running = false;
+    });
+}
+async function waitForCanvasLLMSubmissions(){
+    if(!canvasLLMSubmissionPromises.size) return;
+    await Promise.allSettled([...canvasLLMSubmissionPromises]);
+}
+async function flushCanvasBeforeLLMTask(){
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    if(localCanvasDirty && !savingCanvasNow) await saveCanvas();
+    const deadline = Date.now() + 5000;
+    while(savingCanvasNow && Date.now() < deadline){
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    if(localCanvasDirty && !savingCanvasNow) await saveCanvas();
+}
+async function submitCanvasLLMTask(node, message, messages=[], mode='node'){
+    const submission = (async () => {
+        await flushCanvasBeforeLLMTask();
+        const provider = resolveChatProviderId(node.llmProvider || 'comfly');
+        const model = resolveChatModel(node.model || node.llmMsModel, provider);
+        const inputKey = mode === 'node' ? classicLLMInputKey(node) : '';
+        const response = await fetch('/api/canvas-llm-tasks', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                canvas_id:canvas.id,
+                node_id:node.id,
+                mode,
+                client_id:CLIENT_ID,
+                message,
+                model,
+                ms_model:provider === 'modelscope' ? model : '',
+                provider,
+                system_prompt:node.showSystem ? ((node.systemPrompt || '').trim() || 'You are a helpful assistant.') : '',
+                messages,
+                images:llmInputImages(node),
+                videos:llmInputVideos(node),
+                input_key:inputKey
+            })
+        });
+        if(!response.ok) throw new Error(await responseErrorMessage(response, 'LLM 任务创建失败'));
+        const data = await response.json();
+        if(!data.task_id) throw new Error('LLM 任务创建失败：没有任务编号');
+        canvasTaskRuntimeId = data.runtime_id || canvasTaskRuntimeId;
+        canvas.updated_at = Number(data.updated_at || canvas.updated_at || 0);
+        lastCanvasUpdatedAt = Number(data.updated_at || lastCanvasUpdatedAt || canvas.updated_at || 0);
+        node.llmTask = {
+            id:data.task_id,
+            status:data.status || 'queued',
+            mode,
+            runtimeId:data.runtime_id || canvasTaskRuntimeId,
+            startedAt:Date.now(),
+            inputKey
+        };
+        node.running = true;
+        node.runStatus = 'running';
+        node.runError = '';
+        if(mode === 'chat'){
+            node.messages = node.messages || [];
+            node.messages.push({role:'user', content:message});
+            node.chatInput = '';
+        }
+        return data;
+    })();
+    canvasLLMSubmissionPromises.add(submission);
+    try {
+        return await submission;
+    } finally {
+        canvasLLMSubmissionPromises.delete(submission);
+    }
+}
 function refreshOutputTimer(){
     const hasPending = nodes.some(n => n.type === 'output' && (n._pending || []).length);
     if(hasPending && !outputTimer){
@@ -1478,6 +1711,7 @@ async function saveCanvas(){
         if(res.status === 409){
             const data = await res.json().catch(() => ({}));
             const remote = data.detail?.canvas || data.canvas;
+            if(remote?.nodes) mergeRemoteCanvasLLMTaskResults(remote.nodes);
             if(localCanvasDirty || saveCanvasAgain){
                 lastCanvasUpdatedAt = Number(data.detail?.updated_at || data.updated_at || remote?.updated_at || lastCanvasUpdatedAt || 0);
                 saveCanvasAgain = true;
@@ -2061,6 +2295,7 @@ async function openCanvas(id){
         const data = await res.json();
         resetCascadeRuntimeState();
         canvas = data.canvas;
+        canvasTaskRuntimeId = data.task_runtime_id || canvasTaskRuntimeId;
         rememberCanvasListProject(canvas.project || 'default');
         const touched = await touchCanvasOpened(canvas.id);
         if(touched?.updated_at) canvas.updated_at = Number(touched.updated_at);
@@ -2076,6 +2311,7 @@ async function openCanvas(id){
         lastCanvasUpdatedAt = Number(canvas.updated_at || 0);
         localCanvasDirty = false;
         resetTransientRunState(nodes);
+        const repairedLLMTasks = syncCanvasLLMTaskRuntimeStates(nodes, canvasTaskRuntimeId);
         sanitizeConnections();
         pruneMissingComfyWorkflows();
         await refreshMissingCanvasAssets();
@@ -2086,6 +2322,7 @@ async function openCanvas(id){
         resumeCanvasImageTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
+        if(repairedLLMTasks) scheduleSave();
     } catch(e) {
         setStatus(tr('canvas.openFailed'));
         console.error(e);
@@ -2093,7 +2330,7 @@ async function openCanvas(id){
         window.location.replace(canvasListUrlForProject(canvas?.project || requestedCanvasListProject() || rememberedCanvasListProject()));
     }
 }
-function applyRemoteCanvasData(remote){
+function applyRemoteCanvasData(remote, runtimeId=canvasTaskRuntimeId){
     if(!remote || !canvas || remote.id !== canvas.id) return;
     if(localCanvasDirty || saveTimer || savingCanvasNow || saveCanvasAgain){
         clearTimeout(remoteSyncTimer);
@@ -2114,6 +2351,7 @@ function applyRemoteCanvasData(remote){
         lastCanvasUpdatedAt = Number(canvas.updated_at || Date.now());
         localCanvasDirty = false;
         resetTransientRunState(nodes);
+        const repairedLLMTasks = syncCanvasLLMTaskRuntimeStates(nodes, runtimeId);
         sanitizeConnections();
         pruneMissingComfyWorkflows();
         refreshMissingCanvasAssets().then(() => render());
@@ -2124,6 +2362,7 @@ function applyRemoteCanvasData(remote){
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
         setStatus('Synced');
+        if(repairedLLMTasks) scheduleSave();
     } finally {
         applyingRemoteCanvas = false;
     }
@@ -2183,8 +2422,9 @@ async function syncRemoteCanvasNow(){
         if(!res.ok) throw new Error(tr('canvas.openFailed'));
         const data = await res.json();
         const remote = data.canvas;
+        canvasTaskRuntimeId = data.task_runtime_id || canvasTaskRuntimeId;
         if(Number(remote?.updated_at || 0) >= Number(lastCanvasUpdatedAt || 0)){
-            applyRemoteCanvasData(remote);
+            applyRemoteCanvasData(remote, canvasTaskRuntimeId);
         }
     } catch(e) {
         console.error(e);
@@ -2199,6 +2439,12 @@ async function checkRemoteCanvasVersion(){
         const res = await fetch(`/api/canvases/${canvas.id}/meta`);
         if(!res.ok) throw new Error('meta failed');
         const meta = await res.json();
+        canvasTaskRuntimeId = meta.task_runtime_id || canvasTaskRuntimeId;
+        const repairedLLMTasks = syncCanvasLLMTaskRuntimeStates(nodes, canvasTaskRuntimeId);
+        if(repairedLLMTasks){
+            render();
+            scheduleSave();
+        }
         const remoteUpdatedAt = Number(meta.updated_at || 0);
         if(remoteUpdatedAt > Number(lastCanvasUpdatedAt || 0)){
             await syncRemoteCanvasNow();
@@ -2233,6 +2479,7 @@ function handleCanvasUpdatedMessage(data){
     setStatus('Syncing...');
 }
 async function returnToCanvasManager(){
+    await waitForCanvasLLMSubmissions();
     clearTimeout(saveTimer);
     if(canvas && localCanvasDirty) await saveCanvas();
     stopCanvasRemotePolling();
@@ -2396,6 +2643,15 @@ document.querySelectorAll('[data-crop-ratio]').forEach(btn => {
         setCropAspectPreset(btn.dataset.cropRatio || 'free');
     });
 });
+document.querySelectorAll('[data-outpaint-ratio]').forEach(btn => {
+    btn.addEventListener('click', event => {
+        event.stopPropagation();
+        setOutpaintAspectPreset(btn.dataset.outpaintRatio || 'free');
+    });
+});
+document.getElementById('outpaintBackgroundColor')?.addEventListener('input', event => {
+    setOutpaintBackgroundColor(event.target.value);
+});
 document.getElementById('outpaintFrame')?.addEventListener('mousedown', event => {
     if(event.target.closest('[data-outpaint-handle]')) return;
     document.getElementById('cropCanvas')?.classList.add('dragging-image');
@@ -2440,6 +2696,9 @@ document.getElementById('editTextCanvas')?.addEventListener('dblclick', event =>
     if(!control) return;
     control.addEventListener('input', syncSelectedEditTextStyleFromBrush);
     control.addEventListener('change', () => { editTextDirty = false; });
+});
+['maskPreviewColor','maskPreviewOpacity'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', refreshMaskPreviewStyle);
 });
 ['gridHorizontalLines','gridVerticalLines','gridGapSize'].forEach(id => {
     document.getElementById(id).addEventListener('input', () => {
@@ -2507,7 +2766,16 @@ function addImageNode(point){
 }
 function addPromptNode(point){
     const p = point || defaultPoint(0, 0);
-    return addNode({id:uid('prompt'), type:'prompt', x:p.x, y:p.y, text:''});
+    return addNode({
+        id:uid('prompt'),
+        type:'prompt',
+        x:p.x,
+        y:p.y,
+        text:'',
+        promptSplitEnabled:false,
+        promptSeparator:'----',
+        promptSplitPreviewHeight:70
+    });
 }
 function addLoopNode(point){
     const p = point || defaultPoint(40, 0);
@@ -2524,6 +2792,7 @@ function addLoopNode(point){
         loopStart:1,
         imageBatchSize:1,
         videoBatchSize:1,
+        variablePrompts:[''],
         variablePrompt:'',
         fixedPrompt:''
     });
@@ -2557,6 +2826,8 @@ function addLLMNode(point){
         chatInput:'',
         messages:[],
         outputText:'',
+        llmOutputSplitEnabled:false,
+        llmOutputSeparator:'----',
         llmInputHeight:110,
         llmOutputHeight:150,
         running:false
@@ -2566,7 +2837,7 @@ function addGeneratorNode(point){
     const p = point || defaultPoint(120, 0);
     const providerId = imageApiProviders()[0]?.id || '';
     const model = allImageModels(providerId)[0] || '';
-    return addNode({id:uid('gen'), type:'generator', x:p.x, y:p.y, apiProvider:providerId, model, ratio:'square', resolution:defaultApiImageResolution(model), customRatio:'', customSize:'', customRatioWidth:'', customRatioHeight:'', customWidth:'', customHeight:'', inputs:[]});
+    return addNode({id:uid('gen'), type:'generator', x:p.x, y:p.y, apiProvider:providerId, model, ratio:'square', resolution:defaultClassicApiGeneratorResolution(model), quality:'auto', count:1, localPrompt:'', customRatio:'', customSize:'', customRatioWidth:'', customRatioHeight:'', customWidth:'', customHeight:'', inputs:[]});
 }
 function addMidjourneyNode(point){
     const p = point || defaultPoint(140, 0);
@@ -2742,7 +3013,7 @@ function renderMsGenBody(node){
     const inputSources = generatorSources(node);
     const ordered = orderedSources(node, inputSources);
     const mediaInputs = ordered.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
-    const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
+    const promptInputs = ordered.filter(src => src.prompt);
     const referenceImages = ordered.flatMap(src => src.refs || []);
     const isCustomMs = modelKey === 'custom';
     const msUsesImages = Boolean(msModel.supportsImage || msModel.acceptsImage);
@@ -3229,6 +3500,7 @@ function linkCreateOptions(state){
     if(state.originKind === 'out'){
         if(['image','prompt','loop','group','promptGroup','llm','output'].includes(node.type)){
             return [
+                ...(node.type === 'group' ? [{type:'loop', label:tr('canvas.loopNode'), icon:'repeat-2'}] : []),
                 {type:'generator', label:tr('canvas.apiGenerate'), icon:'wand-sparkles'},
                 {type:'midjourney', label:'Midjourney', icon:'panel-top'},
                 {type:'msgen', label:tr('canvas.modelscopeGenerate'), icon:'cloud-lightning'},
@@ -3241,6 +3513,16 @@ function linkCreateOptions(state){
             ];
         }
         return [];
+    }
+    const loopInputTypes = ClassicCascadePlan.inputQuickCreateTypes(node.type);
+    if(loopInputTypes.length){
+        const catalog = {
+            image:{type:'image', label:tr('canvas.imageCard'), icon:'image-plus'},
+            prompt:{type:'prompt', label:tr('canvas.prompt'), icon:'text-cursor-input'},
+            group:{type:'group', label:tr('canvas.group'), icon:'group'},
+            llm:{type:'llm', label:'LLM', icon:'message-square-text'},
+        };
+        return loopInputTypes.map(type => catalog[type]).filter(Boolean);
     }
     if(CANVAS_GENERATOR_TYPES.includes(node.type) || node.type === 'llm'){
         return [
@@ -3593,9 +3875,7 @@ function createLinkedNode(type){
     if(!created) return;
     const fromId = state.originKind === 'out' ? origin.id : created.id;
     const toId = state.originKind === 'out' ? created.id : origin.id;
-    if(canConnect(fromId, toId) && !connections.some(c => c.from === fromId && c.to === toId)){
-        connections.push({id:uid('c'), from:fromId, to:toId});
-        syncLatestGeneratedOutputToConnection(fromId, toId);
+    if(connectClassicNodes(fromId, toId, {historyCaptured:true})){
         syncGeneratorInputs();
         scheduleSave();
         render();
@@ -4601,6 +4881,7 @@ function setImageEditMode(mode, userTouched=false){
     _syncGridCustomCursor();
     document.querySelectorAll('[data-image-edit-mode]').forEach(btn => btn.classList.toggle('active', btn.dataset.imageEditMode === imageEditMode));
     document.getElementById('imageCropTools')?.classList.toggle('active', imageEditMode === 'crop');
+    document.getElementById('imageOutpaintTools')?.classList.toggle('active', imageEditMode === 'outpaint');
     document.getElementById('imageMaskTools').classList.toggle('active', imageEditMode === 'mask');
     document.getElementById('imageBrushTools').classList.toggle('active', imageEditMode === 'brush');
     document.getElementById('imageResizeTools')?.classList.toggle('active', imageEditMode === 'resize');
@@ -4631,6 +4912,7 @@ function setImageEditMode(mode, userTouched=false){
         }
     }
     resizeEditDrawCanvas();
+    if(imageEditMode === 'mask') refreshMaskPreviewStyle();
     if(isPreview) clearEditDrawing(true);
     else if(imageEditMode === 'grid') refreshGridSplitPreview();
     else if(imageEditMode === 'outpaint') resetOutpaintBox();
@@ -4656,6 +4938,7 @@ function restoreEditDrawSnapshot(snapshot){
     const canvasEl = editDrawCanvas();
     const imageData = snapshot.imageData || snapshot;
     canvasEl.getContext('2d').putImageData(imageData, 0, 0);
+    normalizeMaskPreviewCanvas(canvasEl);
     if(snapshot.labelCounter) brushLabelCounter = snapshot.labelCounter;
     editTextItems = (snapshot.textItems || []).map(item => ({...item}));
     editTextSelectedId = snapshot.textSelectedId || '';
@@ -4773,31 +5056,49 @@ function editBrushSize(){
 function brushColor(){
     return document.getElementById('paintBrushColor')?.value || '#ff2d55';
 }
-const MASK_BRUSH_ALPHA = 115;
-const MASK_BRUSH_COLOR = `rgba(255,255,255,${MASK_BRUSH_ALPHA / 255})`;
+const MASK_EXPORT_ALPHA_THRESHOLD = 8;
+const MASK_DRAW_ALPHA = CanvasMaskPreviewStyle.DEFAULT_DRAW_ALPHA;
+function maskPreviewColor(){
+    return CanvasMaskPreviewStyle.normalizeColor(document.getElementById('maskPreviewColor')?.value);
+}
+function maskPreviewOpacity(){
+    return CanvasMaskPreviewStyle.normalizeOpacityPercent(document.getElementById('maskPreviewOpacity')?.value);
+}
+function syncMaskPreviewControls(){
+    const colorInput = document.getElementById('maskPreviewColor');
+    const opacityInput = document.getElementById('maskPreviewOpacity');
+    const opacityValue = document.getElementById('maskPreviewOpacityValue');
+    const color = maskPreviewColor();
+    const opacity = maskPreviewOpacity();
+    if(colorInput && colorInput.value !== color) colorInput.value = color;
+    if(opacityInput && Number(opacityInput.value) !== opacity) opacityInput.value = String(opacity);
+    if(opacityValue) opacityValue.textContent = `${Math.round(opacity)}%`;
+}
+function refreshMaskPreviewStyle(){
+    syncMaskPreviewControls();
+    normalizeMaskPreviewCanvas();
+}
 function setupDrawStyle(ctx){
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.lineWidth = editBrushSize();
-    ctx.strokeStyle = imageEditMode === 'mask' ? MASK_BRUSH_COLOR : brushColor();
-    ctx.fillStyle = imageEditMode === 'mask' ? MASK_BRUSH_COLOR : brushColor();
+    const drawColor = imageEditMode === 'mask'
+        ? CanvasMaskPreviewStyle.drawRgba(maskPreviewColor(), MASK_DRAW_ALPHA)
+        : brushColor();
+    ctx.strokeStyle = drawColor;
+    ctx.fillStyle = drawColor;
     ctx.globalCompositeOperation = 'source-over';
 }
 function normalizeMaskPreviewCanvas(canvasEl=editDrawCanvas()){
     if(imageEditMode !== 'mask' || !canvasEl?.width || !canvasEl?.height) return;
     const ctx = canvasEl.getContext('2d');
     const imageData = ctx.getImageData(0, 0, canvasEl.width, canvasEl.height);
-    const data = imageData.data;
-    let changed = false;
-    for(let i = 0; i < data.length; i += 4){
-        if(data[i + 3] <= 0) continue;
-        data[i] = 255;
-        data[i + 1] = 255;
-        data[i + 2] = 255;
-        if(data[i + 3] > MASK_BRUSH_ALPHA) data[i + 3] = MASK_BRUSH_ALPHA;
-        changed = true;
-    }
-    if(changed) ctx.putImageData(imageData, 0, 0);
+    const result = CanvasMaskPreviewStyle.recolorImageData(imageData, {
+        color:maskPreviewColor(),
+        opacityPercent:maskPreviewOpacity(),
+        threshold:MASK_EXPORT_ALPHA_THRESHOLD
+    });
+    if(result.changed) ctx.putImageData(imageData, 0, 0);
 }
 function circledNumber(n){
     if(n >= 1 && n <= 20) return String.fromCharCode(0x2460 + n - 1);
@@ -5254,13 +5555,14 @@ function renderCropBox(){
     const img = document.getElementById('cropImage');
     const draw = editDrawCanvas();
     const textCanvas = editTextCanvas();
+    cropCanvasEl?.style.setProperty('--outpaint-background', outpaintBackgroundColor);
     let boxX = cropState.x;
     let boxY = cropState.y;
     if(imageEditMode === 'outpaint' && cropCanvasEl && img){
-        cropCanvasEl.style.width = `${Math.round(cropState.w)}px`;
-        cropCanvasEl.style.height = `${Math.round(cropState.h)}px`;
-        img.style.left = `${Math.round(cropState.x)}px`;
-        img.style.top = `${Math.round(cropState.y)}px`;
+        cropCanvasEl.style.width = `${cropState.w}px`;
+        cropCanvasEl.style.height = `${cropState.h}px`;
+        img.style.left = `${cropState.x}px`;
+        img.style.top = `${cropState.y}px`;
         boxX = 0;
         boxY = 0;
         if(draw){
@@ -5299,15 +5601,35 @@ function renderCropBox(){
         outpaintFrame.style.height = `${cropState.h}px`;
     }
 }
-function outpaintNaturalSize(){
+function currentOutpaintOutputGeometry(){
     const img = document.getElementById('cropImage');
-    if(!img || !cropState) return {w:1, h:1};
+    if(!img || !cropState) return {w:1, h:1, dx:0, dy:0};
+    const geometry = window.ImageOutpaintGeometry;
+    if(geometry?.outputGeometry){
+        return geometry.outputGeometry({
+            canvasW:cropState.w,
+            canvasH:cropState.h,
+            sourceX:cropState.x,
+            sourceY:cropState.y,
+            sourceDisplayW:img.clientWidth || 1,
+            sourceDisplayH:img.clientHeight || 1,
+            naturalW:img.naturalWidth || 1,
+            naturalH:img.naturalHeight || 1,
+            preset:outpaintAspectPreset
+        });
+    }
     const scaleX = Math.max(1, Number(img.naturalWidth || 1)) / Math.max(1, Number(img.clientWidth || 1));
     const scaleY = Math.max(1, Number(img.naturalHeight || 1)) / Math.max(1, Number(img.clientHeight || 1));
     return {
         w:Math.max(1, Math.round((cropState.w || 1) * scaleX)),
-        h:Math.max(1, Math.round((cropState.h || 1) * scaleY))
+        h:Math.max(1, Math.round((cropState.h || 1) * scaleY)),
+        dx:Math.round((cropState.x || 0) * scaleX),
+        dy:Math.round((cropState.y || 0) * scaleY)
     };
+}
+function outpaintNaturalSize(){
+    const geometry = currentOutpaintOutputGeometry();
+    return {w:geometry.w, h:geometry.h};
 }
 function updateOutpaintResolutionLabel(){
     const label = document.getElementById('outpaintResolution');
@@ -5328,10 +5650,10 @@ function clampOutpaint(){
 function resetOutpaintBox(){
     if(!cropState) return;
     const {w, h} = cropBounds();
-    cropState.x = 0;
-    cropState.y = 0;
-    cropState.w = w;
-    cropState.h = h;
+    const next = outpaintAspectRatio && window.ImageOutpaintGeometry?.minimumCanvasForSource
+        ? window.ImageOutpaintGeometry.minimumCanvasForSource(w, h, outpaintAspectPreset)
+        : {x:0, y:0, w, h};
+    Object.assign(cropState, next);
     renderCropBox();
 }
 function cropRatioFromPreset(preset){
@@ -5347,6 +5669,35 @@ function syncCropRatioButtons(){
     document.querySelectorAll('[data-crop-ratio]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.cropRatio === cropAspectPreset);
     });
+}
+function syncOutpaintRatioButtons(){
+    document.querySelectorAll('[data-outpaint-ratio]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.outpaintRatio === outpaintAspectPreset);
+    });
+}
+function syncOutpaintBackgroundControls(){
+    const input = document.getElementById('outpaintBackgroundColor');
+    const label = document.getElementById('outpaintBackgroundValue');
+    if(input && input.value.toLowerCase() !== outpaintBackgroundColor) input.value = outpaintBackgroundColor;
+    if(label) label.textContent = outpaintBackgroundColor.toUpperCase();
+    document.getElementById('cropCanvas')?.style.setProperty('--outpaint-background', outpaintBackgroundColor);
+}
+function setOutpaintBackgroundColor(value=DEFAULT_OUTPAINT_BACKGROUND){
+    outpaintBackgroundColor = window.ImageOutpaintGeometry?.normalizeColor
+        ? window.ImageOutpaintGeometry.normalizeColor(value, DEFAULT_OUTPAINT_BACKGROUND)
+        : (/^#[0-9a-f]{6}$/i.test(String(value || '')) ? String(value).toLowerCase() : DEFAULT_OUTPAINT_BACKGROUND);
+    syncOutpaintBackgroundControls();
+}
+function setOutpaintAspectPreset(preset='free'){
+    outpaintAspectPreset = preset || 'free';
+    outpaintAspectRatio = cropRatioFromPreset(outpaintAspectPreset);
+    syncOutpaintRatioButtons();
+    if(cropState && imageEditMode === 'outpaint' && outpaintAspectRatio){
+        const {w, h} = cropBounds();
+        const next = window.ImageOutpaintGeometry?.minimumCanvasForSource?.(w, h, outpaintAspectPreset);
+        if(next) Object.assign(cropState, next);
+        renderCropBox();
+    }
 }
 function fitCropRectToAspect(ratio, sourceRect=null){
     const {w:boundsW, h:boundsH} = cropBounds();
@@ -5412,6 +5763,11 @@ function openImageEditor(nodeId, initialMode='crop'){
     cropAspectPreset = 'free';
     cropAspectRatio = null;
     syncCropRatioButtons();
+    outpaintAspectPreset = 'free';
+    outpaintAspectRatio = null;
+    outpaintBackgroundColor = DEFAULT_OUTPAINT_BACKGROUND;
+    syncOutpaintRatioButtons();
+    syncOutpaintBackgroundControls();
     editTextItems = [];
     editTextSelectedId = '';
     editTextDrag = null;
@@ -5491,6 +5847,11 @@ function closeImageEditor(){
     imageEditModeTouched = false;
     cropAspectPreset = 'free';
     cropAspectRatio = null;
+    outpaintAspectPreset = 'free';
+    outpaintAspectRatio = null;
+    outpaintBackgroundColor = DEFAULT_OUTPAINT_BACKGROUND;
+    syncOutpaintRatioButtons();
+    syncOutpaintBackgroundControls();
     syncCropRatioButtons();
     document.getElementById('imageEditStage')?.classList.remove('overflowing', 'overflow-x', 'overflow-y');
     const cropCanvasEl = document.getElementById('cropCanvas');
@@ -5522,6 +5883,15 @@ function beginCropDrag(event, mode){
 function resizeOutpaintFromDrag(dx, dy){
     const start = cropDrag?.start;
     if(!start) return;
+    if(outpaintAspectRatio && window.ImageOutpaintGeometry?.resizeCanvasAroundSource){
+        const {w, h} = cropBounds();
+        const handle = String(cropDrag.mode || '').replace(/^outpaint-/, '') || 'corner';
+        Object.assign(cropState, window.ImageOutpaintGeometry.resizeCanvasAroundSource(
+            start, w, h, handle, dx, dy, outpaintAspectPreset
+        ));
+        clampOutpaint();
+        return;
+    }
     let growX = 0, growY = 0;
     if(cropDrag.mode === 'outpaint-left') growX = -dx;
     else if(cropDrag.mode === 'outpaint-right') growX = dx;
@@ -5688,17 +6058,16 @@ async function applyImageOutpaint(){
     const img = document.getElementById('cropImage');
     if(!node || !img.naturalWidth || !img.naturalHeight) return;
     clampOutpaint();
-    const scaleX = img.naturalWidth / (img.clientWidth || 1);
-    const scaleY = img.naturalHeight / (img.clientHeight || 1);
-    const outW = Math.max(img.naturalWidth, Math.round(cropState.w * scaleX));
-    const outH = Math.max(img.naturalHeight, Math.round(cropState.h * scaleY));
-    const dx = Math.round(cropState.x * scaleX);
-    const dy = Math.round(cropState.y * scaleY);
+    const output = currentOutpaintOutputGeometry();
+    const outW = output.w;
+    const outH = output.h;
+    const dx = output.dx;
+    const dy = output.dy;
     const canvasEl = document.createElement('canvas');
     canvasEl.width = outW;
     canvasEl.height = outH;
     const ctx = canvasEl.getContext('2d');
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = outpaintBackgroundColor;
     ctx.fillRect(0, 0, outW, outH);
     ctx.drawImage(img, dx, dy, img.naturalWidth, img.naturalHeight);
     const blob = await new Promise(resolve => canvasEl.toBlob(resolve, 'image/png'));
@@ -5928,6 +6297,70 @@ function measureCanvasOriginalImageNodes(root=nodesEl){
     });
 }
 
+function renderCanvasFrameNode(rawNode){
+    const normalized = SpatialFrames.normalizeFrame(rawNode, {title:tr('common.frameDefaultTitle')});
+    Object.assign(rawNode, normalized);
+    const el = document.createElement('div');
+    el.className = `canvas-frame-node ${selected.has(rawNode.id) ? 'selected' : ''}`;
+    el.dataset.id = rawNode.id;
+    el.style.left = `${rawNode.x}px`;
+    el.style.top = `${rawNode.y}px`;
+    el.style.width = `${rawNode.w}px`;
+    el.style.height = `${rawNode.h}px`;
+    el.style.setProperty('--frame-color', rawNode.color || '#94a3b8');
+    el.style.setProperty('--frame-title-size', `${rawNode.titleSize || 32}px`);
+    el.innerHTML = `<div class="canvas-frame-header"><span class="canvas-frame-title">${escapeHtml(rawNode.title || tr('common.frameDefaultTitle'))}</span></div><div class="canvas-frame-resize" title="${escapeAttr(tr('canvas.resize'))}"></div>`;
+    const header = el.querySelector('.canvas-frame-header');
+    const title = el.querySelector('.canvas-frame-title');
+    header.onclick = event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if(event.ctrlKey || event.metaKey) selected.has(rawNode.id) ? selected.delete(rawNode.id) : selected.add(rawNode.id);
+        else { selected.clear(); selected.add(rawNode.id); }
+        refreshSelectionVisuals();
+    };
+    header.onmousedown = event => {
+        if(event.button !== 0 || event.detail >= 2 || title.isContentEditable) return;
+        startNodeDrag(event, rawNode);
+    };
+    title.ondblclick = event => {
+        event.preventDefault();
+        event.stopPropagation();
+        pushUndo();
+        title.contentEditable = 'true';
+        title.focus();
+        const range = document.createRange();
+        range.selectNodeContents(title);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+    };
+    title.oninput = () => {
+        rawNode.title = title.textContent.trim().slice(0, 80) || tr('common.frameDefaultTitle');
+        scheduleSave();
+    };
+    title.onkeydown = event => {
+        if(event.key === 'Enter'){
+            event.preventDefault();
+            title.blur();
+        }
+        if(event.key === 'Escape'){
+            event.preventDefault();
+            title.blur();
+        }
+    };
+    title.onblur = () => {
+        title.contentEditable = 'false';
+        rawNode.title = title.textContent.trim().slice(0, 80) || tr('common.frameDefaultTitle');
+        title.textContent = rawNode.title;
+        scheduleSave();
+    };
+    el.querySelector('.canvas-frame-resize').onmousedown = event => {
+        if(event.button === 0) startNodeResize(event, rawNode);
+    };
+    return el;
+}
+
 function render(){
     const outputScrolls = captureOutputScrolls();
     const mediaStates = captureMediaPlaybackStates();
@@ -5944,7 +6377,7 @@ function render(){
         // 单个节点渲染异常不能中断整个循环，否则它后面的节点（含新建节点，通常排在末尾）都不会被
         // 追加进 DOM，连带这些节点的连线也会因找不到 DOM 而画到 (0,0) 变成“消失”。
         try {
-            const fresh = renderNode(node);
+            const fresh = isCanvasFrameNode(node) ? renderCanvasFrameNode(node) : renderNode(node);
             const old = reusableMediaNodes.get(node.id);
             nodesEl.appendChild(fresh);
             if(old){
@@ -5974,13 +6407,13 @@ function refreshNodes(ids=[]){
         const node = nodes.find(n => n.id === id);
         if(!node) continue;
         if(node.type === 'output' && refreshOutputNodeContent(node)) continue;
-        const current = nodesEl.querySelector(`.node[data-id="${CSS.escape(id)}"]`);
+        const current = canvasNodeElement(id);
         if(!current){
             render();
             return;
         }
         try {
-            const fresh = renderNode(node);
+            const fresh = isCanvasFrameNode(node) ? renderCanvasFrameNode(node) : renderNode(node);
             if(nodeHasLiveMedia(node)) transplantNodeMediaElement(current, fresh);
             current.replaceWith(fresh);
         } catch(err){
@@ -6116,7 +6549,7 @@ function restoreOutputScrolls(state){
     });
 }
 function isNodeControl(target){
-    return !!target.closest('textarea, input, select, option, button, audio, video, [contenteditable="true"], .seg, .gen-btn, .comfy-run, .input-item, .blank-image, .mode-tabs, .ms-model-tabs, .llm-provider, .llm-output, .llm-chat-log, .llm-bubble, .llm-pane-resizer, .loop-preview, .ltx-director-timeline-host, .minimax-canvas-workbench, .pr-wrapper, .pr-toolbar, .pr-viewport, .pr-canvas, .pr-player-controls, .pr-prompt-area');
+    return !!target.closest('textarea, input, select, option, button, audio, video, [contenteditable="true"], .seg, .gen-btn, .comfy-run, .input-item, .blank-image, .mode-tabs, .ms-model-tabs, .llm-provider, .llm-output, .llm-chat-log, .llm-bubble, .llm-pane-resizer, .loop-preview, .classic-prompt-segments, .classic-prompt-split-resize, .ltx-director-timeline-host, .minimax-canvas-workbench, .pr-wrapper, .pr-toolbar, .pr-viewport, .pr-canvas, .pr-player-controls, .pr-prompt-area');
 }
 function destroyLTXEditor(node){
     if(!node?._ltxEditor) return;
@@ -6129,10 +6562,11 @@ function isNodeDragSurface(target){
 function renderNode(node){
     normalizeApiNodeLayout(node);
     if(node.type === 'rh' && Number(node.h) === 560) delete node.h;
+    if(node.type === 'loop' && (node.showPrompt || node.imageInput)) autoSizeLoopForPanels(node);
     const el = document.createElement('div');
     const size = defaultNodeSize(node.type);
     const hasFixedSize = Boolean(node.h || size.h);
-    el.className = `node ${node.type}-node ${node.url ? 'has-image' : ''} ${hasFixedSize ? 'sized' : ''} ${selected.has(node.id) ? 'selected' : ''}`;
+    el.className = `node ${node.type}-node ${node.url ? 'has-image' : ''} ${hasFixedSize ? 'sized' : ''} ${node.type === 'prompt' && node.promptSplitEnabled === true ? 'prompt-split-enabled' : ''} ${selected.has(node.id) ? 'selected' : ''} ${classicCascadePreviewNodeClasses(node.id).join(' ')}`;
     el.style.left = `${node.x}px`;
     el.style.top = `${node.y}px`;
     el.style.width = `${node.w || size.w}px`;
@@ -6158,7 +6592,7 @@ function renderNode(node){
     const showStatus = ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh','minimax'].includes(node.type) && node.runStatus
         && (node.runStatus !== 'failed' || node._cascadeFailed);
     const statusHtml = showStatus ? (() => {
-        const label = { queued:'排队中', running:'运行中', done:'完成', failed:'失败' }[node.runStatus] || '';
+        const label = { queued:'排队中', running:'运行中', done:'完成', partial:'部分完成', failed:'失败' }[node.runStatus] || '';
         return `<span class="node-run-status ${node.runStatus}"><span class="dot"></span>${escapeHtml(label)}${node._cascadeIdx?' '+node._cascadeIdx:''}</span>`;
     })() : '';
     el.innerHTML = `<div class="node-head"><span class="node-title">${displayTitle}</span><div style="display:flex;align-items:center;gap:8px">${statusHtml}<button onclick="deleteNodeFromButton('${node.id}', event)" class="text-gray-300 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button></div></div>`;
@@ -6169,7 +6603,7 @@ function renderNode(node){
             const missing = isMissingAssetUrl(node.url);
             const mediaKind = mediaKindForNode(node);
             const isEditableImage = mediaKind === 'image' && !missing;
-            body.innerHTML = `<div class="image-preview-wrap">${missing ? missingAssetHtml(node.url) : canvasPreviewImgHtml(node.url, 768, 'draggable="false"')}</div><div class="image-caption text-[11px] text-gray-400 truncate">${escapeHtml(node.name || 'image')}${missing ? ` · ${langIsEn() ? 'missing' : '文件缺失'}` : ''}</div>`;
+            body.innerHTML = `<div class="image-preview-wrap">${missing ? missingAssetHtml(node.url) : canvasPreviewImgHtml(node.url, 768, 'draggable="true"')}</div><div class="image-caption text-[11px] text-gray-400 truncate">${escapeHtml(node.name || 'image')}${missing ? ` · ${langIsEn() ? 'missing' : '文件缺失'}` : ''}</div>`;
             if(!missing && mediaKind !== 'image'){
                 const mediaHtml = mediaKind === 'video'
                     ? `<div class="media-card video-card">${canvasVideoPreviewHtml(node.url, 768, 'draggable="false" data-video-fallback-attrs="controls"')}<button class="canvas-video-play" type="button" title="播放"><i data-lucide="play"></i></button></div>`
@@ -6179,6 +6613,13 @@ function renderNode(node){
             const previewWrap = body.querySelector('.image-preview-wrap');
             const loadedImg = body.querySelector('img');
             const videoPlayBtn = body.querySelector('.canvas-video-play');
+            if(loadedImg && isEditableImage){
+                bindCanvasAssetSaveDragSource(loadedImg, {
+                    url:node.url,
+                    name:node.name || outputImageName(node.url),
+                    kind:'image',
+                });
+            }
             const openPreview = e => {
                 if(!node.url || missing) return;
                 e.preventDefault();
@@ -6255,21 +6696,70 @@ function renderNode(node){
     }
     if(node.type === 'prompt') {
         const templateActive = promptTemplateModal?.classList.contains('open') && promptTemplateNodeId === node.id;
-        body.innerHTML = `<div class="prompt-editor"><div class="prompt-toolbar"><button class="prompt-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-prompt-template-node-id="${escapeAttr(node.id)}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(tr('canvas.promptTemplateLibrary'))}"><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>${promptCounterHtml(node.text || '')}</div><textarea placeholder="${tr('canvas.promptPlaceholder')}">${escapeHtml(node.text || '')}</textarea></div>`;
+        const splitEnabled = node.promptSplitEnabled === true;
+        const separator = classicPromptSeparator(node);
+        const splitPreviewHeight = classicPromptSplitPreviewHeight(node);
+        const separatorLabel = langIsEn() ? 'Separator' : '分隔符';
+        const splitResizeTitle = langIsEn() ? 'Drag to resize the segment preview' : '拖动调整分段预览高度';
+        body.innerHTML = `<div class="prompt-editor classic-prompt-editor">
+            <textarea placeholder="${escapeAttr(tr('canvas.promptPlaceholder'))}">${escapeHtml(node.text || '')}</textarea>
+            <div class="classic-prompt-tools">
+                <button class="prompt-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-prompt-template-node-id="${escapeAttr(node.id)}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(tr('canvas.promptTemplateLibrary'))}"><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>
+                <button class="prompt-template-btn classic-prompt-split-toggle ${splitEnabled ? 'active' : ''}" type="button" data-prompt-split-toggle aria-pressed="${splitEnabled ? 'true' : 'false'}" title="${escapeAttr(separatorLabel)}"><i data-lucide="split"></i><span>${escapeHtml(separatorLabel)}</span></button>
+                ${promptCounterHtml(node.text || '')}
+            </div>
+            ${splitEnabled ? `<div class="classic-prompt-split-row">
+                <label class="classic-prompt-split-control"><span>${escapeHtml(separatorLabel)}</span><input type="text" value="${escapeAttr(separator)}" placeholder="----" data-prompt-separator></label>
+                <span class="classic-prompt-split-count">${escapeHtml(classicPromptSegmentCountText(node))}</span>
+            </div>
+            <div class="classic-prompt-segments" style="height:${splitPreviewHeight}px">${classicPromptSegmentItemsHtml(node)}</div>
+            <div class="classic-prompt-split-resize" data-prompt-split-resize title="${escapeAttr(splitResizeTitle)}"><span></span></div>` : ''}
+        </div>`;
         const textarea = body.querySelector('textarea');
         const templateBtn = body.querySelector('[data-prompt-template-open]');
+        const splitToggle = body.querySelector('[data-prompt-split-toggle]');
         templateBtn.onclick = e => {
             e.preventDefault();
             e.stopPropagation();
             openPromptTemplateModal(node.id);
         };
+        splitToggle.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            pushUndo();
+            node.promptSplitEnabled = !node.promptSplitEnabled;
+            if(node.promptSplitEnabled){
+                node.promptSeparator = classicPromptSeparator(node);
+                node.promptSplitPreviewHeight = classicPromptSplitPreviewHeight(node);
+            }
+            render();
+            scheduleSave();
+            scheduleGeneratorInputSync(node.id);
+        };
         bindScrollableText(textarea);
         textarea.oninput = e => {
             node.text = e.target.value;
             refreshPromptCounter(body, node.text);
+            refreshClassicPromptSegmentsUi(body, node);
             scheduleSave();
-            scheduleGeneratorInputSync();
+            scheduleGeneratorInputSync(node.id);
         };
+        if(splitEnabled){
+            const separatorInput = body.querySelector('[data-prompt-separator]');
+            const segmentList = body.querySelector('.classic-prompt-segments');
+            const splitResize = body.querySelector('[data-prompt-split-resize]');
+            separatorInput.oninput = e => {
+                node.promptSeparator = e.target.value || CLASSIC_PROMPT_SEPARATOR_DEFAULT;
+                refreshClassicPromptSegmentsUi(body, node);
+                scheduleSave();
+                scheduleGeneratorInputSync(node.id);
+            };
+            separatorInput.onblur = () => {
+                if(!separatorInput.value) separatorInput.value = classicPromptSeparator(node);
+            };
+            segmentList?.addEventListener('wheel', e => e.stopPropagation(), {passive:true});
+            splitResize.onmousedown = e => startPromptSplitPreviewResize(e, node);
+        }
     }
     if(node.type === 'loop') body.appendChild(renderLoopBody(node));
     if(node.type === 'group') {
@@ -6325,6 +6815,8 @@ function renderNode(node){
         body.querySelectorAll('.output-img-wrap').forEach(wrap => bindOutputWrap(wrap, node));
     }
     el.appendChild(body);
+    scheduleRenderedLoopAutoSize(node, el);
+    scheduleRenderedLLMMediaAutoSize(node, el);
     el.querySelectorAll('button, select, textarea, input').forEach(control => {
         control.addEventListener('mousedown', e => e.stopPropagation(), true);
         control.addEventListener('click', e => e.stopPropagation());
@@ -6333,7 +6825,7 @@ function renderNode(node){
         if(e.button !== 0 || !isNodeDragSurface(e.target)) return;
         startNodeDrag(e, node);
     };
-    const canInput = ['generator','midjourney','comfy','ltxDirector','output','llm','msgen','video','rh','minimax'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
+    const canInput = ['generator','midjourney','comfy','ltxDirector','output','llm','msgen','video','rh','minimax'].includes(node.type) || node.type === 'loop';
     const canOutput = ['image','prompt','loop','group','promptGroup','generator','midjourney','comfy','ltxDirector','llm','msgen','video','rh','minimax','output'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
@@ -6358,6 +6850,38 @@ function renderNode(node){
     if(inp) inp.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, 'in'); };
     return el;
 }
+function setCanvasAssetSaveDragData(dataTransfer, {url, name='', kind='image', legacyOutput=false}={}){
+    const resolvedUrl = String(url || '').trim();
+    if(!dataTransfer || !resolvedUrl) return false;
+    const payload = {url:resolvedUrl, name:String(name || outputImageName(resolvedUrl) || 'asset'), kind:String(kind || 'image')};
+    dataTransfer.effectAllowed = 'copy';
+    dataTransfer.setData('application/x-canvas-asset-save', JSON.stringify(payload));
+    dataTransfer.setData('text/uri-list', resolvedUrl);
+    dataTransfer.setData('text/plain', resolvedUrl);
+    if(legacyOutput) dataTransfer.setData('application/x-canvas-output-image', resolvedUrl);
+    return true;
+}
+function bindCanvasAssetSaveDragSource(element, source){
+    if(!element) return;
+    const resolveSource = () => typeof source === 'function' ? source() : source;
+    const current = resolveSource() || {};
+    element.draggable = Boolean(current.url);
+    element.dataset.canvasAssetSaveSource = String(current.kind || 'image');
+    element.addEventListener('mousedown', event => {
+        if(event.button === 0) event.stopPropagation();
+    }, true);
+    element.addEventListener('dragstart', event => {
+        const next = resolveSource() || {};
+        if(!setCanvasAssetSaveDragData(event.dataTransfer, next)){
+            event.preventDefault();
+            return;
+        }
+        event.stopPropagation();
+        element.dataset.dragging = '1';
+        if(element.tagName === 'IMG') setOutputDragPreview(event, element);
+    });
+    element.addEventListener('dragend', () => setTimeout(() => { delete element.dataset.dragging; }, 0));
+}
 function bindOutputWrap(wrap, node){
     const img = wrap.querySelector('img');
     const video = wrap.querySelector('video');
@@ -6373,10 +6897,7 @@ function bindOutputWrap(wrap, node){
         if(!url || e.target.closest('button,audio,video')) return;
         e.stopPropagation();
         wrap.dataset.dragging = '1';
-        e.dataTransfer.effectAllowed = 'copy';
-        e.dataTransfer.setData('application/x-canvas-output-image', url);
-        e.dataTransfer.setData('text/uri-list', url);
-        e.dataTransfer.setData('text/plain', url);
+        setCanvasAssetSaveDragData(e.dataTransfer, {url, name:outputImageName(url), kind:'output', legacyOutput:true});
         if(img) setOutputDragPreview(e, img);
     };
     wrap.ondragend = () => setTimeout(() => { delete wrap.dataset.dragging; }, 0);
@@ -6386,9 +6907,7 @@ function bindOutputWrap(wrap, node){
             e.stopPropagation();
             img.dataset.dragging = '1';
             setOutputDragPreview(e, img);
-            e.dataTransfer.effectAllowed = 'copy';
-            e.dataTransfer.setData('application/x-canvas-output-image', img.dataset.url);
-            e.dataTransfer.setData('text/uri-list', img.dataset.url);
+            setCanvasAssetSaveDragData(e.dataTransfer, {url:img.dataset.url, name:outputImageName(img.dataset.url), kind:'output', legacyOutput:true});
         };
         img.ondragend = () => setTimeout(() => { delete img.dataset.dragging; }, 0);
         img.onclick = e => {
@@ -6513,6 +7032,7 @@ function refreshOutputNodeContent(node){
     return true;
 }
 function defaultNodeSize(type){
+    if(type === SpatialFrames?.FRAME_TYPE) return {w:520, h:340};
     if(type === 'image') return {w:260, h:336};
     if(type === 'prompt') return {w:310, h:0};
     if(type === 'loop') return {w:336, h:0};
@@ -6553,11 +7073,12 @@ function loopInputPromptItems(node){
             .forEach(n => {
                 let text = '';
                 if(n.type === 'prompt') {
-                    if((n.text || '').trim()) items.push((n.text || '').trim());
+                    const prompts = classicPromptItems(n).map(part => String(part || '').trim()).filter(Boolean);
+                    items.push(...prompts);
                     return;
                 }
                 else if(n.type === 'promptGroup') {
-                    const parts = (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean).map(p => p.text || '').filter(Boolean);
+                    const parts = (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean).flatMap(p => classicPromptItems(p));
                     parts.forEach(part => {
                         const text = String(part || '').trim();
                         if(text) items.push(text);
@@ -6565,7 +7086,11 @@ function loopInputPromptItems(node){
                     return;
                 }
                 else if(n.type === 'loop') text = renderLoopPrompt(n);
-                else if(n.type === 'llm') text = n.outputText || '';
+                else if(n.type === 'llm') {
+                    const prompts = classicLLMOutputItems(n).map(part => String(part || '').trim()).filter(Boolean);
+                    items.push(...prompts);
+                    return;
+                }
                 if(String(text || '').trim()) items.push(String(text || '').trim());
             });
         return items;
@@ -6578,13 +7103,54 @@ function loopInputPrompt(node, ctx=loopContext){
     if(!items.length) return '';
     const startBase = Math.max(1, Number(node?.loopStart) || 1);
     const currentIndex = Math.max(1, Number(ctx?.index || startBase) || startBase);
-    return items[(currentIndex - 1) % items.length];
+    return items[currentIndex - 1] || '';
+}
+function classicLoopPromptFieldValues(node){
+    if(Array.isArray(node?.variablePrompts) && node.variablePrompts.length){
+        return node.variablePrompts.map(value => String(value || '').trim());
+    }
+    const legacy = String(node?.variablePrompt || '').trim();
+    return legacy ? [legacy] : [];
+}
+function setClassicLoopPromptFieldValues(node, values){
+    if(!node || node.type !== 'loop') return [];
+    const fields = (Array.isArray(values) ? values : [])
+        .map(value => String(value || '').trim());
+    node.variablePrompts = fields.length ? fields : [''];
+    node.variablePrompt = node.variablePrompts.filter(Boolean).join('\n');
+    return node.variablePrompts;
+}
+function addClassicLoopPromptField(node){
+    const existing = classicLoopPromptFieldValues(node);
+    const fields = existing.length ? existing : [''];
+    return setClassicLoopPromptFieldValues(node, [...fields, '']);
+}
+function removeClassicLoopPromptField(node, index){
+    const fields = classicLoopPromptFieldValues(node);
+    const current = fields.length ? [...fields] : [''];
+    if(current.length <= 1) return setClassicLoopPromptFieldValues(node, current);
+    const target = Number(index);
+    if(Number.isInteger(target) && target >= 0 && target < current.length) current.splice(target, 1);
+    return setClassicLoopPromptFieldValues(node, current);
+}
+function classicLoopPromptCapacity(node){
+    if(!node?.showPrompt) return 0;
+    const upstreamCount = loopInputPromptItems(node).length;
+    const localCount = classicLoopPromptFieldValues(node).filter(Boolean).length;
+    return Math.max(upstreamCount, localCount);
+}
+function classicLoopSelectedLocalPrompt(node, ctx=loopContext){
+    const fields = classicLoopPromptFieldValues(node).filter(Boolean);
+    if(!fields.length) return '';
+    const startBase = Math.max(1, Number(node?.loopStart) || 1);
+    const index = Math.max(1, Number(ctx?.index || startBase) || startBase);
+    return fields[index - 1] || '';
 }
 function renderLoopPrompt(node, ctx=loopContext){
     if(!node?.showPrompt) return '';
-    const variable = String(node?.variablePrompt || '').trim();
     const count = loopCount(node);
-    const index = Math.max(1, Number(ctx?.index || 1) || 1);
+    const startBase = Math.max(1, Number(node?.loopStart) || 1);
+    const index = Math.max(1, Number(ctx?.index || startBase) || startBase);
     const total = Math.max(1, Number(ctx?.total || count) || count);
     const replaceVars = text => String(text || '')
         .replaceAll('《计数》', String(index))
@@ -6594,8 +7160,8 @@ function renderLoopPrompt(node, ctx=loopContext){
         .replaceAll(`[${tr('canvas.totalToken')}]`, String(total))
         .replaceAll(`[${tr('canvas.progressToken')}]`, `${index}/${total}`);
     const selected = loopInputPrompt(node, ctx);
-    if(selected) return replaceVars(selected);
-    return replaceVars(variable);
+    const local = classicLoopSelectedLocalPrompt(node, ctx);
+    return replaceVars([selected, local].filter(Boolean).join('\n\n'));
 }
 function imageRefsFromNode(node){
     if(!node) return [];
@@ -6615,17 +7181,46 @@ function imageRefsFromNode(node){
     if(CANVAS_IMAGE_OUTPUT_TYPES.includes(node.type)) return generatedImageRefs(node).filter(ref => ref.kind === 'image');
     return [];
 }
+function cascadeSourceRefsFromNode(node, ctx=loopContext){
+    const override = node?.id && ctx?.sourceRefsByNode ? ctx.sourceRefsByNode[node.id] : null;
+    return Array.isArray(override) ? override : imageRefsFromNode(node);
+}
+function loopImageStartForRound(roundValue, batchValue){
+    const round = Math.max(1, Number(roundValue) || 1);
+    const batchSize = Math.max(1, Math.min(100, Number(batchValue) || 1));
+    return (round - 1) * batchSize;
+}
+function classicLoopWindowState(totalValue, roundValue, batchValue){
+    const total = Math.max(0, Math.floor(Number(totalValue) || 0));
+    const batchSize = Math.max(1, Math.min(100, Number(batchValue) || 1));
+    const startIndex = loopImageStartForRound(roundValue, batchSize);
+    const rangeAt = index => {
+        if(index >= total) return null;
+        const count = Math.min(batchSize, total - index);
+        return {start:index + 1, end:index + count, count};
+    };
+    return {
+        total,
+        skippedCount:Math.min(total, startIndex),
+        current:rangeAt(startIndex),
+        next:rangeAt(startIndex + batchSize),
+    };
+}
+function loopPreviewImageRefs(node, ctx=loopContext){
+    if(!node?.imageInput) return [];
+    return connections
+        .filter(c => c.to === node.id)
+        .flatMap(c => cascadeSourceRefsFromNode(nodes.find(n => n.id === c.from), ctx))
+        .filter(ref => ref?.url);
+}
 function loopInputImageRefs(node, ctx=loopContext){
     if(!node?.imageInput) return [];
-    const allRefs = connections
-        .filter(c => c.to === node.id)
-        .flatMap(c => imageRefsFromNode(nodes.find(n => n.id === c.from)))
-        .filter(ref => ref?.url);
+    const allRefs = loopPreviewImageRefs(node, ctx);
     if(!allRefs.length) return [];
     const startBase = Math.max(1, Number(node.loopStart) || 1);
     const batchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
-    const currentIndex = Math.max(1, Number(ctx?.index || startBase) || startBase);
-    const start = Math.max(0, currentIndex - 1);
+    const currentRound = Math.max(1, Number(ctx?.index || startBase) || startBase);
+    const start = loopImageStartForRound(currentRound, batchSize);
     return allRefs.slice(start, start + batchSize);
 }
 function videoRefsFromNode(node){
@@ -6660,8 +7255,8 @@ function loopInputVideoRefs(node, ctx=loopContext){
     if(!allRefs.length) return [];
     const startBase = Math.max(1, Number(node.loopStart) || 1);
     const batchSize = Math.max(1, Math.min(100, Number(node.videoBatchSize) || 1));
-    const currentIndex = Math.max(1, Number(ctx?.index || startBase) || startBase);
-    const start = Math.max(0, currentIndex - 1);
+    const currentRound = Math.max(1, Number(ctx?.index || startBase) || startBase);
+    const start = loopImageStartForRound(currentRound, batchSize);
     return allRefs.slice(start, start + batchSize);
 }
 function loopTokenLabel(token){
@@ -6684,10 +7279,121 @@ function autoSizeLoopForPanels(node){
     if(!node) return;
     node.w = Math.max(Number(node.w || 0), 336);
     const panels = (node.showPrompt ? 1 : 0) + (node.imageInput ? 1 : 0);
+    const promptRows = Math.max(1, classicLoopPromptFieldValues(node).length);
+    const promptRowGrowth = node.showPrompt ? (Math.min(promptRows, 6) - 1) * 58 : 0;
     if(panels === 0) { delete node.h; return; }
-    if(panels === 1) node.h = node.showPrompt ? 330 : 320;
-    else if(panels === 2) node.h = (node.showPrompt && node.imageInput) ? 390 : 380;
-    else node.h = 460;
+    const baseHeight = panels === 1
+        ? (node.showPrompt ? 410 : 350)
+        : (node.showPrompt && node.imageInput ? 530 : 430);
+    const minimumHeight = Math.min(720, baseHeight + promptRowGrowth);
+    node.h = Math.max(Number(node.h || 0), minimumHeight);
+}
+function scheduleRenderedLoopAutoSize(node, el){
+    if(!node || node.type !== 'loop' || (!node.showPrompt && !node.imageInput) || !el) return;
+    const measure = () => {
+        if(!el.isConnected) return;
+        const body = el.querySelector('.node-body');
+        const loopBody = el.querySelector('.loop-body');
+        const head = el.querySelector('.node-head');
+        if(!body || !loopBody || !head) return;
+        const currentHeight = Number(node.h || el.offsetHeight || 0);
+        const nextHeight = ClassicCascadePlan.growLoopNodeHeight({
+            currentHeight,
+            bodyScrollHeight:Math.max(body.scrollHeight, loopBody.scrollHeight),
+            headerHeight:head.offsetHeight,
+            maxHeight:900,
+        });
+        if(nextHeight <= currentHeight) return;
+        node.h = nextHeight;
+        el.classList.add('sized');
+        el.style.height = `${nextHeight}px`;
+        scheduleLinksRender();
+        scheduleMinimapRender();
+    };
+    if(typeof requestAnimationFrame === 'function') requestAnimationFrame(measure);
+    else measure();
+}
+function classicLLMMediaAutoHeightPlan(options={}){
+    const minimumHeight = 360;
+    const defaultHeight = Math.max(minimumHeight, Math.round(Number(options.defaultHeight) || 590));
+    const currentHeight = Math.max(minimumHeight, Math.round(Number(options.currentHeight) || defaultHeight));
+    const appliedHeight = Math.max(0, Math.round(Number(options.appliedHeight) || 0));
+    if(!options.hasMedia){
+        if(!appliedHeight) return {height:currentHeight, appliedHeight:0, changed:false, clearExplicitHeight:false};
+        const height = Math.max(minimumHeight, currentHeight - appliedHeight);
+        return {
+            height,
+            appliedHeight:0,
+            changed:height !== currentHeight,
+            clearExplicitHeight:options.hadExplicitHeight === false && height <= defaultHeight,
+        };
+    }
+    const mediaFootprint = Math.max(0, Math.ceil(Number(options.mediaFootprint) || 0));
+    const clippedOverflow = Math.max(0, Math.ceil(Number(options.clippedOverflow) || 0));
+    const remainingFootprint = Math.max(0, mediaFootprint - appliedHeight);
+    const increase = clippedOverflow > 0 ? Math.min(remainingFootprint, clippedOverflow + 2) : 0;
+    if(!increase) return {height:currentHeight, appliedHeight, changed:false, clearExplicitHeight:false};
+    return {
+        height:currentHeight + increase,
+        appliedHeight:appliedHeight + increase,
+        changed:true,
+        clearExplicitHeight:false,
+    };
+}
+function scheduleRenderedLLMMediaAutoSize(node, el){
+    if(!node || node.type !== 'llm' || !el) return;
+    const measure = () => {
+        if(!el.isConnected) return;
+        const body = el.querySelector('.node-body');
+        const llmBody = el.querySelector('.llm-body');
+        const activePane = el.querySelector('.llm-node-pane');
+        if(!body || !llmBody || !activePane) return;
+        const mediaPreview = llmBody.querySelector(':scope > .llm-media-preview');
+        const mediaBlocks = mediaPreview
+            ? [mediaPreview, mediaPreview.nextElementSibling].filter(block => block && block !== activePane)
+            : [];
+        const hasMedia = mediaBlocks.length > 0;
+        const appliedHeight = Math.max(0, Number(node.llmMediaAutoExpanded) || 0);
+        if(hasMedia && node.mode === 'chat') return;
+        if(!hasMedia && !appliedHeight) return;
+        const style = typeof getComputedStyle === 'function' ? getComputedStyle(llmBody) : null;
+        const gap = Math.max(0, parseFloat(style?.rowGap || style?.gap || 0) || 0);
+        const mediaFootprint = mediaBlocks.reduce((sum, block) => sum + Math.max(0, Number(block.offsetHeight) || 0), 0) + gap * mediaBlocks.length;
+        const clippedOverflow = Math.max(
+            0,
+            activePane.scrollHeight - activePane.clientHeight,
+            body.scrollHeight - body.clientHeight,
+        );
+        if(hasMedia && !appliedHeight && node.llmMediaAutoExpandedHadExplicitHeight === undefined){
+            node.llmMediaAutoExpandedHadExplicitHeight = Boolean(node.h);
+        }
+        const defaultHeight = Number(defaultNodeSize('llm').h || 590);
+        const currentHeight = Number(node.h || el.offsetHeight || defaultHeight);
+        const plan = classicLLMMediaAutoHeightPlan({
+            currentHeight,
+            appliedHeight,
+            hasMedia,
+            mediaFootprint,
+            clippedOverflow,
+            defaultHeight,
+            hadExplicitHeight:node.llmMediaAutoExpandedHadExplicitHeight !== false,
+        });
+        if(!plan.changed) return;
+        if(plan.clearExplicitHeight) delete node.h;
+        else node.h = plan.height;
+        if(plan.appliedHeight > 0) node.llmMediaAutoExpanded = plan.appliedHeight;
+        else {
+            delete node.llmMediaAutoExpanded;
+            delete node.llmMediaAutoExpandedHadExplicitHeight;
+        }
+        const renderedHeight = Number(node.h || defaultHeight);
+        el.classList.add('sized');
+        el.style.height = `${renderedHeight}px`;
+        scheduleLinksRender();
+        scheduleMinimapRender();
+    };
+    if(typeof requestAnimationFrame === 'function') requestAnimationFrame(measure);
+    else measure();
 }
 function loopTokenChipHtml(token){
     return `<span class="loop-token-chip" contenteditable="false" data-token="${escapeAttr(token)}"><span>${escapeHtml(loopTokenLabel(token))}</span><button type="button" aria-label="${tr('common.delete')}" title="${tr('common.delete')}">×</button></span>`;
@@ -6705,6 +7411,19 @@ function loopEditorText(editor){
         return [...node.childNodes].map(walk).join('');
     };
     return [...(editor?.childNodes || [])].map(walk).join('').replace(/\u00a0/g, ' ');
+}
+function classicLoopPromptRowsHtml(node){
+    const stored = classicLoopPromptFieldValues(node);
+    const fields = stored.length ? stored : [''];
+    const canDelete = fields.length > 1;
+    const rows = fields.map((value, index) => `
+        <div class="loop-prompt-item">
+            <span class="loop-prompt-index" aria-hidden="true">${index + 1}</span>
+            <div class="loop-variable-editor" data-loop-prompt-index="${index}" contenteditable="true" data-placeholder="${escapeAttr(tr('canvas.loopVariablePlaceholder'))}">${loopVariableHtml(value)}</div>
+            <button class="loop-prompt-delete" type="button" data-loop-prompt-delete="${index}" aria-label="${escapeAttr(tr('common.delete'))}" title="${escapeAttr(tr('common.delete'))}" ${canDelete ? '' : 'disabled'}>&times;</button>
+        </div>`).join('');
+    return `<div class="loop-prompt-list">${rows}</div>
+        <div class="loop-prompt-actions"><button class="loop-prompt-add" type="button" data-loop-prompt-add aria-label="${escapeAttr(tr('canvas.loopAddPrompt'))}" title="${escapeAttr(tr('canvas.loopAddPrompt'))}">+</button></div>`;
 }
 function insertLoopToken(editor, token){
     if(!editor) return;
@@ -6728,6 +7447,45 @@ function insertLoopToken(editor, token){
         editor.appendChild(spacer);
     }
 }
+const CLASSIC_PROMPT_SEPARATOR_DEFAULT = '----';
+const CLASSIC_PROMPT_SPLIT_PREVIEW_DEFAULT_HEIGHT = 70;
+const CLASSIC_PROMPT_SPLIT_PREVIEW_MIN_HEIGHT = 44;
+const CLASSIC_PROMPT_SPLIT_PREVIEW_MAX_HEIGHT = 220;
+function classicPromptSeparator(node){
+    return String(node?.promptSeparator || CLASSIC_PROMPT_SEPARATOR_DEFAULT);
+}
+function classicPromptItems(node){
+    const text = String(node?.text || '');
+    if(!text.trim()) return [];
+    if(node?.promptSplitEnabled !== true) return [text];
+    const separator = classicPromptSeparator(node);
+    if(!separator) return [text];
+    const items = text.split(separator).map(item => item.trim()).filter(Boolean);
+    return items.length ? items : [text];
+}
+function classicPromptText(node){
+    return classicPromptItems(node).join('\n\n');
+}
+function classicPromptSplitPreviewHeight(node){
+    return Math.max(
+        CLASSIC_PROMPT_SPLIT_PREVIEW_MIN_HEIGHT,
+        Math.min(CLASSIC_PROMPT_SPLIT_PREVIEW_MAX_HEIGHT, Number(node?.promptSplitPreviewHeight) || CLASSIC_PROMPT_SPLIT_PREVIEW_DEFAULT_HEIGHT)
+    );
+}
+function classicPromptSegmentItemsHtml(node){
+    return classicPromptItems(node).map((item, index) => `<div class="classic-prompt-segment"><span>${index + 1}</span><div>${escapeHtml(item)}</div></div>`).join('');
+}
+function classicPromptSegmentCountText(node){
+    const count = classicPromptItems(node).length;
+    return langIsEn() ? `${count} segment${count === 1 ? '' : 's'}` : `${count} 段`;
+}
+function refreshClassicPromptSegmentsUi(container, node){
+    if(node?.promptSplitEnabled !== true) return;
+    const count = container?.querySelector('.classic-prompt-split-count');
+    const segments = container?.querySelector('.classic-prompt-segments');
+    if(count) count.textContent = classicPromptSegmentCountText(node);
+    if(segments) segments.innerHTML = classicPromptSegmentItemsHtml(node);
+}
 function promptTextLength(text){
     return Array.from(String(text || '')).length;
 }
@@ -6742,6 +7500,28 @@ function refreshPromptCounter(container, text){
     const count = promptTextLength(text);
     counter.classList.toggle('over', count > PROMPT_TEXT_MAX_LENGTH);
     counter.innerHTML = `<span>${count.toLocaleString()}</span><span>/ ${PROMPT_TEXT_MAX_LENGTH.toLocaleString()}</span>`;
+}
+let canvasAssetStatusTimer = null;
+function showCanvasAssetStatus(message, tone='info'){
+    const statusEl = canvasAssetStatus;
+    if(!statusEl) return;
+    const text = String(message || '').trim();
+    if(canvasAssetStatusTimer){
+        clearTimeout(canvasAssetStatusTimer);
+        canvasAssetStatusTimer = null;
+    }
+    statusEl.textContent = text;
+    statusEl.classList.toggle('success', tone === 'success');
+    statusEl.classList.toggle('error', tone === 'error');
+    statusEl.hidden = !text;
+    if(text){
+        canvasAssetStatusTimer = setTimeout(() => {
+            statusEl.hidden = true;
+            statusEl.textContent = '';
+            statusEl.classList.remove('success', 'error');
+            canvasAssetStatusTimer = null;
+        }, tone === 'error' ? 7000 : 4500);
+    }
 }
 function canvasAssetLibraries(){
     return Array.isArray(canvasAssetLibrary.libraries) && canvasAssetLibrary.libraries.length ? canvasAssetLibrary.libraries : [{id:'default', name:'默认资产库', categories:canvasAssetLibrary.categories || []}];
@@ -6926,7 +7706,7 @@ async function loadCanvasAssetLibrary({renderPanel=true}={}){
         if(renderPanel) renderCanvasAssetLibrary();
         return data;
     } catch(e) {
-        setStatus('资产库加载失败');
+        showCanvasAssetStatus(e?.message || '资产库加载失败', 'error');
         return null;
     }
 }
@@ -7010,33 +7790,41 @@ function toggleCanvasAssetLibrary(open=!canvasAssetLibraryOpen){
     if(canvasAssetLibraryOpen) loadCanvasAssetLibrary();
 }
 async function addUrlToCanvasAssetLibrary(url, name=''){
-    if(canvasAssetLibraryIsLocal()){ setStatus('本地素材请在素材库管理中上传'); return; }
+    if(canvasAssetLibraryIsLocal()){ showCanvasAssetStatus('本地素材请在素材库管理中上传', 'error'); return null; }
     const cat = activeCanvasAssetCategory();
-    if(!cat){ setStatus('请先创建资产分组'); return; }
-    if(String(cat.type || 'image').toLowerCase() === 'workflow'){ setStatus('当前是工作流分组，请切换到图片分组保存媒体'); return; }
-    const data = await fetch('/api/asset-library/items', {
+    if(!cat){ showCanvasAssetStatus('请先创建资产分组', 'error'); return null; }
+    if(String(cat.type || 'image').toLowerCase() === 'workflow'){ showCanvasAssetStatus('当前是工作流分组，请切换到图片分组保存媒体', 'error'); return null; }
+    if(!String(url || '').trim()){ showCanvasAssetStatus('没有可保存的图片地址', 'error'); return null; }
+    showCanvasAssetStatus('正在保存到资产库...');
+    const response = await fetch('/api/asset-library/items', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({library_id:activeCanvasAssetLibraryId, category_id:cat.id, url, name})
-    }).then(async r => {
-        if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '保存失败');
-        return r.json();
     });
+    if(!response.ok) throw new Error(await responseErrorMessage(response, '保存资产失败'));
+    const data = await response.json();
+    if(!data?.library) throw new Error('资产库没有返回保存结果');
     canvasAssetLibrary = data.library || canvasAssetLibrary;
     renderCanvasAssetLibrary();
-    setStatus('已保存到资产库');
+    return data;
 }
 async function uploadFilesToLibrary(files, libraryId, categoryId){
     const form = new FormData();
     [...files].forEach(file => form.append('files', file));
-    const uploaded = await fetch('/api/ai/upload', {method:'POST', body:form}).then(r => r.json());
+    const uploadResponse = await fetch('/api/ai/upload', {method:'POST', body:form});
+    if(!uploadResponse.ok) throw new Error(await responseErrorMessage(uploadResponse, '上传图片失败'));
+    const uploaded = await uploadResponse.json();
     const items = (uploaded.files || []).filter(file => file?.url).map(file => ({library_id:libraryId, category_id:categoryId, url:file.url, name:file.name || 'asset'}));
-    if(!items.length) return null;
-    return fetch('/api/asset-library/items/batch', {
+    if(!items.length) throw new Error(uploaded?.detail || '上传完成，但没有返回可保存的图片');
+    const batchResponse = await fetch('/api/asset-library/items/batch', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({library_id:libraryId, category_id:categoryId, items})
-    }).then(r => r.json());
+    });
+    if(!batchResponse.ok) throw new Error(await responseErrorMessage(batchResponse, '保存图片到资产库失败'));
+    const data = await batchResponse.json();
+    if(!data?.library) throw new Error('资产库没有返回批量保存结果');
+    return data;
 }
 function openAssetManager(){
     assetManagerModal?.classList.add('open');
@@ -7317,13 +8105,15 @@ function renderCanvasPromptLibrarySelect(){
 }
 function activeCanvasPromptTemplateGroups(){
     const lib = activeCanvasPromptLibrary();
+    const fromLibrary = Array.isArray(lib?.categories) ? lib.categories.filter(c => c?.id && c?.name) : [];
+    if(fromLibrary.length) return fromLibrary;
     if(!lib || lib.id === 'system') return promptTemplateGroups;
-    return Array.isArray(lib.categories) ? lib.categories.filter(c => c?.id && c?.name) : [];
+    return [];
 }
 function canvasPromptTemplateCategoryLabel(category){
     if(category === 'all') return tr('smart.tplAll');
     const lib = activeCanvasPromptLibrary();
-    if(lib && lib.id !== 'system'){
+    if(lib && !lib.readonly){
         return activeCanvasPromptTemplateGroups().find(g => g.id === category)?.name || category || '';
     }
     const builtin = {
@@ -7379,7 +8169,9 @@ function currentCanvasPromptTemplateLibraryEditable(){
     return Boolean(lib && !lib.readonly);
 }
 function currentCanvasPromptTemplateNodeText(){
-    const node = nodes.find(n => n.id === promptTemplateNodeId && n.type === 'prompt');
+    const node = nodes.find(n => n.id === promptTemplateNodeId && ['prompt','generator','llm'].includes(n.type));
+    if(node?.type === 'generator') return String(node.localPrompt || '').trim();
+    if(node?.type === 'llm') return String(node.userInput || '').trim();
     return String(node?.text || '').trim();
 }
 function syncCanvasPromptTemplateButtons(){
@@ -7551,7 +8343,7 @@ async function createCanvasPromptTemplateGroup(){
     const name = window.prompt(tr('smart.tplNewGroupPrompt'), tr('smart.tplNewGroupDefault'));
     if(!String(name || '').trim()) return;
     const lib = activeCanvasPromptLibrary();
-    if(lib && lib.id !== 'system'){
+    if(lib && !lib.readonly){
         try {
             const data = await fetch('/api/prompt-libraries/categories', {
                 method:'POST', headers:{'Content-Type':'application/json'},
@@ -7576,7 +8368,7 @@ async function renameCanvasPromptTemplateGroup(groupId){
     if(!group) return;
     const name = window.prompt(tr('smart.tplGroupNamePrompt'), group.name || '');
     if(!String(name || '').trim()) return;
-    if(lib && lib.id !== 'system'){
+    if(lib && !lib.readonly){
         try {
             const data = await fetch(`/api/prompt-libraries/categories/${encodeURIComponent(groupId)}`, {
                 method:'PATCH', headers:{'Content-Type':'application/json'},
@@ -7625,12 +8417,88 @@ async function deleteCanvasPromptTemplateGroup(groupId){
     refreshCanvasPromptTemplatesFromLibraries();
     renderPromptTemplateModal();
 }
+async function reorderCanvasPromptTemplateGroups(movedId, targetId, after=false){
+    const order = window.PromptTemplateOrder;
+    const library = activeCanvasPromptLibrary();
+    if(!order || !library || library.readonly) return;
+    const currentIds = (library.categories || []).map(group => group?.id).filter(Boolean);
+    const orderedIds = order.moveId(currentIds, movedId, targetId, after);
+    if(orderedIds.join('\u0000') === currentIds.join('\u0000')) return;
+    try {
+        const data = await fetch('/api/prompt-libraries/categories/reorder', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({library_id:library.id, ordered_ids:orderedIds})
+        }).then(async response => {
+            if(!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || '分组排序失败');
+            return response.json();
+        });
+        canvasPromptLibraries = data.library?.libraries || canvasPromptLibraries;
+        refreshCanvasPromptTemplatesFromLibraries();
+        renderPromptTemplateModal();
+    } catch(error){ setStatus(error.message || '分组排序失败'); }
+}
+async function reorderCanvasPromptTemplateItems(movedId, targetId, after=false){
+    const order = window.PromptTemplateOrder;
+    const library = activeCanvasPromptLibrary();
+    const query = String(promptTemplateSearch?.value || promptTemplateQuery || '').trim();
+    if(!order || !library || library.readonly || !order.canSortItems({category:promptTemplateCategory, query})) return;
+    const records = Array.isArray(library.items) ? library.items : [];
+    const subsetIds = records.filter(item => item?.category === promptTemplateCategory).map(item => item.id).filter(Boolean);
+    if(!subsetIds.includes(movedId) || !subsetIds.includes(targetId)) return;
+    const currentIds = records.map(item => item?.id).filter(Boolean);
+    const orderedIds = order.mergeSubsetOrder(records, subsetIds, movedId, targetId, after);
+    if(orderedIds.join('\u0000') === currentIds.join('\u0000')) return;
+    try {
+        const data = await fetch('/api/prompt-libraries/items/reorder', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({library_id:library.id, ordered_ids:orderedIds})
+        }).then(async response => {
+            if(!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || '提示词排序失败');
+            return response.json();
+        });
+        canvasPromptLibraries = data.library?.libraries || canvasPromptLibraries;
+        refreshCanvasPromptTemplatesFromLibraries();
+        renderPromptTemplateModal();
+    } catch(error){ setStatus(error.message || '提示词排序失败'); }
+}
+function bindCanvasPromptTemplateOrdering(query=''){
+    promptTemplateCats._promptOrderCleanup?.();
+    promptTemplateCats._promptOrderCleanup = null;
+    promptTemplateBody._promptOrderCleanup?.();
+    promptTemplateBody._promptOrderCleanup = null;
+    const order = window.PromptTemplateOrder;
+    const library = activeCanvasPromptLibrary();
+    if(!order || !library || library.readonly) return;
+    if(promptTemplateGroupEditMode){
+        promptTemplateCats._promptOrderCleanup = order.bindSortable(promptTemplateCats, {
+            handleSelector:'[data-template-group-drag]',
+            targetSelector:'[data-template-group-order-id]',
+            handleId:element => element?.dataset?.templateGroupDrag,
+            targetId:element => element?.dataset?.templateGroupOrderId,
+            onDrop:({movedId,targetId,after}) => reorderCanvasPromptTemplateGroups(movedId,targetId,after)
+        });
+    }
+    if(order.canSortItems({category:promptTemplateCategory, query})){
+        promptTemplateBody._promptOrderCleanup = order.bindSortable(promptTemplateBody, {
+            handleSelector:'[data-template-item-drag]',
+            targetSelector:'[data-template-item-order-id]',
+            handleId:element => element?.dataset?.templateItemDrag,
+            targetId:element => element?.dataset?.templateItemOrderId,
+            onDrop:({movedId,targetId,after}) => reorderCanvasPromptTemplateItems(movedId,targetId,after)
+        });
+    }
+}
 function renderPromptTemplateModal(){
     if(!promptTemplateModal || !promptTemplatePanel || !promptTemplateCats || !promptTemplateBody) return;
     canvasPromptTemplates = activeCanvasPromptLibraryItems();
     renderCanvasPromptLibrarySelect();
     const scrollSnapshot = promptTemplateScrollSnapshot();
+    const query = String(promptTemplateSearch?.value || promptTemplateQuery || '').trim().toLowerCase();
     const activeGroups = activeCanvasPromptTemplateGroups();
+    const activeLibrary = activeCanvasPromptLibrary();
+    const canReorderLibrary = Boolean(window.PromptTemplateOrder && activeLibrary && !activeLibrary.readonly);
+    const reorderableItemIds = new Set((activeLibrary?.items || []).map(item => item?.id).filter(Boolean));
+    const canReorderItems = Boolean(canReorderLibrary && window.PromptTemplateOrder.canSortItems({category:promptTemplateCategory, query}));
     const categories = [{id:'all', name:tr('smart.tplAll')}, ...activeGroups.map(group => ({...group, name:canvasPromptTemplateCategoryLabel(group.id)}))];
     const counts = canvasPromptTemplates.reduce((map, item) => {
         const category = item.category || 'mine';
@@ -7652,7 +8520,8 @@ function renderPromptTemplateModal(){
             </div>
             <div class="prompt-template-group-list">
                 ${activeGroups.map(group => `
-                    <div class="prompt-template-group-row ${['view','storyboard','character','product','lighting','mine'].includes(group.id) ? '' : 'has-delete'}">
+                    <div class="prompt-template-group-row ${canReorderLibrary ? 'has-order' : ''} ${['view','storyboard','character','product','lighting','mine'].includes(group.id) ? '' : 'has-delete'}" data-template-group-order-id="${escapeAttr(group.id)}">
+                        ${canReorderLibrary ? `<button type="button" class="group-tool prompt-template-drag-handle" draggable="true" data-template-group-drag="${escapeAttr(group.id)}" title="${escapeAttr(tr('smart.tplDragSort'))}"><i data-lucide="grip-vertical"></i></button>` : ''}
                         <button type="button" class="group-name ${group.id === promptTemplateCategory ? 'active' : ''}" data-template-cat="${escapeAttr(group.id)}">
                             <span>${escapeHtml(canvasPromptTemplateCategoryLabel(group.id))}</span>
                             <small>${counts[group.id] || 0}</small>
@@ -7687,7 +8556,8 @@ function renderPromptTemplateModal(){
                 <button type="button" ${canCreateCurrentLibrary ? '' : 'disabled'} data-template-save-current><i data-lucide="bookmark-plus"></i><span>${escapeHtml(tr('smart.tplSaveCurrent'))}</span></button>
                 <button type="button" ${canCreateCurrentLibrary ? '' : 'disabled'} data-template-new><i data-lucide="file-plus-2"></i><span>${escapeHtml(tr('smart.tplNewTemplate'))}</span></button>
             </div>
-            ${items.length ? items.map(item => `<button type="button" class="prompt-template-card ${item.id === selected?.id ? 'active' : ''}" data-template-id="${escapeAttr(item.id)}">
+            ${items.length ? items.map(item => `<button type="button" class="prompt-template-card ${item.id === selected?.id ? 'active' : ''}" data-template-id="${escapeAttr(item.id)}" data-template-item-order-id="${escapeAttr(item.id)}">
+                ${canReorderItems && reorderableItemIds.has(item.id) ? `<span class="prompt-template-drag-handle prompt-template-card-drag" draggable="true" data-template-item-drag="${escapeAttr(item.id)}" title="${escapeAttr(tr('smart.tplDragSort'))}"><i data-lucide="grip-vertical"></i></span>` : ''}
                 <span class="prompt-template-card-top">
                     <span class="prompt-template-name">${escapeHtml(canvasPromptTemplateName(item))}</span>
                     <span class="prompt-template-source">${escapeHtml(item.builtin ? tr('smart.tplBuiltin') : tr('smart.tplMine'))}</span>
@@ -7744,6 +8614,7 @@ function renderPromptTemplateModal(){
             ` : `<div class="prompt-template-empty">${escapeHtml(tr('smart.tplPickOrCreate'))}</div>`}
         </div>
     `;
+    bindCanvasPromptTemplateOrdering(query);
     refreshIcons();
     restorePromptTemplateScroll(scrollSnapshot);
 }
@@ -7768,9 +8639,12 @@ function closePromptTemplateModal(){
 }
 function applyPromptTemplateToPromptNode(mode='positive'){
     const template = canvasPromptTemplates.find(item => item.id === promptTemplateSelectedId);
-    const node = nodes.find(n => n.id === promptTemplateNodeId && n.type === 'prompt');
+    const node = nodes.find(n => n.id === promptTemplateNodeId && ['prompt','generator','llm'].includes(n.type));
     if(!template || !node) return;
-    node.text = canvasPromptTemplateText(template, mode);
+    const templateText = canvasPromptTemplateText(template, mode);
+    if(node.type === 'generator') node.localPrompt = templateText;
+    else if(node.type === 'llm') node.userInput = templateText;
+    else node.text = templateText;
     closePromptTemplateModal();
     scheduleSave();
     syncGeneratorInputs();
@@ -7787,88 +8661,113 @@ function renderLoopBody(node){
     node.showPrompt = Boolean(node.showPrompt);
     node.imageInput = Boolean(node.imageInput);
     node.videoInput = false;
-    const imageInputCount = loopInputImageRefs(node, {index:node.loopStart}).length;
-    const promptItemCount = node.showPrompt ? loopInputPromptItems(node).length : 0;
-    const hasUpstreamPrompt = promptItemCount > 0;
+    const previewImages = loopPreviewImageRefs(node);
+    const imageWindow = classicLoopWindowState(previewImages.length, node.loopStart, node.imageBatchSize);
+    const rangeText = range => range ? (range.start === range.end ? String(range.start) : `${range.start}–${range.end}`) : '';
+    const imageSummaryForWindow = windowState => {
+        const current = !node.imageInput
+            ? tr('canvas.loopSummaryImagesDisabled')
+            : windowState.current
+                ? trf('canvas.loopSummaryCurrentImages', {range:rangeText(windowState.current)})
+                : tr('canvas.loopSummaryNoCurrentImages');
+        const next = !node.imageInput
+            ? ''
+            : windowState.next
+                ? trf('canvas.loopSummaryNextImages', {range:rangeText(windowState.next)})
+                : tr('canvas.loopSummaryNoNextImages');
+        return [current, next].filter(Boolean).join('　');
+    };
+    const promptSummaryForNode = () => classicLoopPromptViewState(node).summary;
+    const imageSummary = imageSummaryForWindow(imageWindow);
+    const promptSummary = promptSummaryForNode();
+    const thumbsHtml = previewImages.length
+        ? `<div class="loop-input-thumbs">${previewImages.slice(0, 12).map((ref, index) => {
+            const label = ref.name || trf('canvas.loopImageLabel', {n:index + 1});
+            return `<div class="loop-input-thumb ${index < imageWindow.skippedCount ? 'is-skipped' : ''}" title="${escapeAttr(label)}">${canvasPreviewImgHtml(ref.url, 160, `alt="${escapeAttr(label)}" draggable="false"`)}<span>${index + 1}</span></div>`;
+        }).join('')}</div>`
+        : '';
     const loopTargetId = findLoopCascadeTarget(node.id);
-    const loopTargetOrder = loopTargetId ? computeCascadeOrder(loopTargetId) : [];
+    const loopTargetPlan = loopTargetId ? classicCascadePlan(loopTargetId, node.id) : null;
+    const loopTargetOrder = loopTargetPlan?.loopOrder || [];
     const loopRunHtml = loopTargetId ? (isCascadeActive(loopTargetId)
         ? `<div class="gen-run-row"><button class="gen-cascade-btn gen-cascade-stop" type="button" data-loop-cascade-stop="${loopTargetId}" ${isCascadeStopping(loopTargetId) ? 'disabled' : ''}><i data-lucide="square" class="w-4 h-4"></i><span>${isCascadeStopping(loopTargetId) ? '停止中…' : '停止运行'}</span></button></div>`
-        : `<div class="gen-run-row"><button class="gen-cascade-btn" type="button" data-loop-cascade="${loopTargetId}" title="从当前循环节点启动整条工作流"><i data-lucide="play-circle" class="w-4 h-4"></i><span>开始 ${loopTargetOrder.length || 1} 个节点 × ${node.count} ${tr('canvas.loopRounds')}</span></button></div>`)
+        : `<div class="gen-run-row"><button class="gen-cascade-btn" type="button" data-loop-cascade="${loopTargetId}" title="${escapeAttr(ClassicCascadePlan.runActionTooltip('loop'))}"><i data-lucide="play-circle" class="w-4 h-4"></i><span>运行本循环 ${loopTargetOrder.length || 1} 个节点 × ${node.count} ${tr('canvas.loopRounds')}</span></button></div>`)
         : '';
     wrap.innerHTML = `
         <div class="loop-count-row">
             <div class="loop-run-row">
-                <div class="loop-count-group">
-                    <span class="loop-count-label">${tr('canvas.loopCount')}</span>
-                    <input class="loop-count-input" type="number" min="1" max="100" step="1" value="${node.count}">
-                </div>
                 <div class="seg loop-mode">
                     <button type="button" data-loop-mode="serial" class="${node.mode !== 'parallel' ? 'active' : ''}">${tr('canvas.loopSerial')}</button>
                     <button type="button" data-loop-mode="parallel" class="${node.mode === 'parallel' ? 'active' : ''}">${tr('canvas.loopParallel')}</button>
                 </div>
             </div>
             <div class="loop-toggle-row">
-                <button class="loop-toggle loop-image-toggle ${node.imageInput ? 'active' : ''}" type="button"><i data-lucide="image" class="w-3.5 h-3.5"></i>${tr('canvas.loopImageToggle')}</button>
-                <button class="loop-toggle loop-prompt-toggle ${node.showPrompt ? 'active' : ''}" type="button"><i data-lucide="text-cursor-input" class="w-3.5 h-3.5"></i>${tr('canvas.loopPromptToggle')}</button>
+                <button class="loop-toggle loop-image-toggle ${node.imageInput ? 'active' : ''}" type="button" title="${escapeAttr(tr('canvas.loopImageHelp'))}"><i data-lucide="image" class="w-3.5 h-3.5"></i>${tr('canvas.loopImageToggle')}</button>
+                <button class="loop-toggle loop-prompt-toggle ${node.showPrompt ? 'active' : ''}" type="button" title="${escapeAttr(tr('canvas.loopPromptHelp'))}"><i data-lucide="text-cursor-input" class="w-3.5 h-3.5"></i>${tr('canvas.loopPromptToggle')}</button>
             </div>
         </div>
         ${node.imageInput ? `<div class="loop-image-panel">
+            ${thumbsHtml}
             <div class="loop-image-row">
-                <span class="loop-count-label">${tr('canvas.loopImageStart')}</span>
-                <input class="loop-count-input loop-image-start-input" type="number" min="1" max="9999" step="1" value="${node.loopStart}">
                 <span class="loop-count-label">${tr('canvas.loopBatchSize')}</span>
                 <input class="loop-count-input loop-batch-input" type="number" min="1" max="100" step="1" value="${node.imageBatchSize}">
             </div>
-            <div class="loop-image-hint loop-image-hint-only">${imageInputCount ? trf('canvas.loopImageWillOutput', {n:imageInputCount}) : tr('canvas.loopImageEmpty')}</div>
         </div>` : ''}
-        ${node.showPrompt ? `<div class="loop-prompt-panel ${hasUpstreamPrompt ? 'has-upstream' : ''}">
-            <div class="loop-field">
-                <div class="loop-variable-editor ${hasUpstreamPrompt ? 'is-disabled' : ''}" contenteditable="${hasUpstreamPrompt ? 'false' : 'true'}" data-placeholder="${escapeAttr(tr('canvas.loopVariablePlaceholder'))}">${loopVariableHtml(node.variablePrompt || '')}</div>
-            </div>
-            ${hasUpstreamPrompt ? `<div class="loop-prompt-hint">已识别 ${promptItemCount} 条提示词，按计数轮流输出</div>` : ''}
-            <div class="loop-start-row">
-                <button class="loop-token-btn loop-counter-token-btn" type="button" data-token="《计数》">${tr('canvas.counterToken')}</button>
+        ${(node.imageInput || node.showPrompt) ? `<div class="loop-summary" aria-live="polite">
+            <div class="loop-summary-row loop-summary-images" title="${escapeAttr(imageSummary)}">${escapeHtml(imageSummary)}</div>
+            <div class="loop-summary-row loop-summary-prompt" title="${escapeAttr(promptSummary)}">${escapeHtml(promptSummary)}</div>
+        </div>` : ''}
+        ${node.showPrompt ? `<div class="loop-prompt-panel">
+            ${classicLoopPromptRowsHtml(node)}
+        </div>` : ''}
+        <div class="loop-start-row">
+            <div class="loop-count-group">
                 <span class="loop-count-label">${tr('canvas.loopStart')}</span>
                 <input class="loop-count-input loop-start-input" type="number" min="1" max="9999" step="1" value="${node.loopStart}">
             </div>
-        </div>` : ''}
+            <div class="loop-count-group">
+                <span class="loop-count-label">${tr('canvas.loopTotalRounds')}</span>
+                <input class="loop-count-input loop-total-input" type="number" min="1" max="100" step="1" value="${node.count}">
+            </div>
+        </div>
         ${loopRunHtml}
     `;
-    const countInput = wrap.querySelector('.loop-count-input');
-    const variable = wrap.querySelector('.loop-variable-editor');
+    const countInput = wrap.querySelector('.loop-total-input');
+    const variables = [...wrap.querySelectorAll('.loop-variable-editor')];
     const toggle = wrap.querySelector('.loop-prompt-toggle');
     const imageToggle = wrap.querySelector('.loop-image-toggle');
-    if(variable) {
+    variables.forEach(variable => {
         variable.onmousedown = e => e.stopPropagation();
         variable.onclick = e => e.stopPropagation();
         variable.onwheel = e => e.stopPropagation();
-    }
-    const refreshPreview = () => {
-        const preview = wrap.querySelector('.loop-preview:last-child');
-        if(preview) preview.textContent = renderLoopPrompt(node, {index:1, total:loopCount(node)}) || tr('canvas.noPromptMeta');
-    };
-    const refreshImageHint = () => {
-        const hint = wrap.querySelector('.loop-image-hint-only');
-        if(!hint) return;
-        const count = loopInputImageRefs(node, {index:node.loopStart}).length;
-        hint.textContent = count ? trf('canvas.loopImageWillOutput', {n:count}) : tr('canvas.loopImageEmpty');
-    };
-    const syncStartInputs = source => {
-        wrap.querySelectorAll('.loop-image-start-input, .loop-start-input').forEach(input => {
-            if(input !== source && input.value !== String(node.loopStart)) input.value = node.loopStart;
+    });
+    const syncPromptFieldsFromDom = () => setClassicLoopPromptFieldValues(node, variables
+        .sort((a, b) => Number(a.dataset.loopPromptIndex) - Number(b.dataset.loopPromptIndex))
+        .map(variable => loopEditorText(variable)));
+    const refreshDerivedView = () => {
+        const windowState = classicLoopWindowState(previewImages.length, node.loopStart, node.imageBatchSize);
+        const imageRow = wrap.querySelector('.loop-summary-images');
+        const promptRow = wrap.querySelector('.loop-summary-prompt');
+        const nextImageText = imageSummaryForWindow(windowState);
+        const nextPromptText = promptSummaryForNode();
+        if(imageRow){ imageRow.textContent = nextImageText; imageRow.title = nextImageText; }
+        if(promptRow){ promptRow.textContent = nextPromptText; promptRow.title = nextPromptText; }
+        wrap.querySelectorAll('.loop-input-thumb').forEach((thumb, index) => {
+            thumb.classList.toggle('is-skipped', index < windowState.skippedCount);
         });
     };
     countInput.oninput = e => {
-        node.count = loopCount({count:e.target.value});
+        updateLoopDownstreamLLMViews(node, () => {
+            node.count = loopCount({count:e.target.value});
+        });
         e.target.value = node.count;
-        refreshPreview();
+        refreshDerivedView();
         /* 同步底部级联按钮上的轮数文字，避免输入循环次数后下游"× N 轮"残留旧值
            不直接 render() 是为了不破坏当前正在输入的 input 焦点 */
         const loopCascadeBtn = wrap.querySelector('[data-loop-cascade]');
         if(loopCascadeBtn){
             const span = loopCascadeBtn.querySelector('span');
-            if(span) span.textContent = `开始 ${loopTargetOrder.length || 1} 个节点 × ${node.count} ${tr('canvas.loopRounds')}`;
+            if(span) span.textContent = `运行本循环 ${loopTargetOrder.length || 1} 个节点 × ${node.count} ${tr('canvas.loopRounds')}`;
         }
         if(loopTargetId){
             const targetEl = document.querySelector(`.node[data-id="${loopTargetId}"]`);
@@ -7876,8 +8775,7 @@ function renderLoopBody(node){
             if(targetCascadeBtn){
                 const span = targetCascadeBtn.querySelector('span');
                 if(span){
-                    const targetOrder = computeCascadeOrder(loopTargetId);
-                    span.textContent = `一键运行 ${targetOrder.length} 个节点 × ${node.count} ${tr('canvas.loopRounds')}`;
+                    span.textContent = cascadeCompleteRunLabel(loopTargetId);
                 }
             }
         }
@@ -7888,22 +8786,10 @@ function renderLoopBody(node){
         startInput.onmousedown = e => e.stopPropagation();
         startInput.onclick = e => e.stopPropagation();
         startInput.oninput = e => {
-            node.loopStart = Math.max(1, Number(e.target.value) || 1);
-            refreshImageHint();
-            syncStartInputs(e.target);
-            scheduleSave();
-            syncGeneratorInputs();
-            refreshGeneratorInputViews();
-        };
-    }
-    const imageStartInput = wrap.querySelector('.loop-image-start-input');
-    if(imageStartInput){
-        imageStartInput.onmousedown = e => e.stopPropagation();
-        imageStartInput.onclick = e => e.stopPropagation();
-        imageStartInput.oninput = e => {
-            node.loopStart = Math.max(1, Number(e.target.value) || 1);
-            refreshImageHint();
-            syncStartInputs(e.target);
+            updateLoopDownstreamLLMViews(node, () => {
+                node.loopStart = Math.max(1, Number(e.target.value) || 1);
+            });
+            refreshDerivedView();
             scheduleSave();
             syncGeneratorInputs();
             refreshGeneratorInputViews();
@@ -7914,9 +8800,11 @@ function renderLoopBody(node){
         batchInput.onmousedown = e => e.stopPropagation();
         batchInput.onclick = e => e.stopPropagation();
         batchInput.oninput = e => {
-            node.imageBatchSize = Math.max(1, Math.min(100, Number(e.target.value) || 1));
+            updateLoopDownstreamLLMViews(node, () => {
+                node.imageBatchSize = Math.max(1, Math.min(100, Number(e.target.value) || 1));
+            });
             e.target.value = node.imageBatchSize;
-            refreshImageHint();
+            refreshDerivedView();
             scheduleSave();
             syncGeneratorInputs();
             refreshGeneratorInputViews();
@@ -7933,21 +8821,25 @@ function renderLoopBody(node){
     toggle.onclick = e => {
         e.stopPropagation();
         const opening = !node.showPrompt;
-        node.showPrompt = opening;
-        autoSizeLoopNode(node, opening);
-        autoSizeLoopForPanels(node);
-        if(!opening){
-            connections = connections.filter(c => c.to !== node.id || canConnect(c.from, node.id));
-        }
+        updateLoopDownstreamLLMViews(node, () => {
+            node.showPrompt = opening;
+            autoSizeLoopNode(node, opening);
+            autoSizeLoopForPanels(node);
+            if(!opening){
+                connections = connections.filter(c => c.to !== node.id || canConnect(c.from, node.id));
+            }
+        });
         render();
         scheduleSave();
         syncGeneratorInputs();
         refreshGeneratorInputViews();
     };
-    if(variable) {
+    variables.forEach(variable => {
         variable.oninput = e => {
-            node.variablePrompt = loopEditorText(variable);
-            refreshPreview();
+            updateLoopDownstreamLLMViews(node, () => {
+                syncPromptFieldsFromDom();
+            });
+            refreshDerivedView();
             scheduleSave();
             syncGeneratorInputs();
             refreshGeneratorInputViews();
@@ -7957,39 +8849,58 @@ function renderLoopBody(node){
             if(!btn) return;
             e.preventDefault();
             e.stopPropagation();
-            btn.closest('.loop-token-chip')?.remove();
-            node.variablePrompt = loopEditorText(variable);
-            refreshPreview();
+            updateLoopDownstreamLLMViews(node, () => {
+                btn.closest('.loop-token-chip')?.remove();
+                syncPromptFieldsFromDom();
+            });
+            refreshDerivedView();
             scheduleSave();
             syncGeneratorInputs();
             refreshGeneratorInputViews();
         });
-    }
-    wrap.querySelectorAll('[data-token]').forEach(btn => {
-        btn.onclick = e => {
+    });
+    const refreshPromptRows = mutate => {
+        updateLoopDownstreamLLMViews(node, () => {
+            syncPromptFieldsFromDom();
+            mutate();
+            autoSizeLoopForPanels(node);
+        });
+        refreshNodes([node.id]);
+        scheduleSave();
+        syncGeneratorInputs();
+        refreshGeneratorInputViews();
+    };
+    const promptAdd = wrap.querySelector('[data-loop-prompt-add]');
+    if(promptAdd){
+        promptAdd.onmousedown = e => e.stopPropagation();
+        promptAdd.onclick = e => {
+            e.preventDefault();
             e.stopPropagation();
-            const token = btn.dataset.token || '';
-            if(!variable) return;
-            insertLoopToken(variable, token);
-            node.variablePrompt = loopEditorText(variable);
-            variable.focus();
-            refreshPreview();
-            scheduleSave();
-            syncGeneratorInputs();
-            refreshGeneratorInputViews();
+            refreshPromptRows(() => addClassicLoopPromptField(node));
+        };
+    }
+    wrap.querySelectorAll('[data-loop-prompt-delete]').forEach(button => {
+        button.onmousedown = e => e.stopPropagation();
+        button.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            if(button.disabled) return;
+            refreshPromptRows(() => removeClassicLoopPromptField(node, Number(button.dataset.loopPromptDelete)));
         };
     });
     if(imageToggle){
         imageToggle.onclick = e => {
             e.stopPropagation();
-            node.imageInput = !node.imageInput;
-            if(node.imageInput){
-                node.loopStart = Math.max(1, Number(node.loopStart) || 1);
-                node.imageBatchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
-            } else {
-                connections = connections.filter(c => c.to !== node.id || canConnect(c.from, node.id));
-            }
-            autoSizeLoopForPanels(node);
+            updateLoopDownstreamLLMViews(node, () => {
+                node.imageInput = !node.imageInput;
+                if(node.imageInput){
+                    node.loopStart = Math.max(1, Number(node.loopStart) || 1);
+                    node.imageBatchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
+                } else {
+                    connections = connections.filter(c => c.to !== node.id || canConnect(c.from, node.id));
+                }
+                autoSizeLoopForPanels(node);
+            });
             render();
             scheduleSave();
             syncGeneratorInputs();
@@ -7998,9 +8909,12 @@ function renderLoopBody(node){
     }
     wrap.querySelectorAll('[data-loop-cascade]').forEach(btn => {
         btn.onmousedown = e => e.stopPropagation();
+        btn.onmouseenter = () => setClassicCascadePreview(btn.dataset.loopCascade, {scope:'loop', loopId:node.id});
+        btn.onmouseleave = () => clearClassicCascadePreview();
         btn.onclick = e => {
             e.stopPropagation();
-            runNodeCascade(btn.dataset.loopCascade);
+            clearClassicCascadePreview();
+            runNodeCascade(btn.dataset.loopCascade, {scope:'loop', loopId:node.id});
         };
     });
     wrap.querySelectorAll('[data-loop-cascade-stop]').forEach(btn => {
@@ -8012,15 +8926,44 @@ function renderLoopBody(node){
     });
     return wrap;
 }
+function llmConnectedMediaPreviewHtml(images=[], videos=[]){
+    const items = [
+        ...images.filter(Boolean).map((url, index) => ({url, kind:'image', index:index + 1})),
+        ...videos.filter(Boolean).map((url, index) => ({url, kind:'video', index:index + 1}))
+    ];
+    if(!items.length) return '';
+    return `<div class="llm-media-preview">${items.map(item => {
+        const label = item.kind === 'video' ? `视频 ${item.index}` : `图片 ${item.index}`;
+        const preview = item.kind === 'video'
+            ? canvasVideoPreviewHtml(item.url, 160, `alt="${escapeAttr(label)}" draggable="false"`)
+            : canvasPreviewImgHtml(item.url, 160, `alt="${escapeAttr(label)}" draggable="false"`);
+        return `<div class="llm-media-thumb is-${item.kind}" title="${escapeAttr(label)}">${preview}<span class="llm-media-thumb-badge">${item.kind === 'video' ? '<i data-lucide="play"></i>' : item.index}</span></div>`;
+    }).join('')}</div>`;
+}
+const CLASSIC_LLM_SYSTEM_PROMPT_HEIGHT_DELTA = 92;
+function setClassicLLMSystemPromptEnabled(node, enabled){
+    if(!node || node.type !== 'llm') return false;
+    const nextEnabled = Boolean(enabled);
+    if(Boolean(node.showSystem) === nextEnabled) return false;
+    const currentHeight = Math.max(360, Number(node.h || defaultNodeSize('llm').h || 590));
+    if(nextEnabled){
+        node.h = currentHeight + CLASSIC_LLM_SYSTEM_PROMPT_HEIGHT_DELTA;
+        node.llmSystemAutoExpanded = true;
+    } else if(node.llmSystemAutoExpanded){
+        node.h = Math.max(360, currentHeight - CLASSIC_LLM_SYSTEM_PROMPT_HEIGHT_DELTA);
+        delete node.llmSystemAutoExpanded;
+    }
+    node.showSystem = nextEnabled;
+    return true;
+}
 function renderLLMBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'llm-body';
-    const mode = node.mode || 'node';
+    const mode = node.mode === 'chat' ? 'chat' : 'node';
     node.llmProvider = resolveChatProviderId(node.llmProvider || 'comfly');
     const llmProv = node.llmProvider;
     if(llmProv === 'modelscope') node.model = node.llmMsModel || node.model;
     if(!providerChatModels(llmProv).includes(node.model)) node.model = providerChatModels(llmProv)[0] || node.model;
-    const modelOpts = chatModelOptions(node.model, llmProv);
     const imgs = llmInputImages(node);
     const videos = llmInputVideos(node);
     const mediaBadgeText = [
@@ -8030,47 +8973,15 @@ function renderLLMBody(node){
     const imgBadge = mediaBadgeText ? `<div style="display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:8px;background:rgba(16,185,129,.12);color:#047857;font-size:10.5px;font-weight:700;width:fit-content;line-height:1.4"><i data-lucide="${videos.length && !imgs.length ? 'video' : 'image'}" class="w-3 h-3"></i>已连接 ${mediaBadgeText} · 需选支持视觉/视频的模型</div>` : '';
     node.showSystem = Boolean(node.showSystem);
     wrap.innerHTML = `
-        <div class="llm-row">
-            <select class="select-lite llm-provider-select" style="flex:1">${chatProviderOptions(llmProv)}</select>
-            <select class="select-lite llm-model">${modelOpts}</select>
-            <div class="llm-mode"><button data-mode="node">${tr('canvas.nodeMode')}</button><button data-mode="chat">${tr('canvas.chatMode')}</button></div>
-            <button class="llm-sys-toggle ${node.showSystem ? 'active' : ''}" type="button">System</button>
+        <div class="llm-mode" role="tablist" aria-label="${escapeAttr(tr('canvas.llmModeSwitch'))}">
+            <button data-mode="node" type="button"><i data-lucide="sparkles"></i><span>${escapeHtml(tr('canvas.llmMode'))}</span></button>
+            <button data-mode="chat" type="button"><i data-lucide="messages-square"></i><span>${escapeHtml(tr('canvas.chatMode'))}</span></button>
         </div>
+        ${llmConnectedMediaPreviewHtml(imgs, videos)}
         ${imgBadge}
-        ${node.showSystem ? `<textarea class="llm-system" placeholder="${tr('canvas.systemPrompt')}">${escapeHtml(node.systemPrompt || '')}</textarea>` : ''}
         <div class="llm-node-pane"></div>
         <div class="llm-chat-pane"></div>
     `;
-    const providerSelect = wrap.querySelector('.llm-provider-select');
-    const modelSelect = wrap.querySelector('.llm-model');
-    providerSelect.value = llmProv;
-    modelSelect.value = resolveChatModel(node.model, llmProv);
-    [providerSelect, modelSelect].forEach(input => {
-        input.onmousedown = e => e.stopPropagation();
-        input.onclick = e => e.stopPropagation();
-    });
-    providerSelect.onchange = e => {
-        e.stopPropagation();
-        node.llmProvider = e.target.value;
-        const models = providerChatModels(node.llmProvider);
-        node.model = models[0] || '';
-        if(node.llmProvider === 'modelscope') node.llmMsModel = node.model;
-        render();
-        scheduleSave();
-    };
-    modelSelect.onchange = e => {
-        e.stopPropagation();
-        node.model = e.target.value;
-        if((node.llmProvider||'comfly') === 'modelscope') node.llmMsModel = e.target.value;
-        scheduleSave();
-    };
-    wrap.querySelector('.llm-sys-toggle').onclick = e => { e.stopPropagation(); node.showSystem = !node.showSystem; render(); scheduleSave(); };
-    const sysEl = wrap.querySelector('.llm-system');
-    if(sysEl){ sysEl.oninput = e => { node.systemPrompt = e.target.value; scheduleSave(); }; bindScrollableText(sysEl); }
-    wrap.querySelectorAll('[data-mode]').forEach(btn => {
-        btn.classList.toggle('active', mode === btn.dataset.mode);
-        btn.onclick = e => { e.stopPropagation(); node.mode = btn.dataset.mode; render(); scheduleSave(); };
-    });
     const nodePane = wrap.querySelector('.llm-node-pane');
     const chatPane = wrap.querySelector('.llm-chat-pane');
     if(mode === 'chat'){
@@ -8080,6 +8991,37 @@ function renderLLMBody(node){
         chatPane.style.display = 'none';
         renderLLMNodePane(nodePane, node);
     }
+    const providerSelect = wrap.querySelector('.llm-provider-select');
+    const modelSelect = wrap.querySelector('.llm-model');
+    if(providerSelect) providerSelect.value = llmProv;
+    if(modelSelect) modelSelect.value = resolveChatModel(node.model, llmProv);
+    [providerSelect, modelSelect].filter(Boolean).forEach(input => {
+        input.onmousedown = e => e.stopPropagation();
+        input.onclick = e => e.stopPropagation();
+    });
+    if(providerSelect) providerSelect.onchange = e => {
+        e.stopPropagation();
+        node.llmProvider = e.target.value;
+        const models = providerChatModels(node.llmProvider);
+        node.model = models[0] || '';
+        if(node.llmProvider === 'modelscope') node.llmMsModel = node.model;
+        render();
+        scheduleSave();
+    };
+    if(modelSelect) modelSelect.onchange = e => {
+        e.stopPropagation();
+        node.model = e.target.value;
+        if((node.llmProvider||'comfly') === 'modelscope') node.llmMsModel = e.target.value;
+        scheduleSave();
+    };
+    const systemToggle = wrap.querySelector('.llm-sys-toggle');
+    if(systemToggle) systemToggle.onclick = e => { e.stopPropagation(); setClassicLLMSystemPromptEnabled(node, !node.showSystem); render(); scheduleSave(); };
+    const sysEl = wrap.querySelector('.llm-system');
+    if(sysEl){ sysEl.oninput = e => { node.systemPrompt = e.target.value; scheduleSave(); }; bindScrollableText(sysEl); }
+    wrap.querySelectorAll('[data-mode]').forEach(btn => {
+        btn.classList.toggle('active', mode === btn.dataset.mode);
+        btn.onclick = e => { e.stopPropagation(); node.mode = btn.dataset.mode; render(); scheduleSave(); };
+    });
     return wrap;
 }
 function renderLLMNodePane(container, node){
@@ -8089,28 +9031,89 @@ function renderLLMNodePane(container, node){
     const inputHeight = Math.max(70, node.llmInputHeight || 110);
     const outputHeight = Math.max(70, node.llmOutputHeight || 150);
     const inputPlaceholder = langIsEn() ? 'Type input, or connect a Prompt node…' : '直接输入，或连接提示词节点…';
+    const outputText = classicLLMOutputText(node);
+    const outputDisplay = outputText || (classicLLMHasAnyResult(node) ? tr('canvas.llmNoResultForInput') : tr('canvas.llmOutputEmpty'));
+    const splitEnabled = node.llmOutputSplitEnabled === true;
+    const separator = classicLLMOutputSeparator(node);
+    const templateActive = promptTemplateModal?.classList.contains('open') && promptTemplateNodeId === node.id;
+    const templateTitle = isReadonly ? tr('canvas.llmTemplateUnavailableConnected') : tr('canvas.promptTemplateLibrary');
+    const cascade = cascadeBtnHtml(node);
     container.innerHTML = `
-        <div class="llm-pane-label">Input${isReadonly ? ' <span style="font-size:9px;opacity:.5;font-weight:600;text-transform:none;letter-spacing:0">(来自连接)</span>' : ''}</div>
+        <div class="llm-pane-label-row llm-input-head">
+            <div class="llm-pane-label">${escapeHtml(tr('canvas.llmInputLabel'))}${isReadonly ? ` <span class="llm-connected-label">${escapeHtml(tr('canvas.llmConnectedInput'))}</span>` : ''}</div>
+            <button class="prompt-template-btn llm-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-prompt-template-node-id="${escapeAttr(node.id)}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(templateTitle)}" ${isReadonly ? 'disabled' : ''}><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>
+        </div>
         <textarea class="llm-input-area llm-input-output" style="height:${inputHeight}px; flex:0 0 ${inputHeight}px;" ${isReadonly ? 'readonly' : ''} placeholder="${inputPlaceholder}">${escapeHtml(inputValue)}</textarea>
-        <div class="llm-pane-resizer" title="${tr('canvas.resizePanes')}"></div>
-        <div class="llm-pane-label">Output</div>
+        <div class="llm-pane-label-row llm-output-head">
+            <div class="llm-pane-label">${escapeHtml(tr('canvas.llmOutputLabel'))}</div>
+            <div class="llm-output-head-actions"><button class="llm-copy-btn llm-output-copy" type="button" title="${escapeAttr(tr('canvas.copy'))}"><i data-lucide="copy"></i></button></div>
+        </div>
         <div class="llm-output-wrap" style="height:${outputHeight}px; flex:0 0 ${outputHeight}px;">
-            <button class="llm-copy-btn llm-output-copy" type="button" title="复制"><i data-lucide="copy" class="w-3.5 h-3.5"></i></button>
-            <div class="llm-output llm-result-output">${escapeHtml(node.outputText || tr('canvas.llmOutputEmpty'))}</div>
+            <div class="llm-output llm-result-output">${escapeHtml(outputDisplay)}</div>
         </div>
-        <div class="gen-run-row mt-2">
-            <button class="llm-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play" class="w-4 h-4"></i>${node.running ? tr('canvas.running') : 'Run LLM'}</button>
-            ${cascadeBtnHtml(node)}
+        <div class="llm-output-split-tools">
+            <button class="prompt-template-btn llm-output-split-toggle ${splitEnabled ? 'active' : ''}" type="button" data-llm-output-split aria-pressed="${splitEnabled ? 'true' : 'false'}" title="${escapeAttr(tr('canvas.llmOutputSeparator'))}"><i data-lucide="split"></i><span>${escapeHtml(tr('canvas.llmOutputSeparator'))}</span></button>
+            ${splitEnabled ? `<label class="llm-output-separator"><span>${escapeHtml(tr('canvas.llmSeparatorValue'))}</span><input data-llm-output-separator value="${escapeAttr(separator)}" spellcheck="false"></label><span class="llm-output-segment-count">${escapeHtml(classicLLMOutputSegmentCountText(node))}</span>` : ''}
         </div>
+        ${splitEnabled ? `<div class="llm-output-segments">${classicLLMOutputSegmentItemsHtml(node)}</div>` : ''}
+        <div class="llm-model-row">
+            <select class="select-lite llm-provider-select" aria-label="${escapeAttr(tr('canvas.apiProvider'))}">${chatProviderOptions(node.llmProvider)}</select>
+            <select class="select-lite llm-model" aria-label="${escapeAttr(tr('canvas.model'))}">${chatModelOptions(node.model, node.llmProvider)}</select>
+        </div>
+        <div class="llm-bottom-actions">
+            <button class="llm-sys-toggle ${node.showSystem ? 'active' : ''}" type="button"><i data-lucide="${node.showSystem ? 'toggle-right' : 'toggle-left'}"></i><span>${escapeHtml(tr(node.showSystem ? 'canvas.llmSystemDisable' : 'canvas.llmSystemEnable'))}</span></button>
+            <button class="llm-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play"></i><span>${escapeHtml(node.running ? tr('canvas.running') : tr('canvas.llmRun'))}</span></button>
+        </div>
+        ${node.showSystem ? `<textarea class="llm-system" placeholder="${escapeAttr(tr('canvas.systemPrompt'))}">${escapeHtml(node.systemPrompt || '')}</textarea>` : ''}
+        ${cascade ? `<div class="llm-cascade-row">${cascade}</div>` : ''}
         ${retryBarHtml(node)}
     `;
     const inputEl = container.querySelector('.llm-input-output');
     bindScrollableText(inputEl);
     if(!isReadonly){
-        inputEl.oninput = e => { node.userInput = e.target.value; };
+        inputEl.oninput = e => {
+            node.userInput = e.target.value;
+            const outputEl = container.querySelector('.llm-result-output');
+            const matching = classicLLMOutputText(node);
+            if(outputEl) outputEl.textContent = matching || (classicLLMHasAnyResult(node) ? tr('canvas.llmNoResultForInput') : tr('canvas.llmOutputEmpty'));
+            refreshClassicLLMOutputSegmentsUi(container, node);
+            scheduleSave();
+        };
+    }
+    const templateBtn = container.querySelector('[data-prompt-template-open]');
+    if(templateBtn && !isReadonly){
+        templateBtn.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            openPromptTemplateModal(node.id);
+        };
+    }
+    const splitToggle = container.querySelector('[data-llm-output-split]');
+    splitToggle.onclick = e => {
+        e.preventDefault();
+        e.stopPropagation();
+        node.llmOutputSplitEnabled = !node.llmOutputSplitEnabled;
+        refreshClassicLLMOutputSegmentsUi(container, node);
+        scheduleSave();
+        syncGeneratorInputs();
+        refreshGeneratorInputViews();
+        render();
+    };
+    const separatorInput = container.querySelector('[data-llm-output-separator]');
+    if(separatorInput){
+        separatorInput.onmousedown = e => e.stopPropagation();
+        separatorInput.oninput = e => {
+            e.stopPropagation();
+            node.llmOutputSeparator = e.target.value || CLASSIC_LLM_OUTPUT_SEPARATOR_DEFAULT;
+            refreshClassicLLMOutputSegmentsUi(container, node);
+            scheduleSave();
+            syncGeneratorInputs();
+            refreshGeneratorInputViews();
+            const downstreamIds = connections.filter(c => c.from === node.id).map(c => c.to);
+            if(downstreamIds.length) refreshNodes([...new Set(downstreamIds)]);
+        };
     }
     bindScrollableText(container.querySelector('.llm-result-output'));
-    container.querySelector('.llm-pane-resizer').onmousedown = e => startLLMPaneResize(e, node);
     container.querySelector('.llm-run').onclick = e => { e.stopPropagation(); runLLMNode(node.id); };
     bindCascadeButtons(container, node.id);
     const copyBtn = container.querySelector('.llm-output-copy');
@@ -8118,7 +9121,7 @@ function renderLLMNodePane(container, node){
         copyBtn.onmousedown = e => e.stopPropagation();
         copyBtn.onclick = async e => {
             e.stopPropagation();
-            const text = node.outputText || '';
+            const text = classicLLMOutputText(node);
             if(!text) return;
             if(await copyTextToClipboard(text)){
                 copyBtn.classList.add('copied');
@@ -8132,7 +9135,15 @@ function renderLLMChatPane(container, node){
     container.innerHTML = `
         <div class="llm-chat-log">${messages.length ? messages.map((msg, mi) => `<div class="llm-bubble ${msg.role === 'user' ? 'user' : 'assistant'}" data-msg-idx="${mi}">${escapeHtml(msg.content || '')}${msg.role === 'assistant' ? `<button class="llm-bubble-copy" type="button" title="复制"><i data-lucide="copy" style="width:11px;height:11px;display:inline-block;vertical-align:middle"></i></button>` : ''}</div>`).join('') : `<div class="text-[11px] text-gray-300">${tr('canvas.startChat')}</div>`}</div>
         <textarea class="llm-chat-input mt-2" rows="2" placeholder="${tr('canvas.chatInput')}">${escapeHtml(node.chatInput || '')}</textarea>
-        <button class="llm-run mt-2" ${node.running ? 'disabled' : ''}><i data-lucide="send" class="w-4 h-4"></i>${node.running ? tr('canvas.sending') : 'Send'}</button>
+        <div class="llm-model-row">
+            <select class="select-lite llm-provider-select" aria-label="${escapeAttr(tr('canvas.apiProvider'))}">${chatProviderOptions(node.llmProvider)}</select>
+            <select class="select-lite llm-model" aria-label="${escapeAttr(tr('canvas.model'))}">${chatModelOptions(node.model, node.llmProvider)}</select>
+        </div>
+        <div class="llm-bottom-actions">
+            <button class="llm-sys-toggle ${node.showSystem ? 'active' : ''}" type="button"><i data-lucide="${node.showSystem ? 'toggle-right' : 'toggle-left'}"></i><span>${escapeHtml(tr(node.showSystem ? 'canvas.llmSystemDisable' : 'canvas.llmSystemEnable'))}</span></button>
+            <button class="llm-run llm-chat-send" ${node.running ? 'disabled' : ''}><i data-lucide="send"></i><span>${escapeHtml(node.running ? tr('canvas.sending') : tr('canvas.llmSend'))}</span></button>
+        </div>
+        ${node.showSystem ? `<textarea class="llm-system" placeholder="${escapeAttr(tr('canvas.systemPrompt'))}">${escapeHtml(node.systemPrompt || '')}</textarea>` : ''}
     `;
     bindScrollableText(container.querySelector('.llm-chat-log'));
     bindScrollableText(container.querySelector('.llm-chat-input'));
@@ -8145,7 +9156,7 @@ function renderLLMChatPane(container, node){
             runLLMChat(node.id);
         }
     };
-    container.querySelector('.llm-run').onclick = e => { e.stopPropagation(); runLLMChat(node.id); };
+    container.querySelector('.llm-chat-send').onclick = e => { e.stopPropagation(); runLLMChat(node.id); };
     container.querySelectorAll('.llm-bubble-copy').forEach(btn => {
         btn.onmousedown = e => e.stopPropagation();
         btn.onclick = async e => {
@@ -8261,12 +9272,43 @@ function onLLMPaneResize(e){
         }
     }
 }
+function startPromptSplitPreviewResize(e, node){
+    e.preventDefault();
+    e.stopPropagation();
+    promptSplitResize = {
+        node,
+        sy:e.clientY,
+        startHeight:classicPromptSplitPreviewHeight(node),
+        historyCaptured:false
+    };
+    document.body.classList.add('canvas-prompt-split-resize');
+    window.onmousemove = onPromptSplitPreviewResize;
+    window.onmouseup = endDrag;
+}
+function onPromptSplitPreviewResize(e){
+    if(!promptSplitResize) return;
+    const delta = (e.clientY - promptSplitResize.sy) / viewport.scale;
+    if(!promptSplitResize.historyCaptured && delta !== 0){
+        pushUndo();
+        promptSplitResize.historyCaptured = true;
+    }
+    const nextHeight = Math.max(
+        CLASSIC_PROMPT_SPLIT_PREVIEW_MIN_HEIGHT,
+        Math.min(CLASSIC_PROMPT_SPLIT_PREVIEW_MAX_HEIGHT, promptSplitResize.startHeight + delta)
+    );
+    promptSplitResize.node.promptSplitPreviewHeight = Math.round(nextHeight);
+    const el = nodesEl.querySelector(`.node[data-id="${promptSplitResize.node.id}"]`);
+    const segments = el?.querySelector('.classic-prompt-segments');
+    if(segments) segments.style.height = `${promptSplitResize.node.promptSplitPreviewHeight}px`;
+    scheduleLinksRender();
+    scheduleMinimapRender();
+}
 function llmInputText(node){
     return connections.filter(c => c.to === node.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).map(n => {
-        if(n.type === 'prompt') return n.text || '';
+        if(n.type === 'prompt') return classicPromptText(n);
         if(n.type === 'loop') return renderLoopPrompt(n);
-        if(n.type === 'promptGroup') return (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean).map(p => p.text || '').filter(Boolean).join('\n\n');
-        if(n.type === 'llm') return n.outputText || '';
+        if(n.type === 'promptGroup') return (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean).map(p => classicPromptText(p)).filter(Boolean).join('\n\n');
+        if(n.type === 'llm') return classicLLMOutputPromptText(n);
         return '';
     }).filter(Boolean).join('\n\n');
 }
@@ -8274,6 +9316,11 @@ function llmInputImages(node){
     const urls = [];
     connections.filter(c => c.to === node.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).forEach(n => {
         if(n.type === 'image' && n.url && mediaKindForNode(n) === 'image') urls.push(n.url);
+        if(n.type === 'loop'){
+            loopInputImageRefs(n).forEach(ref => {
+                if(ref?.url) urls.push(ref.url);
+            });
+        }
         if(n.type === 'output' && (n.images||[]).length){
             const last = [...n.images].reverse().map(outputUrlValue).find(url => url && !isVideoUrl(url) && !isAudioUrl(url));
             if(last) urls.push(last);
@@ -8288,6 +9335,11 @@ function llmInputVideos(node){
     const urls = [];
     connections.filter(c => c.to === node.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).forEach(n => {
         if(n.type === 'image' && n.url && mediaKindForNode(n) === 'video') urls.push(n.url);
+        if(n.type === 'loop'){
+            loopInputVideoRefs(n).forEach(ref => {
+                if(ref?.url) urls.push(ref.url);
+            });
+        }
         if(n.type === 'output' && (n.images||[]).length){
             const last = [...n.images].reverse().map(outputUrlValue).find(url => url && isVideoUrl(url));
             if(last) urls.push(last);
@@ -8298,17 +9350,133 @@ function llmInputVideos(node){
     });
     return urls;
 }
+const classicLLMKeyVisiting = new Set();
+function classicLLMInputKey(node){
+    if(!node?.id || !window.CanvasLLMResultMemory) return '';
+    if(classicLLMKeyVisiting.has(node.id)) return `llm-cycle-${node.id}`;
+    classicLLMKeyVisiting.add(node.id);
+    try {
+        const provider = resolveChatProviderId(node.llmProvider || 'comfly');
+        const model = resolveChatModel(node.model || node.llmMsModel, provider);
+        const mediaIdentity = value => window.CanvasLLMResultMemory.mediaIdentity(value);
+        return window.CanvasLLMResultMemory.keyFor({
+            version:'classic-node-v1',
+            message:llmInputText(node) || node.userInput || '',
+            images:llmInputImages(node).map(mediaIdentity),
+            videos:llmInputVideos(node).map(mediaIdentity),
+            provider,
+            model,
+            systemPrompt:node.showSystem ? ((node.systemPrompt || '').trim() || 'You are a helpful assistant.') : ''
+        });
+    } finally {
+        classicLLMKeyVisiting.delete(node.id);
+    }
+}
+function classicLLMOutputLooksLikeChatReply(node, text){
+    if(node?.llmResultKey || (Array.isArray(node?.llmResultMemory) && node.llmResultMemory.length)) return false;
+    const lastAssistant = [...(Array.isArray(node?.messages) ? node.messages : [])]
+        .reverse()
+        .find(message => message?.role === 'assistant' && String(message?.content || '').trim());
+    return Boolean(lastAssistant && String(lastAssistant.content || '').trim() === String(text || '').trim());
+}
+function classicLLMOutputText(node){
+    if(!node) return '';
+    const inputKey = classicLLMInputKey(node);
+    const cached = window.CanvasLLMResultMemory?.read(node, inputKey) || '';
+    if(cached) return cached;
+    const current = String(node.outputText || '');
+    if(node.llmResultKey === inputKey) return current;
+    if(!node.llmResultKey && current && inputKey){
+        if(classicLLMOutputLooksLikeChatReply(node, current)) return '';
+        window.CanvasLLMResultMemory?.remember(node, inputKey, current);
+        node.llmResultKey = inputKey;
+        return current;
+    }
+    return '';
+}
+const CLASSIC_LLM_OUTPUT_SEPARATOR_DEFAULT = '----';
+function classicLLMOutputSeparator(node){
+    return String(node?.llmOutputSeparator || CLASSIC_LLM_OUTPUT_SEPARATOR_DEFAULT);
+}
+function classicLLMOutputItems(node){
+    const text = String(classicLLMOutputText(node) || '');
+    if(!text.trim()) return [];
+    if(node?.llmOutputSplitEnabled !== true) return [text];
+    const separator = classicLLMOutputSeparator(node);
+    if(!separator) return [text];
+    const items = text.split(separator).map(item => item.trim()).filter(Boolean);
+    return items.length ? items : [text];
+}
+function classicLLMOutputPromptText(node){
+    return classicLLMOutputItems(node).join('\n\n');
+}
+function classicLLMOutputSegmentItemsHtml(node){
+    return classicLLMOutputItems(node).map((item, index) => `<div class="llm-output-segment"><span>${index + 1}</span><div>${escapeHtml(item)}</div></div>`).join('');
+}
+function classicLLMOutputSegmentCountText(node){
+    const count = classicLLMOutputItems(node).length;
+    return trf('canvas.llmOutputSegments', {n:count});
+}
+function refreshClassicLLMOutputSegmentsUi(container, node){
+    const count = container?.querySelector('.llm-output-segment-count');
+    const segments = container?.querySelector('.llm-output-segments');
+    if(count) count.textContent = classicLLMOutputSegmentCountText(node);
+    if(segments) segments.innerHTML = classicLLMOutputSegmentItemsHtml(node);
+}
+function classicLLMHasAnyResult(node){
+    return Boolean(node?.outputText || (Array.isArray(node?.llmResultMemory) && node.llmResultMemory.length));
+}
+function classicLLMInputFingerprint(node){
+    return classicLLMInputKey(node);
+}
+function loopDownstreamLLMNodes(loopNode){
+    if(!loopNode?.id) return [];
+    const seen = new Set();
+    return connections.filter(c => c.from === loopNode.id)
+        .map(c => nodes.find(node => node.id === c.to))
+        .filter(node => {
+            if(node?.type === 'llm' && !seen.has(node.id)){
+                seen.add(node.id);
+                return true;
+            }
+            return false;
+        });
+}
+function updateLoopDownstreamLLMViews(loopNode, mutate){
+    const targets = loopDownstreamLLMNodes(loopNode);
+    targets.forEach(classicLLMOutputText);
+    const before = new Map(targets.map(node => [node.id, classicLLMInputFingerprint(node)]));
+    if(typeof mutate === 'function') mutate();
+    const changed = targets.filter(node => before.get(node.id) !== classicLLMInputFingerprint(node));
+    if(changed.length) refreshNodes(changed.map(node => node.id));
+    return changed;
+}
+function classicApiLocalPromptEditorHtml(node, hasUpstreamPrompt=false, templateActive=false){
+    const labelKey = hasUpstreamPrompt ? 'canvas.apiAppendPrompt' : 'canvas.apiLocalPrompt';
+    const placeholderKey = hasUpstreamPrompt ? 'canvas.apiAppendPromptPlaceholder' : 'canvas.apiLocalPromptPlaceholder';
+    return `<div class="api-local-prompt-editor">
+        <div class="api-local-prompt-head">
+            <span class="api-local-prompt-label">${escapeHtml(tr(labelKey))}</span>
+            <button class="prompt-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-api-prompt-template-open data-prompt-template-node-id="${escapeAttr(node?.id || '')}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(tr('canvas.promptTemplateLibrary'))}"><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>
+        </div>
+        <textarea class="api-local-prompt-input" rows="3" placeholder="${escapeAttr(tr(placeholderKey))}">${escapeHtml(node?.localPrompt || '')}</textarea>
+    </div>`;
+}
+function classicApiPromptSectionHtml(node, hasUpstreamPrompt=false, templateActive=false){
+    return `<div class="prompt-list mb-3"></div>${classicApiLocalPromptEditorHtml(node, hasUpstreamPrompt, templateActive)}`;
+}
 function renderGeneratorBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'generator-body';
     const inputSources = generatorSources(node);
     const ordered = orderedSources(node, inputSources);
     const mediaInputs = ordered.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
-    const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
+    const promptInputs = ordered.filter(src => src.prompt);
+    const templateActive = promptTemplateModal?.classList.contains('open') && promptTemplateNodeId === node.id;
     sanitizeImageNodeProviderModel(node);
     normalizeApiNodeSizeChoice(node);
     wrap.innerHTML = `
-        <div class="prompt-list mb-3"></div>
+        ${classicApiPromptSectionHtml(node, promptInputs.length > 0, templateActive)}
         <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-2">${tr('canvas.images')}</div>
         <div class="input-list"></div>
         <div class="gen-settings">
@@ -8330,6 +9498,8 @@ function renderGeneratorBody(node){
                     <option value="landscape">3:2</option>
                     <option value="portrait43">3:4</option>
                     <option value="landscape43">4:3</option>
+                    <option value="portrait45">4:5</option>
+                    <option value="landscape54">5:4</option>
                     <option value="story">9:16</option>
                     <option value="wide">16:9</option>
                     <option value="ultrawide">21:9</option>
@@ -8338,18 +9508,9 @@ function renderGeneratorBody(node){
                     <option value="custom">${tr('canvas.custom')}</option>
                 </select>
                 <select class="select-lite quality-select">
-                    <option value="auto">Q auto</option>
-                    <option value="low">Q low</option>
-                    <option value="medium">Q med</option>
-                    <option value="high">Q high</option>
+                    ${classicApiQualityOptionsHtml()}
                 </select>
-                <div class="gen-count-row">
-                    <div class="gen-stepper">
-                        <button class="gen-step-btn" data-step="-1" type="button" title="${tr('canvas.decrease')}" aria-label="${tr('canvas.decreaseCount')}"><i data-lucide="chevron-left" class="w-3.5 h-3.5"></i></button>
-                        <input class="gen-count-input" type="text" inputmode="numeric" pattern="[0-9]*" value="${Math.max(1, Math.min(8, Number(node.count || 1)))}">
-                        <button class="gen-step-btn" data-step="1" type="button" title="${tr('canvas.increase')}" aria-label="${tr('canvas.increaseCount')}"><i data-lucide="chevron-right" class="w-3.5 h-3.5"></i></button>
-                    </div>
-                </div>
+                ${classicApiCountControlHtml(node)}
             </div>
             <div class="gen-settings-row custom-ratio-row" style="display:none">
                 <label class="field">
@@ -8374,13 +9535,29 @@ function renderGeneratorBody(node){
             </div>
         </div>
         <div class="gen-run-row">
-            <button class="gen-btn ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="zap" class="w-4 h-4"></i>${node.running ? tr('canvas.generating') : tr('canvas.apiGenerate')}</button>
+            <button class="gen-btn ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''} title="${escapeAttr(ClassicCascadePlan.runActionTooltip('api'))}"><i data-lucide="zap" class="w-4 h-4"></i>${node.running ? tr('canvas.generating') : tr('canvas.apiGenerate')}</button>
             ${cascadeBtnHtml(node)}
         </div>
         ${retryBarHtml(node)}
     `;
     const providerSelect = wrap.querySelector('.provider-select');
     const modelSelect = wrap.querySelector('.model-select');
+    const localPromptInput = wrap.querySelector('.api-local-prompt-input');
+    const localPromptTemplateBtn = wrap.querySelector('[data-api-prompt-template-open]');
+    bindScrollableText(localPromptInput);
+    localPromptInput.onmousedown = e => e.stopPropagation();
+    localPromptInput.onclick = e => e.stopPropagation();
+    localPromptInput.oninput = e => {
+        node.localPrompt = e.target.value;
+        scheduleSave();
+    };
+    if(localPromptTemplateBtn){
+        localPromptTemplateBtn.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            openPromptTemplateModal(node.id);
+        };
+    }
     providerSelect.onmousedown = e => e.stopPropagation();
     providerSelect.onclick = e => e.stopPropagation();
     providerSelect.onchange = e => {
@@ -8389,7 +9566,7 @@ function renderGeneratorBody(node){
         const providerModels = providerImageModels(node.apiProvider);
         if(!providerModels.includes(resolveImageModel(node.model))) node.model = providerModels[0] || '';
         node._apiResolutionUserSet = false;
-        node.resolution = defaultApiImageResolution(node.model);
+        node.resolution = defaultClassicApiGeneratorResolution(node.model);
         modelSelect.innerHTML = imageModelOptions(node.model, node.apiProvider);
         syncSizeControls();
         syncQualityControls();
@@ -8401,7 +9578,7 @@ function renderGeneratorBody(node){
         e.stopPropagation();
         node.model = e.target.value;
         node._apiResolutionUserSet = false;
-        if(node.resolution !== 'custom') node.resolution = defaultApiImageResolution(node.model);
+        if(node.resolution !== 'custom') node.resolution = defaultClassicApiGeneratorResolution(node.model);
         syncSizeControls();
         syncQualityControls();
         scheduleSave();
@@ -8454,7 +9631,8 @@ function renderGeneratorBody(node){
         try {
             const dims = await getImageDimensions(ref.url);
             if(requestId !== sourceRatioRequest || node.ratio !== 'source') return;
-            const parts = ratioPartsFromDimensions(dims.width, dims.height);
+            const matchedRatio = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(dims.width, dims.height) || '';
+            const parts = ADAPTIVE_RATIO_TOOLS?.ratioParts(matchedRatio) || ratioPartsFromDimensions(dims.width, dims.height);
             node.customRatioWidth = String(parts.width);
             node.customRatioHeight = String(parts.height);
             node.customRatio = `${parts.width}:${parts.height}`;
@@ -8474,7 +9652,7 @@ function renderGeneratorBody(node){
         }
         const ratioValue = node.ratio && [...ratioSelect.options].some(opt => opt.value === node.ratio) ? node.ratio : 'square';
         ratioSelect.value = ratioValue;
-        resolutionSelect.value = node.resolution || defaultApiImageResolution(node.model);
+        resolutionSelect.value = node.resolution || defaultClassicApiGeneratorResolution(node.model);
         ratioSelect.disabled = node.resolution === 'custom' || node.resolution === 'auto';
         customRatioRow.style.display = (node.resolution !== 'auto' && (node.ratio === 'custom' || node.ratio === 'source')) ? 'flex' : 'none';
         customSizeRow.style.display = node.resolution === 'custom' ? 'flex' : 'none';
@@ -8589,27 +9767,52 @@ function renderGeneratorBody(node){
     }
     syncSizeControls();
     const countInput = wrap.querySelector('.gen-count-input');
+    const countPresetSelect = wrap.querySelector('.gen-count-preset-select');
+    const commitCountValue = value => {
+        node.count = normalizeClassicApiCount(value, node.count);
+        countInput.value = String(node.count);
+        scheduleSave();
+    };
     countInput.onmousedown = e => e.stopPropagation();
     countInput.onclick = e => e.stopPropagation();
     countInput.oninput = e => {
-        const value = Math.max(1, Math.min(8, Number(e.target.value) || 1));
-        node.count = value;
+        const digits = String(e.target.value || '').replace(/\D+/g, '').slice(0, 2);
+        e.target.value = digits;
+        if(digits === '') return;
+        node.count = normalizeClassicApiCount(e.target.value, node.count);
+        if(Number(digits) < 1 || Number(digits) > 10) e.target.value = String(node.count);
         scheduleSave();
     };
-    countInput.onblur = e => { e.target.value = String(Math.max(1, Math.min(8, Number(node.count || 1)))); };
-    wrap.querySelectorAll('[data-step]').forEach(btn => {
-        btn.onclick = e => {
-            e.stopPropagation();
-            const next = Math.max(1, Math.min(8, Number(node.count || 1) + Number(btn.dataset.step || 0)));
-            node.count = next;
-            countInput.value = String(next);
-            scheduleSave();
-        };
-    });
+    countInput.onkeydown = e => {
+        if(e.key === 'Enter'){
+            e.preventDefault();
+            commitCountValue(e.target.value);
+            countInput.select();
+        } else if(e.key === 'Escape'){
+            e.preventDefault();
+            commitCountValue(e.target.value);
+            countInput.blur();
+        } else if(e.key === 'ArrowDown'){
+            e.preventDefault();
+            countPresetSelect.focus();
+            if(typeof countPresetSelect.showPicker === 'function') countPresetSelect.showPicker();
+        }
+    };
+    countInput.onblur = e => commitCountValue(e.target.value);
+    countPresetSelect.onmousedown = e => e.stopPropagation();
+    countPresetSelect.onclick = e => e.stopPropagation();
+    countPresetSelect.onchange = e => {
+        e.stopPropagation();
+        if(e.target.value) commitCountValue(e.target.value);
+        e.target.value = '';
+    };
     const list = wrap.querySelector('.input-list');
     renderImageInputList(list, node, mediaInputs);
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
-    wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
+    const generateBtn = wrap.querySelector('.gen-btn');
+    generateBtn.onmouseenter = () => setClassicCurrentNodePreview(node.id);
+    generateBtn.onmouseleave = () => clearClassicCurrentNodePreview();
+    generateBtn.onclick = e => { e.stopPropagation(); clearClassicCurrentNodePreview(); runCanvasGenerate(node.id); };
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
@@ -8640,7 +9843,7 @@ function renderMidjourneyBody(node){
     node.speed = ['relax','fast','turbo'].includes(node.speed) ? node.speed : 'relax';
     const sources = orderedSources(node, generatorSources(node));
     const mediaInputs = sources.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'image'));
-    const promptInputs = sources.filter(src => src.prompt && !src.refs?.length);
+    const promptInputs = sources.filter(src => src.prompt);
     const maskRef = mediaInputs.flatMap(source => source.refs || []).find(ref => String(ref.role || '').toLowerCase() === 'mask') || null;
     const hasProvider = Boolean(node.apiProvider);
     const taskText = node.lastTaskId ? `任务 ${escapeHtml(node.lastTaskId.slice(-14))}` : '生成四宫格后可选图';
@@ -8713,7 +9916,7 @@ function renderVideoBody(node){
     const inputSources = generatorSources(node);
     const ordered = orderedSources(node, inputSources);
     const mediaInputs = ordered.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
-    const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
+    const promptInputs = ordered.filter(src => src.prompt);
     sanitizeVideoNodeProviderModel(node);
     node.model = node.model || 'veo3-fast';
     wrap.innerHTML = `
@@ -9416,7 +10619,7 @@ function bindMiniMaxWorkbench(wrap, node){
 }
 function renderPromptPreview(container, promptInputs){
     if(!container) return;
-    container.innerHTML = promptInputs.length ? `<div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Prompts</div>${promptInputs.map(src => `<div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2 line-clamp-2">${escapeHtml(src.label)}</div>`).join('')}` : '';
+    container.innerHTML = promptInputs.length ? `<div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Prompts</div>${promptInputs.map(src => `<div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2 line-clamp-2">${escapeHtml(src.prompt || src.label)}</div>`).join('')}` : '';
 }
 function renderImageInputList(list, node, imageInputs, emptyText=null){
     if(!list) return;
@@ -9595,7 +10798,7 @@ function renderComfyBody(node){
     const imageInputs = mediaInputs
         .map(src => ({...src, refs:imageRefsOnly(src.refs || [])}))
         .filter(src => src.refs?.length);
-    const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
+    const promptInputs = ordered.filter(src => src.prompt);
     const mode = node.mode || 'text';
     const imageFieldCount = mode === 'custom' ? comfyFields(node, 'image').length : 0;
     const videoFieldCount = mode === 'custom' ? comfyFields(node, 'video').length : 0;
@@ -9721,6 +10924,25 @@ function rhFieldRole(field){
     const text = `${field?.fieldName || ''} ${field?.label || ''} ${field?.group || ''}`.toLowerCase();
     if(/prompt|positive|negative|text|caption|description|关键词|提示词|正向|负向/.test(text)) return 'prompt';
     return 'text';
+}
+function rhPromptBindingState(fields, media){
+    const configuredFields = Array.isArray(fields) ? fields : [];
+    const promptFields = configuredFields.filter(field => rhFieldRole(field) === 'prompt');
+    const upstreamPromptFields = promptFields.filter(field => field?.sourceFromUpstream !== false);
+    const connectedSources = (media?.sources || []).filter(source => String(source?.prompt || '').trim());
+    const connectedPrompt = String(media?.prompt || connectedSources.map(source => source.prompt).join('\n\n')).trim();
+    const configured = configuredFields.length > 0;
+    const promptGuidance = configured && !upstreamPromptFields.length
+        ? (connectedPrompt ? 'warning' : (!promptFields.length ? 'info' : ''))
+        : '';
+    return {
+        promptFields,
+        upstreamPromptFields,
+        connectedSources,
+        configured,
+        promptGuidance,
+        unsupported:promptGuidance === 'warning',
+    };
 }
 function rhExtractFieldOptions(field){
     const candidates = [field?.fieldData, field?.options, field?.list, field?.values, field?.enum, field?.choices, field?.items, field?.selectOptions, field?.dropdown];
@@ -10061,7 +11283,8 @@ function rhFieldValue(node, field, media=null){
     }
     if(rhFieldRole(field) === 'prompt'){
         const upstreamPrompt = (media || rhMediaSources(node)).prompt || '';
-        return param?.value ?? (upstreamPrompt || rhDefaultValue(field));
+        if(field?.sourceFromUpstream !== false && String(upstreamPrompt).trim()) return upstreamPrompt;
+        return param?.value ?? rhDefaultValue(field);
     }
     return param?.value ?? rhDefaultValue(field);
 }
@@ -10301,8 +11524,8 @@ function renderRhBody(node){
         node.instanceType = e.target.value === 'plus' ? 'plus' : '';
         scheduleSave();
     };
-    if(mode === 'model') renderPromptPreview(wrap.querySelector('.rh-prompt-list'), media.sources.filter(src => src.prompt && !src.refs?.length));
-    else renderRhPromptFields(wrap.querySelector('.rh-prompt-list'), node, fields);
+    if(mode === 'model') renderPromptPreview(wrap.querySelector('.rh-prompt-list'), media.sources.filter(src => src.prompt));
+    else renderRhPromptSection(wrap.querySelector('.rh-prompt-list'), node, fields, media);
     renderRhInputs(wrap.querySelector('.rh-input-list'), node, media);
     renderRhParams(wrap.querySelector('.rh-param-list'), node, fields, media);
     if(mode === 'model') bindRhModelControls(wrap, node, media);
@@ -10438,7 +11661,7 @@ function renderRhInputs(list, node, media){
         list.appendChild(item);
     });
 }
-function renderRhPromptFields(container, node, fields){
+function renderRhPromptFields(container, node, fields, media=null){
     if(!container) return;
     const prompts = (fields || []).filter(field => rhFieldRole(field) === 'prompt');
     if(!prompts.length){
@@ -10448,13 +11671,32 @@ function renderRhPromptFields(container, node, fields){
     container.innerHTML = prompts.map(field => {
         const key = rhParamKey(field.nodeId, field.fieldName);
         const label = field.label || field.fieldName || 'Prompt';
-        const value = rhFieldValue(node, field, rhMediaSources(node));
+        const value = rhFieldValue(node, field, media || rhMediaSources(node));
         return `<label class="field rh-prompt-field">
             <div class="setting-title">${escapeHtml(label)}</div>
             <textarea class="setting-input rh-param-input" data-rh-param="${escapeAttr(key)}" data-rh-role="prompt">${escapeHtml(value)}</textarea>
         </label>`;
     }).join('');
     bindRhParamControls(container, node);
+}
+function renderRhPromptSection(container, node, fields, media){
+    if(!container) return;
+    const state = rhPromptBindingState(fields, media);
+    if(state.promptFields.length){
+        renderRhPromptFields(container, node, state.promptFields, media);
+        if(!state.upstreamPromptFields.length && state.connectedSources.length){
+            const preview = document.createElement('div');
+            renderPromptPreview(preview, state.connectedSources);
+            if(preview.innerHTML) container.insertAdjacentHTML('afterbegin', preview.innerHTML);
+        }
+    } else {
+        renderPromptPreview(container, state.connectedSources);
+    }
+    if(state.unsupported || state.promptGuidance === 'warning'){
+        container.insertAdjacentHTML('beforeend', `<div class="rh-prompt-warning" role="status">${escapeHtml(tr('canvas.rhPromptUnsupported'))}</div>`);
+    } else if(state.promptGuidance === 'info'){
+        container.insertAdjacentHTML('beforeend', `<div class="rh-prompt-info" role="status"><span aria-hidden="true">ⓘ</span><span>${escapeHtml(tr('canvas.rhPromptNotRequired'))}</span></div>`);
+    }
 }
 function renderRhParams(container, node, fields, media){
     if(!container) return;
@@ -10793,13 +12035,16 @@ async function runRhModelNode(node, opts={}){
     const count = Math.max(1, Math.min(8, Number(node.count || 1)));
     let out = outputForNode(node, 500);
     const run = runSnapshot(node, prompt || 'Edit the reference images.', refs);
+    const imageRequest = await prepareGeneratorImageRequest(node, refs);
     run.taskLabel = 'RunningHub';
     const payload = {
         prompt:prompt || 'Edit the reference images.',
         provider_id:'runninghub',
         model,
-        size:await generatorSizeForRun(node, refs),
-        reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
+        size:imageRequest.size,
+        aspect_ratio:imageRequest.aspectRatio,
+        resolution:['1k','2k','4k'].includes(node.resolution) ? node.resolution : '',
+        reference_images:imageRequest.referenceImages
     };
     const quality = normalizedImageQuality(node.quality);
     if(quality) payload.quality = quality;
@@ -11149,14 +12394,16 @@ function mediaRefsFromNode(node){
 }
 function generatorSources(gen){
     return connections.filter(c => c.to === gen.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).map(n => {
-        if(n.type === 'output' && (n.images||[]).length){
+        const activeCtx = gen?._activeLoopCtx || loopContext || null;
+        const outputRefs = n.type === 'output' ? cascadeSourceRefsFromNode(n, activeCtx) : [];
+        if(n.type === 'output' && outputRefs.length){
             // 从 output 节点取最新一张图当作 reference 给下游
-            const reversed = [...n.images].map((item, index) => ({item, index})).reverse();
+            const reversed = [...outputRefs].map((item, index) => ({item, index})).reverse();
             const found = reversed.find(entry => outputUrlValue(entry.item));
             if(found){
                 const last = outputUrlValue(found.item);
                 const kind = mediaKindForOutputItem(found.item);
-                return {id:n.id, type:'outputImage', label:'上游输出', preview:last, refs:[{url:last, name:'output.png', kind, nodeId:n.id, outputIndex:found.index}], prompt:''};
+                return {id:n.id, type:'outputImage', label:'上游输出', preview:last, refs:[{...found.item, url:last, name:found.item?.name || 'output.png', kind, nodeId:n.id, outputIndex:found.item?.outputIndex ?? found.index}], prompt:''};
             }
         }
         if(CANVAS_MEDIA_OUTPUT_TYPES.includes(n.type)){
@@ -11188,7 +12435,7 @@ function generatorSources(gen){
                 refs:[{url:img.url, name:img.name || mediaKindForNode(img), role:img.role || '', kind:mediaKindForNode(img)}],
                 prompt:''
             }));
-            const prompts = items.filter(x => x.type === 'prompt').map(p => p.text || '').filter(Boolean);
+            const prompts = items.filter(x => x.type === 'prompt').map(p => classicPromptText(p)).filter(Boolean);
             if(prompts.length){
                 const combined = prompts.join('\n\n');
                 sources.push({
@@ -11202,19 +12449,23 @@ function generatorSources(gen){
             }
             return sources;
         }
-        if(n.type === 'prompt') return {id:n.id, type:'prompt', label:(n.text || '提示词').slice(0, 32), refs:[], prompt:n.text || ''};
+        if(n.type === 'prompt') {
+            const prompt = classicPromptText(n);
+            return {id:n.id, type:'prompt', label:(prompt || '提示词').slice(0, 32), refs:[], prompt};
+        }
         if(n.type === 'loop') {
             const ctx = gen?._activeLoopCtx || loopContext || null;
             const prompt = renderLoopPrompt(n, ctx);
             const imageRefs = loopInputImageRefs(n, ctx);
             const out = [];
             if(imageRefs.length){
-                const currentIndex = Math.max(1, Number(ctx?.index || n.loopStart || 1) || 1);
+                const currentRound = Math.max(1, Number(ctx?.index || n.loopStart || 1) || 1);
+                const firstImageNumber = loopImageStartForRound(currentRound, n.imageBatchSize) + 1;
                 imageRefs.forEach((ref, i) => {
                     out.push({
-                        id:`${n.id}:image:${currentIndex + i}:${ref.url}`,
+                        id:`${n.id}:image:${firstImageNumber + i}:${ref.url}`,
                         type:'loopImage',
-                        label:trf('canvas.loopImageLabel', {n:currentIndex + i}),
+                        label:trf('canvas.loopImageLabel', {n:firstImageNumber + i}),
                         preview:ref.url,
                         refs:[ref],
                         prompt:i === 0 && !out.length ? prompt : ''
@@ -11225,10 +12476,13 @@ function generatorSources(gen){
             return {id:n.id, type:'loop', label:`${tr('canvas.loopNode')} ${loopCount(n)}x`, refs:[], prompt};
         }
         if(n.type === 'promptGroup') {
-            const prompts = (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean).map(p => p.text || '').filter(Boolean);
+            const prompts = (n.items || []).map(id => nodes.find(x => x.id === id)).filter(Boolean).map(p => classicPromptText(p)).filter(Boolean);
             return {id:n.id, type:'promptGroup', label:`提示词 ${prompts.length} 个`, refs:[], prompt:prompts.join('\n\n')};
         }
-        if(n.type === 'llm' && (n.mode || 'node') === 'node' && n.outputText) return {id:n.id, type:'llm', label:(n.outputText || 'LLM').slice(0, 32), refs:[], prompt:n.outputText || ''};
+        if(n.type === 'llm' && (n.mode || 'node') === 'node'){
+            const prompt = classicLLMOutputPromptText(n);
+            if(prompt) return {id:n.id, type:'llm', label:prompt.slice(0, 32), refs:[], prompt};
+        }
         return null;
     }).flat().filter(Boolean);
 }
@@ -11259,12 +12513,58 @@ function syncGeneratorInputs(){
 }
 // 提示词节点每敲一个字都全量重建所有生成器节点的输入/预览 DOM 会卡顿。节点的 text 已即时写入
 // （运行时实时读取，不受影响），生成器里的预览只需稍后同步一次即可，这里做防抖。
+const pendingClassicLoopPromptSourceIds = new Set();
+function classicLoopIdsForPromptNode(promptNodeId, nodeList=nodes, connectionList=connections){
+    if(!promptNodeId) return [];
+    const sourceIds = new Set([promptNodeId]);
+    nodeList.filter(node => node.type === 'promptGroup' && (node.items || []).includes(promptNodeId))
+        .forEach(node => sourceIds.add(node.id));
+    return [...new Set(connectionList
+        .filter(connection => sourceIds.has(connection.from))
+        .map(connection => nodeList.find(node => node.id === connection.to))
+        .filter(node => node?.type === 'loop')
+        .map(node => node.id))];
+}
+function classicLoopPromptViewState(node){
+    const promptItems = node?.showPrompt ? loopInputPromptItems(node) : [];
+    const count = promptItems.length;
+    const effective = String(renderLoopPrompt(node, {
+        index:Math.max(1, Number(node?.loopStart) || 1),
+        total:Math.max(1, Number(node?.loopStart) || 1) + loopCount(node) - 1,
+    }) || '').replace(/\s+/g, ' ').trim();
+    return {
+        count,
+        hasUpstream:count > 0,
+        summary:node?.showPrompt
+            ? trf('canvas.loopSummaryPrompt', {n:count, text:effective || tr('canvas.loopSummaryPromptEmpty')})
+            : tr('canvas.loopSummaryPromptDisabled'),
+    };
+}
+function refreshClassicLoopPromptView(loopNodeOrId){
+    const node = typeof loopNodeOrId === 'string'
+        ? nodes.find(item => item.id === loopNodeOrId)
+        : loopNodeOrId;
+    if(!node || node.type !== 'loop') return;
+    const el = nodesEl.querySelector(`.node[data-id="${CSS.escape(node.id)}"]`);
+    if(!el) return;
+    const state = classicLoopPromptViewState(node);
+    const promptRow = el.querySelector('.loop-summary-prompt');
+    if(promptRow){
+        promptRow.textContent = state.summary;
+        promptRow.title = state.summary;
+    }
+}
 let generatorInputSyncTimer = 0;
-function scheduleGeneratorInputSync(){
+function scheduleGeneratorInputSync(promptSourceId=''){
+    if(promptSourceId) pendingClassicLoopPromptSourceIds.add(promptSourceId);
     clearTimeout(generatorInputSyncTimer);
     generatorInputSyncTimer = setTimeout(() => {
+        const promptSourceIds = [...pendingClassicLoopPromptSourceIds];
+        pendingClassicLoopPromptSourceIds.clear();
         syncGeneratorInputs();
         refreshGeneratorInputViews();
+        const loopIds = new Set(promptSourceIds.flatMap(id => classicLoopIdsForPromptNode(id)));
+        loopIds.forEach(id => refreshClassicLoopPromptView(id));
     }, 160);
 }
 function refreshGeneratorInputViews(){
@@ -11275,7 +12575,12 @@ function refreshGeneratorInputViews(){
         const imageInputs = sources
             .map(src => ({...src, refs:imageRefsOnly(src.refs || [])}))
             .filter(src => src.refs?.length);
-        renderPromptPreview(el.querySelector('.prompt-list'), sources.filter(src => src.prompt && !src.refs?.length));
+        renderPromptPreview(el.querySelector('.prompt-list'), sources.filter(src => src.prompt));
+        const hasUpstreamPrompt = sources.some(src => src.prompt);
+        const localPromptLabel = el.querySelector('.api-local-prompt-label');
+        const localPromptInput = el.querySelector('.api-local-prompt-input');
+        if(localPromptLabel) localPromptLabel.textContent = tr(hasUpstreamPrompt ? 'canvas.apiAppendPrompt' : 'canvas.apiLocalPrompt');
+        if(localPromptInput) localPromptInput.placeholder = tr(hasUpstreamPrompt ? 'canvas.apiAppendPromptPlaceholder' : 'canvas.apiLocalPromptPlaceholder');
         if(gen.type === 'generator') renderImageInputList(el.querySelector('.input-list'), gen, imageInputs);
         if(gen.type === 'midjourney') renderImageInputList(el.querySelector('.mj-input-list'), gen, imageInputs);
         if(gen.type === 'msgen') renderImageInputList(el.querySelector('.ms-img-list'), gen, imageInputs);
@@ -11292,8 +12597,8 @@ function refreshGeneratorInputViews(){
         }
         if(gen.type === 'rh'){
             const media = rhMediaSources(gen);
-            if(rhCurrentKind(gen) === 'model') renderPromptPreview(el.querySelector('.rh-prompt-list'), media.sources.filter(src => src.prompt && !src.refs?.length));
-            else renderRhPromptFields(el.querySelector('.rh-prompt-list'), gen, rhActiveFields(gen));
+            if(rhCurrentKind(gen) === 'model') renderPromptPreview(el.querySelector('.rh-prompt-list'), media.sources.filter(src => src.prompt));
+            else renderRhPromptSection(el.querySelector('.rh-prompt-list'), gen, rhActiveFields(gen), media);
             renderRhInputs(el.querySelector('.rh-input-list'), gen, media);
             renderRhParams(el.querySelector('.rh-param-list'), gen, rhActiveFields(gen), media);
         }
@@ -11304,18 +12609,21 @@ async function runGenerator(genId, opts={}){
     if(!gen || (gen.running && !opts.cascade)) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(gen, generatorSources(gen));
-    const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
+    const prompt = ClassicCascadePlan.composeGeneratorPrompt(sources.map(s => s.prompt), gen.localPrompt);
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
-    const count = Math.max(1, Math.min(8, Number(gen.count || 1)));
+    const count = normalizeClassicApiCount(gen.count);
     let out = outputForNode(gen, 460);
     const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
+    const imageRequest = await prepareGeneratorImageRequest(gen, refs);
     const payload = {
         prompt: prompt || 'Edit the reference images.',
         provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
         model:resolveImageModel(gen.model),
-        size:await generatorSizeForRun(gen, refs),
-        reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
+        size:imageRequest.size,
+        aspect_ratio:imageRequest.aspectRatio,
+        resolution:['1k','2k','4k'].includes(gen.resolution) ? gen.resolution : '',
+        reference_images:imageRequest.referenceImages
     };
     const quality = normalizedImageQuality(gen.quality);
     if(quality) payload.quality = quality;
@@ -11548,14 +12856,15 @@ async function runGeneratorLegacy(genId, opts={}){
     const gen = nodes.find(n => n.id === genId);
     if(!gen || (gen.running && !opts.cascade)) return;
     const sources = orderedSources(gen, generatorSources(gen));
-    const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
+    const prompt = ClassicCascadePlan.composeGeneratorPrompt(sources.map(s => s.prompt), gen.localPrompt);
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
-    const count = Math.max(1, Math.min(8, Number(gen.count || 1)));
+    const count = normalizeClassicApiCount(gen.count);
     let out = outputForNode(gen, 460);
     const pendingIds = Array.from({length:count}, () => uid('p'));
     const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
-    const requestSize = await generatorSizeForRun(gen, refs);
+    const imageRequest = await prepareGeneratorImageRequest(gen, refs);
+    const requestSize = imageRequest.size;
     if(out) out._pending = [...(out._pending||[]), ...pendingIds.map(id => makePendingForRun(id, run, gen, {refs, requestSize}))];
     if(!opts.cascade){
         gen.running = true;
@@ -11569,9 +12878,9 @@ async function runGeneratorLegacy(genId, opts={}){
             provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
             model:resolveImageModel(gen.model),
             size:requestSize,
-            aspect_ratio:API_RATIO_VALUES[gen.ratio] || (gen.ratio === 'custom' ? String(gen.customRatio || '').trim() : ''),
+            aspect_ratio:imageRequest.aspectRatio,
             resolution:['1k','2k','4k'].includes(gen.resolution) ? gen.resolution : '',
-            reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
+            reference_images:imageRequest.referenceImages
         };
         const quality = normalizedImageQuality(gen.quality);
         if(quality) payload.quality = quality;
@@ -12427,7 +13736,7 @@ function renderLTXDirectorBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'ltx-director-body';
     const sources = orderedSources(node, generatorSources(node));
-    const promptInputs = sources.filter(src => src.prompt && !src.refs?.length);
+    const promptInputs = sources.filter(src => src.prompt);
     const imageInputs = sources
         .map(src => ({...src, refs:imageRefsOnly(src.refs || [])}))
         .filter(src => src.refs?.length);
@@ -12773,24 +14082,41 @@ async function runLLMNode(nodeId, opts={}){
         if(opts.cascade) throw new Error('LLM 缺少提示词输入');
         alert(tr('canvas.needPromptToLLM')); return;
     }
-    if(!opts.cascade){ node.running = true; refreshNodes([node.id]); }
+    const inputKey = classicLLMInputKey(node);
+    scheduleSave();
+    if(!opts.cascade){
+        node.running = true;
+        node.runStatus = 'running';
+        node.runError = '';
+        refreshNodes([node.id]);
+        try {
+            await submitCanvasLLMTask(node, input, [], 'node');
+            refreshNodes([node.id]);
+        } catch(err) {
+            node.running = false;
+            node.runStatus = 'failed';
+            node.runError = err.message || String(err);
+            refreshNodes([node.id]);
+            alert(err.message || 'LLM 任务创建失败');
+        }
+        return;
+    }
     try {
-        node.outputText = await callCanvasLLM(node, input, [], {cascadeTargetId});
-        if(!opts.cascade) node.running = false;
+        const resultText = await callCanvasLLM(node, input, [], {cascadeTargetId});
+        window.CanvasLLMResultMemory?.remember(node, inputKey, resultText);
+        node.llmResultKey = inputKey;
+        node.outputText = resultText;
         node.runStatus = 'done'; node.runError = '';
         refreshNodes([node.id]);
         scheduleSave();
     } catch(err) {
-        if(!opts.cascade) node.running = false;
         if(isCascadeAbortError(err)){
             refreshNodes([node.id]);
-            if(opts.cascade) throw err;
-            return;
+            throw err;
         }
         node.runStatus = 'failed'; node.runError = err.message || String(err);
         refreshNodes([node.id]);
-        if(opts.cascade) throw err;
-        alert(err.message || 'LLM 运行失败');
+        throw err;
     }
 }
 // 判断是不是「链尾」节点：没有下游生成节点（直接相连或经 Output 中转都算）
@@ -12829,19 +14155,37 @@ function findLoopCascadeTarget(loopId){
     const terminal = candidates.filter(c => c.terminal).sort((a, b) => b.depth - a.depth)[0];
     return (terminal || candidates.sort((a, b) => b.depth - a.depth)[0])?.id || '';
 }
+function cascadeCompleteRunLabel(targetId){
+    const loop = resolveCascadeLoop(targetId);
+    const plan = classicCascadePlan(targetId, loop?.node?.id || '');
+    if((plan.loopStages || []).length > 1) return `运行完整流程：${plan.loopStages.length} 个循环阶段`;
+    if(!loop) return `一键运行 ${plan.allOrder.length} 个节点`;
+    return `运行完整流程：预处理 ${plan.onceOrder.length} 个节点 + 循环 ${plan.loopOrder.length || 1} 个节点 × ${loop.count} ${tr('canvas.loopRounds')}`;
+}
 function cascadeBtnHtml(node){
     // 仅链尾节点显示一键运行
     if(!isTerminalGenerator(node.id)) return '';
     // 也要求至少有上游生成节点，否则没意义
-    const order = computeCascadeOrder(node.id);
     const loop = resolveCascadeLoop(node.id);
+    const plan = classicCascadePlan(node.id, loop?.node?.id || '');
+    const order = plan.allOrder;
     if(order.length <= 1 && !loop) return '';
-    const suffix = loop ? ` × ${loop.count} ${tr('canvas.loopRounds')}` : '';
     if(isCascadeActive(node.id)){
         const stopping = isCascadeStopping(node.id);
         return `<button class="gen-cascade-btn gen-cascade-stop" type="button" data-cascade-stop="${node.id}" ${stopping ? 'disabled' : ''}><i data-lucide="square" class="w-4 h-4"></i><span>${stopping ? '停止中…' : '停止运行'}</span></button>`;
     }
-    return `<button class="gen-cascade-btn" type="button" data-cascade="${node.id}" title="一键运行整条工作流（追溯所有上游生成节点）"><i data-lucide="play-circle" class="w-4 h-4"></i><span>一键运行 ${order.length} 个节点${suffix}</span></button>`;
+    const loopStageCount = Array.isArray(plan.loopStages) ? plan.loopStages.length : 0;
+    const label = loopStageCount > 1
+        ? `运行完整流程：${loopStageCount} 个循环阶段`
+        : loop
+        ? `运行完整流程：预处理 ${plan.onceOrder.length} 个节点 + 循环 ${plan.loopOrder.length || 1} 个节点 × ${loop.count} ${tr('canvas.loopRounds')}`
+        : `一键运行 ${order.length} 个节点`;
+    const title = loopStageCount > 1
+        ? '循环阶段将依次运行，前一个循环全部完成后才进入下一个循环'
+        : loop
+        ? '先运行循环前节点一次，再运行循环内节点'
+        : '一键运行整条工作流（追溯所有上游生成节点）';
+    return `<button class="gen-cascade-btn" type="button" data-cascade="${node.id}" title="${title}"><i data-lucide="play-circle" class="w-4 h-4"></i><span>${label}</span></button>`;
 }
 function retryBarHtml(node){
     // 只在一键运行模式中失败才显示；普通单节点失败直接弹 alert，不显示这条
@@ -12855,7 +14199,9 @@ function retryBarHtml(node){
 function bindCascadeButtons(wrap, nodeId){
     wrap.querySelectorAll(`[data-cascade="${nodeId}"]`).forEach(b => {
         b.onmousedown = e => e.stopPropagation();
-        b.onclick = e => { e.stopPropagation(); runNodeCascade(nodeId); };
+        b.onmouseenter = () => setClassicCascadePreview(nodeId, {scope:'complete'});
+        b.onmouseleave = () => clearClassicCascadePreview();
+        b.onclick = e => { e.stopPropagation(); clearClassicCascadePreview(); runNodeCascade(nodeId); };
     });
     wrap.querySelectorAll(`[data-cascade-stop="${nodeId}"]`).forEach(b => {
         b.onmousedown = e => e.stopPropagation();
@@ -12969,33 +14315,71 @@ async function runCanvasGenerate(nodeId){
     if(!node || node.running || cascadeRunningIds.has(nodeId)) return;
     return runCascadeNodeByType(node, {cascade:false});
 }
+function classicCascadePlan(targetId, loopId=''){
+    if(!window.ClassicCascadePlan) return {targetId, loopId:'', onceOrder:[], loopOrder:[], allOrder:[]};
+    return window.ClassicCascadePlan.buildCascadePlan(nodes, connections, targetId, canvasRunTypes(), {loopId});
+}
+const CLASSIC_CASCADE_PREVIEW_NODE_CLASSES = [
+    'workflow-preview-current-run',
+    'workflow-preview-once-data',
+    'workflow-preview-loop-data',
+    'workflow-preview-once-run',
+    'workflow-preview-loop-run',
+];
+const CLASSIC_CASCADE_PREVIEW_LINK_CLASSES = ['workflow-preview-once', 'workflow-preview-loop'];
+function classicCascadePreviewNodeClasses(nodeId){
+    if(!classicCascadePreview || !nodeId) return [];
+    const classes = [];
+    if(classicCascadePreview.currentRunnableNodeIds?.includes(nodeId)) classes.push('workflow-preview-current-run');
+    if(classicCascadePreview.onceDataNodeIds?.includes(nodeId)) classes.push('workflow-preview-once-data');
+    if(classicCascadePreview.loopDataNodeIds?.includes(nodeId)) classes.push('workflow-preview-loop-data');
+    if(classicCascadePreview.onceRunnableNodeIds?.includes(nodeId)) classes.push('workflow-preview-once-run');
+    if(classicCascadePreview.loopRunnableNodeIds?.includes(nodeId)) classes.push('workflow-preview-loop-run');
+    return classes;
+}
+function classicCascadePreviewLinkClasses(connectionId){
+    if(!classicCascadePreview || !connectionId) return [];
+    if(classicCascadePreview.loopEdgeIds?.includes(connectionId)) return ['workflow-preview-loop'];
+    if(classicCascadePreview.onceEdgeIds?.includes(connectionId)) return ['workflow-preview-once'];
+    return [];
+}
+function applyClassicCascadePreviewClasses(){
+    nodesEl?.querySelectorAll?.('.node').forEach(element => {
+        element.classList.remove(...CLASSIC_CASCADE_PREVIEW_NODE_CLASSES);
+        element.classList.add(...classicCascadePreviewNodeClasses(element.dataset.id));
+    });
+    linksEl?.querySelectorAll?.('.link[data-connection-id]').forEach(element => {
+        element.classList.remove(...CLASSIC_CASCADE_PREVIEW_LINK_CLASSES);
+        element.classList.add(...classicCascadePreviewLinkClasses(element.dataset.connectionId));
+    });
+}
+function setClassicCascadePreview(targetId, options={}){
+    if(!window.ClassicCascadePlan?.buildCascadePreview || !targetId) return;
+    const loopId = options.loopId || classicCascadePlan(targetId).loopId || '';
+    classicCascadePreview = window.ClassicCascadePlan.buildCascadePreview(
+        nodes,
+        connections,
+        targetId,
+        canvasRunTypes(),
+        {scope:options.scope === 'loop' ? 'loop' : 'complete', loopId}
+    );
+    applyClassicCascadePreviewClasses();
+}
+function setClassicCurrentNodePreview(targetId){
+    if(!window.ClassicCascadePlan?.buildCurrentNodePreview || !targetId) return;
+    classicCascadePreview = window.ClassicCascadePlan.buildCurrentNodePreview(targetId);
+    applyClassicCascadePreviewClasses();
+}
+function clearClassicCurrentNodePreview(){
+    clearClassicCascadePreview();
+}
+function clearClassicCascadePreview(){
+    if(!classicCascadePreview) return;
+    classicCascadePreview = null;
+    applyClassicCascadePreviewClasses();
+}
 function computeCascadeOrder(targetId){
-    const visited = new Set();
-    const order = [];
-    const GEN_TYPES = canvasRunTypes();
-    function dfs(id){
-        if(visited.has(id)) return;
-        visited.add(id);
-        const node = nodes.find(n => n.id === id);
-        if(!node) return;
-        // 找该节点的上游
-        connections.filter(c => c.to === id).forEach(c => {
-            const from = nodes.find(n => n.id === c.from);
-            if(!from) return;
-            if(GEN_TYPES.includes(from.type)){
-                dfs(from.id);
-            } else if(from.type === 'output'){
-                // output 节点的上游是生成器
-                connections.filter(cc => cc.to === from.id).forEach(cc => {
-                    const ff = nodes.find(n => n.id === cc.from);
-                    if(ff && GEN_TYPES.includes(ff.type)) dfs(ff.id);
-                });
-            }
-        });
-        if(GEN_TYPES.includes(node.type)) order.push(id);
-    }
-    dfs(targetId);
-    return order;
+    return classicCascadePlan(targetId).allOrder;
 }
 function upstreamNodeIds(targetId){
     const found = new Set();
@@ -13009,58 +14393,230 @@ function upstreamNodeIds(targetId){
     walk(targetId);
     return found;
 }
-function resolveCascadeLoop(targetId){
-    const upstream = upstreamNodeIds(targetId);
-    const loops = nodes.filter(n => n.type === 'loop' && upstream.has(n.id));
-    if(!loops.length) return null;
-    const loop = loops[loops.length - 1];
+function resolveCascadeLoop(targetId, requestedLoopId=''){
+    const loopId = classicCascadePlan(targetId, requestedLoopId).loopId;
+    const loop = nodes.find(n => n.id === loopId && n.type === 'loop');
+    if(!loop) return null;
     return {node:loop, count:loopCount(loop), mode:loop.mode === 'parallel' ? 'parallel' : 'serial'};
 }
 function cascadeUiNodeIds(targetId, order=null){
     const ids = new Set([targetId, ...(order || computeCascadeOrder(targetId))]);
-    const loop = resolveCascadeLoop(targetId);
-    if(loop?.node?.id) ids.add(loop.node.id);
+    const plan = classicCascadePlan(targetId);
+    (plan.loopStages || []).forEach(stage => ids.add(stage.loopId));
+    if(!(plan.loopStages || []).length){
+        const loop = resolveCascadeLoop(targetId);
+        if(loop?.node?.id) ids.add(loop.node.id);
+    }
     return [...ids].filter(Boolean);
 }
-async function runNodeCascade(nodeId){
+function cascadeFreshSourceRefsByNode(onceOrder){
+    const onceIds = new Set(onceOrder || []);
+    const sourceRefsByNode = {};
+    connections.forEach(connection => {
+        if(!onceIds.has(connection.from)) return;
+        const source = nodes.find(node => node.id === connection.from);
+        const target = nodes.find(node => node.id === connection.to);
+        if(!source || target?.type !== 'output') return;
+        const refs = generatedImageRefs(source).filter(ref => ref.kind === 'image');
+        if(!refs.length) return;
+        const current = sourceRefsByNode[target.id] || [];
+        sourceRefsByNode[target.id] = [
+            ...current,
+            ...refs.map((ref, index) => ({...ref, nodeId:target.id, outputIndex:current.length + index})),
+        ];
+    });
+    return sourceRefsByNode;
+}
+function classicCascadeLoopSettings(plan){
+    const settings = {};
+    (plan?.loopStages || []).forEach(stage => {
+        const loop = nodes.find(node => node.id === stage.loopId && node.type === 'loop');
+        if(!loop) return;
+        settings[stage.loopId] = {
+            startRound:Math.max(1, Number(loop.loopStart) || 1),
+            totalRounds:loopCount(loop),
+        };
+    });
+    return settings;
+}
+function checkClassicCascadeLoopImages(loopNode, sourceRefsByNode, startRound, totalRounds){
+    if(!loopNode) return true;
+    const available = loopPreviewImageRefs(loopNode, {sourceRefsByNode}).length;
+    const check = window.ClassicCascadePlan.checkLoopImageAvailability({
+        enabled:loopNode.imageInput === true,
+        available,
+        startRound,
+        totalRounds,
+        batchSize:loopNode.imageBatchSize,
+    });
+    if(check.ok) return true;
+    alert(`图片数量不足：当前只有 ${check.available} 张，第 ${check.firstEmptyRound} 轮没有可用图片。按当前设置至少需要 ${check.required} 张图片。`);
+    return false;
+}
+async function runClassicCascadeLoopStage(options={}){
+    const targetId = options.targetId || '';
+    const cascadeContext = options.cascadeContext;
+    const stage = options.stage || {};
+    const loopNode = options.loopNode;
+    const sourceRefsByNode = options.sourceRefsByNode || {};
+    const order = options.order || stage.order || [];
+    const stageOrder = [...(stage.order || [])];
+    const rounds = [...(stage.rounds || [])];
+    if(!loopNode || !stageOrder.length || !rounds.length){
+        return {attemptedRounds:0, successfulRounds:0, failedRounds:0, failures:[], outcomes:[]};
+    }
+    const totalRounds = rounds.length;
+    const endIdx = rounds[rounds.length - 1].index;
+    const limit = loopNode.mode === 'parallel' && totalRounds > 1
+        ? cascadeParallelLimit(stageOrder, totalRounds)
+        : 1;
+    stageOrder.forEach(id => {
+        const node = nodes.find(item => item.id === id);
+        if(node){
+            node.runStatus = 'queued';
+            node.runError = '';
+            node._cascadeFailed = false;
+            node._cascadeIdx = `0/${totalRounds}`;
+        }
+    });
+    refreshNodes(cascadeUiNodeIds(targetId, order));
+    try {
+        const result = await window.ClassicCascadePlan.runTolerantLoopRounds(rounds, limit, async (roundPlan, roundOffset) => {
+            ensureCascadeActive(targetId, cascadeContext?.message);
+            const loopIndex = roundPlan.index;
+            const currentLoopContext = {index:loopIndex, total:endIdx, nodeId:loopNode.id, sourceRefsByNode};
+            roundPlan.order.forEach((id, index) => {
+                const node = nodes.find(item => item.id === id);
+                if(node){
+                    node.runStatus = 'queued';
+                    node.runError = '';
+                    node._cascadeFailed = false;
+                    node._cascadeIdx = `${index + 1}/${roundPlan.order.length}${totalRounds > 1 ? ` · ${loopIndex}/${endIdx}` : ''}`;
+                }
+            });
+            refreshNodes(cascadeUiNodeIds(targetId, order));
+            for(let i = 0; i < roundPlan.order.length; i++){
+                const id = roundPlan.order[i];
+                const node = nodes.find(item => item.id === id);
+                if(!node) continue;
+                cascadeContext.currentNodeId = id;
+                cascadeContext.currentRoundLabel = totalRounds > 1 ? `${loopIndex}/${endIdx}` : '';
+                node.runStatus = 'running';
+                refreshNodes([id]);
+                try {
+                    await runCascadeNodeWithLoopContext(node, currentLoopContext, {cascadeTargetId:targetId});
+                    ensureCascadeActive(targetId, cascadeContext?.message);
+                    node.runStatus = 'done';
+                    refreshNodes([id]);
+                } catch(err){
+                    if(isCascadeAbortError(err)) throw err;
+                    node.runStatus = 'failed';
+                    node.runError = `${totalRounds > 1 ? `${tr('canvas.loopRound')} ${roundOffset + 1}/${totalRounds}: ` : ''}${err.message || String(err)}`;
+                    node._cascadeFailed = true;
+                    err.cascadeNodeId = id;
+                    err.cascadeRoundIndex = loopIndex;
+                    for(let j = i + 1; j < roundPlan.order.length; j++){
+                        const downstream = nodes.find(item => item.id === roundPlan.order[j]);
+                        if(downstream){
+                            downstream.runStatus = '';
+                            downstream._cascadeIdx = '';
+                        }
+                    }
+                    refreshNodes(roundPlan.order);
+                    throw err;
+                }
+            }
+        }, isCascadeAbortError);
+        const summary = result.failedRounds > 0
+            ? `成功 ${result.successfulRounds} / 失败 ${result.failedRounds}`
+            : `${result.successfulRounds}/${result.attemptedRounds}`;
+        const failureMessage = result.failures
+            .map(item => item.reason?.message || String(item.reason || ''))
+            .filter(Boolean)
+            .slice(0, 3)
+            .join('；');
+        stageOrder.forEach(id => {
+            const node = nodes.find(item => item.id === id);
+            if(!node) return;
+            node.runStatus = result.failedRounds > 0 ? 'partial' : 'done';
+            node.runError = failureMessage;
+            node._cascadeFailed = false;
+            node._cascadeIdx = summary;
+        });
+        refreshNodes(stageOrder);
+        return result;
+    } finally {
+        loopContext = null;
+    }
+}
+async function runNodeCascadeSingleLoop(nodeId, options={}){
+    clearClassicCascadePreview();
     const target = nodes.find(n => n.id === nodeId);
     if(!target) return;
     if(target.running){ alert('当前节点正在运行'); return; }
-    const order = computeCascadeOrder(nodeId);
-    if(!order.length){ alert('没有可运行的生成节点'); return; }
-    const loop = resolveCascadeLoop(nodeId);
+    const scope = options.scope === 'loop' ? 'loop' : 'complete';
+    const loop = resolveCascadeLoop(nodeId, options.loopId || '');
+    const plan = classicCascadePlan(nodeId, loop?.node?.id || '');
     const totalRounds = loop?.count || 1;
     const startIdx = Math.max(1, Number(loop?.node?.loopStart) || 1);
-    const loopImageStride = loop?.node?.imageInput ? Math.max(1, Math.min(100, Number(loop?.node?.imageBatchSize) || 1)) : 0;
-    const loopBatchSize = Math.max(1, loopImageStride);
-    const endIdx = startIdx + (totalRounds - 1) * loopBatchSize;
+    const endIdx = startIdx + totalRounds - 1;
+    const schedule = window.ClassicCascadePlan.buildExecutionStages(plan, {scope, startRound:startIdx, totalRounds});
+    const order = scope === 'loop' ? [...plan.loopOrder] : [...plan.allOrder];
+    if(!order.length){ alert('没有可运行的生成节点'); return; }
     const ctx = beginCascade(nodeId, order, {serial:true, mode:loop?.mode || 'serial'});
     refreshNodes(cascadeUiNodeIds(nodeId, order));
     order.forEach(id => {
-        const n = nodes.find(x => x.id === id);
-        if(n) n.generatedOutputs = [];
+        const node = nodes.find(item => item.id === id);
+        if(node) node.generatedOutputs = [];
     });
-    if(loop?.mode === 'parallel' && totalRounds > 1){
-        order.forEach(id => {
-            const n = nodes.find(x => x.id === id);
-            if(n){ n.runStatus = 'queued'; n.runError = ''; n._cascadeFailed = false; n._cascadeIdx = `0/${totalRounds}`; }
+
+    try {
+        if(schedule.onceOrder.length){
+            await runOneCascadePass(schedule.onceOrder, {cascadeTargetId:nodeId});
+            ensureCascadeActive(nodeId, ctx.message);
+        }
+    } catch(err){
+        if(isCascadeAbortError(err)) finalizeCascade(nodeId, 'stopped', {order});
+        else finalizeCascade(nodeId, 'failed', {order});
+        return;
+    }
+
+    if(!loop){
+        finalizeCascade(nodeId, 'done', {order});
+        return;
+    }
+
+    const sourceRefsByNode = cascadeFreshSourceRefsByNode(schedule.onceOrder);
+    if(!checkClassicCascadeLoopImages(loop.node, sourceRefsByNode, startIdx, totalRounds)){
+        finalizeCascade(nodeId, 'stopped', {order});
+        return;
+    }
+    const loopOrder = [...plan.loopOrder];
+    if(!loopOrder.length){
+        finalizeCascade(nodeId, 'done', {order});
+        return;
+    }
+
+    if(loop.mode === 'parallel' && totalRounds > 1){
+        loopOrder.forEach(id => {
+            const node = nodes.find(item => item.id === id);
+            if(node){ node.runStatus = 'queued'; node.runError = ''; node._cascadeFailed = false; node._cascadeIdx = `0/${totalRounds}`; }
         });
         refreshNodes(cascadeUiNodeIds(nodeId, order));
         let done = 0;
-        const rounds = Array.from({length:totalRounds}, (_, idx) => ({idx, index:startIdx + idx * loopBatchSize}));
-        const limit = cascadeParallelLimit(order, totalRounds);
-        const results = await runLimitedCascadeRounds(rounds, limit, async ({index}) => {
+        const limit = cascadeParallelLimit(loopOrder, totalRounds);
+        const results = await runLimitedCascadeRounds(schedule.rounds, limit, async ({index, order:roundOrder}) => {
             ensureCascadeActive(nodeId, ctx.message);
-            const loopCtx = {index, total:endIdx, nodeId:loop.node.id};
-            for(let i = 0; i < order.length; i++){
+            const loopCtx = {index, total:endIdx, nodeId:loop.node.id, sourceRefsByNode};
+            for(let i = 0; i < roundOrder.length; i++){
                 ensureCascadeActive(nodeId, ctx.message);
-                const id = order[i];
-                const node = nodes.find(n => n.id === id);
+                const id = roundOrder[i];
+                const node = nodes.find(item => item.id === id);
                 if(!node) continue;
                 ctx.currentNodeId = id;
                 ctx.currentRoundLabel = `${index}/${endIdx}`;
                 node.runStatus = 'running';
-                node._cascadeIdx = `${order.indexOf(id)+1}/${order.length} · ${index}/${endIdx}`;
+                node._cascadeIdx = `${i + 1}/${roundOrder.length} · ${index}/${endIdx}`;
                 refreshNodes([id]);
                 await runCascadeNodeWithLoopContext(node, loopCtx, {cascadeTargetId:nodeId});
                 ensureCascadeActive(nodeId, ctx.message);
@@ -13068,21 +14624,21 @@ async function runNodeCascade(nodeId){
                 refreshNodes([id]);
             }
             done += 1;
-            order.forEach(id => {
-                const n = nodes.find(x => x.id === id);
-                if(n) n._cascadeIdx = `${done}/${totalRounds}`;
+            loopOrder.forEach(id => {
+                const node = nodes.find(item => item.id === id);
+                if(node) node._cascadeIdx = `${done}/${totalRounds}`;
             });
-            refreshNodes(order);
+            refreshNodes(loopOrder);
         });
         loopContext = null;
-        const failed = results.find(r => r.status === 'rejected');
+        const failed = results.find(result => result.status === 'rejected');
         if(failed){
             const err = failed.reason || new Error('parallel loop failed');
             if(isCascadeAbortError(err)){
                 finalizeCascade(nodeId, 'stopped', {order});
                 return;
             }
-            const node = nodes.find(n => n.id === ctx.currentNodeId) || nodes.find(n => n.id === nodeId) || target;
+            const node = nodes.find(item => item.id === ctx.currentNodeId) || target;
             node.runStatus = 'failed';
             node.runError = err.message || String(err);
             node._cascadeFailed = true;
@@ -13092,19 +14648,21 @@ async function runNodeCascade(nodeId){
         finalizeCascade(nodeId, 'done', {order});
         return;
     }
+
     refreshNodes(cascadeUiNodeIds(nodeId, order));
-    for(let round = 1; round <= totalRounds; round++){
+    for(let round = 0; round < schedule.rounds.length; round++){
         ensureCascadeActive(nodeId, ctx.message);
-        const loopIndex = startIdx + (round - 1) * loopBatchSize;
-        loopContext = loop ? {index:loopIndex, total:endIdx, nodeId:loop.node.id} : null;
-        order.forEach(id => {
-            const n = nodes.find(x => x.id === id);
-            if(n){ n.runStatus = 'queued'; n.runError = ''; n._cascadeFailed = false; n._cascadeIdx = `${order.indexOf(id)+1}/${order.length}${totalRounds > 1 ? ` · ${loopIndex}/${endIdx}` : ''}`; }
+        const roundPlan = schedule.rounds[round];
+        const loopIndex = roundPlan.index;
+        loopContext = {index:loopIndex, total:endIdx, nodeId:loop.node.id, sourceRefsByNode};
+        roundPlan.order.forEach((id, index) => {
+            const node = nodes.find(item => item.id === id);
+            if(node){ node.runStatus = 'queued'; node.runError = ''; node._cascadeFailed = false; node._cascadeIdx = `${index + 1}/${roundPlan.order.length}${totalRounds > 1 ? ` · ${loopIndex}/${endIdx}` : ''}`; }
         });
         refreshNodes(cascadeUiNodeIds(nodeId, order));
-        for(let i = 0; i < order.length; i++){
-            const id = order[i];
-            const node = nodes.find(n => n.id === id);
+        for(let i = 0; i < roundPlan.order.length; i++){
+            const id = roundPlan.order[i];
+            const node = nodes.find(item => item.id === id);
             if(!node) continue;
             ctx.currentNodeId = id;
             ctx.currentRoundLabel = totalRounds > 1 ? `${loopIndex}/${endIdx}` : '';
@@ -13122,11 +14680,11 @@ async function runNodeCascade(nodeId){
                     return;
                 }
                 node.runStatus = 'failed';
-                node.runError = `${totalRounds > 1 ? `${tr('canvas.loopRound')} ${round}/${totalRounds}: ` : ''}${err.message || String(err)}`;
+                node.runError = `${totalRounds > 1 ? `${tr('canvas.loopRound')} ${round + 1}/${totalRounds}: ` : ''}${err.message || String(err)}`;
                 node._cascadeFailed = true;
-                for(let j = i + 1; j < order.length; j++){
-                    const n2 = nodes.find(x => x.id === order[j]);
-                    if(n2){ n2.runStatus = ''; n2._cascadeIdx = ''; }
+                for(let j = i + 1; j < roundPlan.order.length; j++){
+                    const downstream = nodes.find(item => item.id === roundPlan.order[j]);
+                    if(downstream){ downstream.runStatus = ''; downstream._cascadeIdx = ''; }
                 }
                 finalizeCascade(nodeId, 'failed', {order});
                 return;
@@ -13135,6 +14693,119 @@ async function runNodeCascade(nodeId){
     }
     loopContext = null;
     finalizeCascade(nodeId, 'done', {order});
+}
+async function runNodeCascade(nodeId, options={}){
+    const requestedLoopId = String(options.loopId || '');
+    const initialPlan = classicCascadePlan(nodeId, requestedLoopId);
+    if((initialPlan.loopStages || []).length === 0){
+        return runNodeCascadeSingleLoop(nodeId, options);
+    }
+
+    clearClassicCascadePreview();
+    const target = nodes.find(node => node.id === nodeId);
+    if(!target) return;
+    if(target.running){
+        alert('当前节点正在运行');
+        return;
+    }
+    const scope = options.scope === 'loop' ? 'loop' : 'complete';
+    const plan = classicCascadePlan(nodeId, requestedLoopId);
+    const schedule = window.ClassicCascadePlan.buildExecutionStages(plan, {
+        scope,
+        loopId:requestedLoopId || plan.loopId,
+        loopSettingsById:classicCascadeLoopSettings(plan),
+    });
+    const order = scope === 'loop'
+        ? schedule.stages.flatMap(stage => stage.order)
+        : [...plan.allOrder];
+    if(!order.length){
+        alert('没有可运行的生成节点');
+        return;
+    }
+
+    const ctx = beginCascade(nodeId, order, {serial:true, mode:'staged-loop'});
+    refreshNodes(cascadeUiNodeIds(nodeId, order));
+    order.forEach(id => {
+        const node = nodes.find(item => item.id === id);
+        if(node) node.generatedOutputs = [];
+    });
+
+    const completedOrder = [];
+    const partial = {failedRounds:0, skippedRounds:0};
+    try {
+        if(schedule.onceOrder.length){
+            await runOneCascadePass(schedule.onceOrder, {cascadeTargetId:nodeId});
+            ensureCascadeActive(nodeId, ctx.message);
+            completedOrder.push(...schedule.onceOrder);
+        }
+
+        for(const stage of schedule.stages){
+            ensureCascadeActive(nodeId, ctx.message);
+            const stageLoop = nodes.find(node => node.id === stage.loopId && node.type === 'loop');
+            if(!stageLoop) throw new Error(`找不到循环节点：${stage.loopId}`);
+            const sourceRefsByNode = cascadeFreshSourceRefsByNode(completedOrder);
+            const firstRound = stage.rounds[0]?.index || Math.max(1, Number(stageLoop.loopStart) || 1);
+            const totalRounds = stage.rounds.length || loopCount(stageLoop);
+            const imageAvailable = loopPreviewImageRefs(stageLoop, {sourceRefsByNode}).length;
+            const imageFit = window.ClassicCascadePlan.fitLoopRoundsToAvailableImages({
+                enabled:stageLoop.imageInput === true,
+                available:imageAvailable,
+                startRound:firstRound,
+                totalRounds,
+                batchSize:stageLoop.imageBatchSize,
+            });
+            if(imageFit.enabled && imageFit.runnableRounds === 0){
+                alert(`图片数量不足：当前只有 ${imageFit.available} 张，从第 ${imageFit.startRound} 轮开始没有可用图片，后续运行已停止。`);
+                finalizeCascade(nodeId, 'stopped', {order});
+                return;
+            }
+            const promptFit = window.ClassicCascadePlan.fitLoopRoundsToAvailablePrompts({
+                enabled:stageLoop.showPrompt === true,
+                available:classicLoopPromptCapacity(stageLoop),
+                startRound:firstRound,
+                totalRounds,
+            });
+            if(promptFit.enabled && promptFit.runnableRounds === 0){
+                partial.skippedRounds += totalRounds;
+                target.runStatus = 'partial';
+                target.runError = '';
+                target._cascadeFailed = false;
+                target._cascadeIdx = `无可用提示词 · 跳过 ${totalRounds}`;
+                finalizeCascade(nodeId, 'partial', {order});
+                return;
+            }
+            const runnableRounds = Math.min(imageFit.runnableRounds, promptFit.runnableRounds);
+            partial.skippedRounds += totalRounds - runnableRounds;
+            const runnableStage = {...stage, rounds:stage.rounds.slice(0, runnableRounds)};
+            const result = await runClassicCascadeLoopStage({
+                targetId:nodeId,
+                cascadeContext:ctx,
+                stage:runnableStage,
+                loopNode:stageLoop,
+                sourceRefsByNode,
+                order,
+            });
+            ensureCascadeActive(nodeId, ctx.message);
+            partial.failedRounds += result.failedRounds;
+            completedOrder.push(...stage.order);
+        }
+        if(partial.failedRounds || partial.skippedRounds){
+            target.runStatus = 'partial';
+            target.runError = '';
+            target._cascadeFailed = false;
+            target._cascadeIdx = [
+                partial.failedRounds ? `失败 ${partial.failedRounds}` : '',
+                partial.skippedRounds ? `跳过 ${partial.skippedRounds}` : '',
+            ].filter(Boolean).join(' · ');
+            finalizeCascade(nodeId, 'partial', {order});
+        } else {
+            finalizeCascade(nodeId, 'done', {order});
+        }
+    } catch(err){
+        loopContext = null;
+        if(isCascadeAbortError(err)) finalizeCascade(nodeId, 'stopped', {order});
+        else finalizeCascade(nodeId, 'failed', {order});
+    }
 }
 async function runOneCascadePass(order, options={}){
     const targetId = cascadeTargetIdFromOptions(options);
@@ -13206,30 +14877,40 @@ async function runLLMChat(nodeId){
     if(!message) return;
     node.messages = node.messages || [];
     const history = node.messages.slice();
-    node.messages.push({role:'user', content:message});
-    node.chatInput = '';
     node.running = true;
+    node.runStatus = 'running';
+    node.runError = '';
     refreshNodes([node.id]);
     try {
-        const text = await callCanvasLLM(node, message, history);
-        node.messages.push({role:'assistant', content:text});
-        node.outputText = text;
-        node.running = false;
+        await submitCanvasLLMTask(node, message, history, 'chat');
         refreshNodes([node.id]);
-        scheduleSave();
     } catch(err) {
         node.running = false;
+        node.runStatus = 'failed';
+        node.runError = err.message || String(err);
         refreshNodes([node.id]);
-        alert(err.message || 'LLM 运行失败');
+        alert(err.message || 'LLM 任务创建失败');
     }
 }
 
+function removeClassicConnections(shouldRemove){
+    if(!window.ClassicCascadePlan?.removeConnectionsAndReconcileLoops){
+        const removed = connections.filter(shouldRemove);
+        connections = connections.filter(connection => !shouldRemove(connection));
+        return removed;
+    }
+    const result = window.ClassicCascadePlan.removeConnectionsAndReconcileLoops(nodes, connections, shouldRemove);
+    connections = result.connections;
+    result.changedLoopIds.forEach(loopId => autoSizeLoopForPanels(nodes.find(node => node.id === loopId)));
+    return result.removed;
+}
 function deleteNode(id, event){
     event?.stopPropagation();
     pushUndo();
     destroyLTXEditor(nodes.find(n => n.id === id));
+    removeClassicConnections(connection => connection.from === id || connection.to === id);
     nodes = nodes.filter(n => n.id !== id);
-    connections = connections.filter(c => c.from !== id && c.to !== id);
+    nodes.filter(isCanvasFrameNode).forEach(frame => { frame.items = (frame.items || []).filter(itemId => itemId !== id); });
     selected.delete(id);
     render();
     scheduleSave();
@@ -13237,15 +14918,6 @@ function deleteNode(id, event){
 function clearNodeContentBeforeDelete(id){
     const node = nodes.find(n => n.id === id);
     if(!node) return false;
-    if(node.type === 'image' && node.url){
-        pushUndo();
-        node.url = '';
-        node.mediaKind = 'image';
-        node.name = tr('canvas.imageCard');
-        render();
-        scheduleSave();
-        return true;
-    }
     if(node.type === 'output' && ((node.images || []).length || (node._pending || []).length)){
         pushUndo();
         node.images = [];
@@ -13267,7 +14939,7 @@ function deleteConnection(id, event){
     event?.preventDefault();
     event?.stopPropagation();
     pushUndo();
-    connections = connections.filter(c => c.id !== id);
+    removeClassicConnections(connection => connection.id === id);
     if(hoveredConnectionId === id) hoveredConnectionId = '';
     syncGeneratorInputs();
     render();
@@ -13955,13 +15627,60 @@ async function downloadUrl(url, filename){
     link.remove();
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 }
+function resetOutputCompareResultPresentation(){
+    outputCompareResult.style.objectFit = 'contain';
+    outputCompareResult.style.boxSizing = '';
+    outputCompareResult.style.padding = '';
+}
+function applyOutputCompareDisplayMode(){
+    const fillMode = outputCompareDisplayMode === 'fill';
+    outputCompareFillBtn?.classList.toggle('active', fillMode);
+    outputCompareDefaultBtn?.classList.toggle('active', !fillMode);
+    outputCompareFillBtn?.setAttribute('aria-pressed', String(fillMode));
+    outputCompareDefaultBtn?.setAttribute('aria-pressed', String(!fillMode));
+    resetOutputCompareResultPresentation();
+    if(!fillMode || !currentOutputCompareUrl) return;
+    const insets = window.OutputCompareLayout?.containInsets(
+        outputCompareContainer.clientWidth,
+        outputCompareContainer.clientHeight,
+        outputCompareOriginal.naturalWidth,
+        outputCompareOriginal.naturalHeight
+    );
+    const padding = window.OutputCompareLayout?.paddingValue(insets) || '';
+    if(!padding) return;
+    outputCompareResult.style.objectFit = 'fill';
+    outputCompareResult.style.boxSizing = 'border-box';
+    outputCompareResult.style.padding = padding;
+}
+function setOutputCompareControlsAvailable(available){
+    [outputCompareFillBtn, outputCompareDefaultBtn].forEach(btn => {
+        if(btn) btn.hidden = !available;
+    });
+}
+function setOutputCompareDisplayMode(mode, activate=false){
+    outputCompareDisplayMode = mode === 'fill' ? 'fill' : 'default';
+    applyOutputCompareDisplayMode();
+    if(activate && currentOutputCompareUrl && !outputPreview.classList.contains('compare-mode')) setOutputCompareMode(true);
+}
 function setOutputCompareMode(active){
-    outputPreview.classList.toggle('compare-mode', active);
-    if(active){
+    const enabled = Boolean(active && currentOutputCompareUrl);
+    outputPreview.classList.toggle('compare-mode', enabled);
+    const videoVisible = outputLightboxVideo.style.display === 'block';
+    outputLightboxImg.style.display = (enabled || videoVisible) ? 'none' : 'block';
+    if(enabled){
         outputCompareOriginalWrap.style.clipPath = 'inset(0 50% 0 0)';
         outputCompareSlider.style.left = '50%';
+        applyOutputCompareDisplayMode();
     }
 }
+outputCompareFillBtn?.addEventListener('click', e => {
+    e.stopPropagation();
+    setOutputCompareDisplayMode('fill', true);
+});
+outputCompareDefaultBtn?.addEventListener('click', e => {
+    e.stopPropagation();
+    setOutputCompareDisplayMode('default', true);
+});
 function outputResolutionText(text, meta=null){
     const parts = [text || '--'];
     if(meta?.runMs) parts.push(`<span>${formatRunDuration(meta.runMs)}</span>`);
@@ -13970,7 +15689,7 @@ function outputResolutionText(text, meta=null){
 function setupOutputPromptPanel(meta){
     currentOutputMeta = meta || null;
     const prompt = meta?.run?.prompt || '';
-    outputPromptPanel.classList.toggle('open', !!prompt || !!meta?.run);
+    outputPromptPanel.classList.toggle('open', !!prompt || !!meta?.run || !!currentOutputCompareUrl);
     outputPromptText.textContent = prompt || tr('canvas.noPromptMeta');
     outputCopyPromptBtn.onclick = e => {
         e.stopPropagation();
@@ -14155,41 +15874,84 @@ workflowTransferModal?.addEventListener('drop', event => {
     else setStatus('请拖入 JSON 或 ZIP 工作流文件');
 });
 function hasCanvasAssetSaveDrop(dataTransfer){
-    return hasOutputImageDrag(dataTransfer) || hasImageDropData(dataTransfer);
+    const types = Array.from(dataTransfer?.types || []);
+    return types.includes('application/x-canvas-asset-save') || hasOutputImageDrag(dataTransfer) || hasImageDropData(dataTransfer);
 }
-canvasAssetDropZone?.addEventListener('dragover', event => {
+function canvasAssetSaveDropPayload(dataTransfer){
+    if(!Array.from(dataTransfer?.types || []).includes('application/x-canvas-asset-save')) return null;
+    try {
+        const payload = JSON.parse(dataTransfer.getData('application/x-canvas-asset-save') || '{}');
+        if(!payload?.url) return null;
+        return {url:String(payload.url), name:String(payload.name || outputImageName(payload.url)), kind:String(payload.kind || 'image')};
+    } catch(err) {
+        return null;
+    }
+}
+function activateCanvasAssetDrop(event){
     if(!hasCanvasAssetSaveDrop(event.dataTransfer)) return;
     event.preventDefault();
+    event.stopPropagation();
     event.dataTransfer.dropEffect = 'copy';
     canvasAssetDropZone.classList.add('drag-over');
+}
+canvasAssetDropZone?.addEventListener('dragenter', activateCanvasAssetDrop);
+canvasAssetDropZone?.addEventListener('dragover', activateCanvasAssetDrop);
+canvasAssetDropZone?.addEventListener('dragleave', event => {
+    if(event.relatedTarget && canvasAssetDropZone.contains(event.relatedTarget)) return;
+    canvasAssetDropZone.classList.remove('drag-over');
 });
-canvasAssetDropZone?.addEventListener('dragleave', () => canvasAssetDropZone.classList.remove('drag-over'));
 canvasAssetDropZone?.addEventListener('drop', async event => {
     if(!hasCanvasAssetSaveDrop(event.dataTransfer)) return;
     event.preventDefault();
     event.stopPropagation();
     canvasAssetDropZone.classList.remove('drag-over');
     try {
+        const directPayload = canvasAssetSaveDropPayload(event.dataTransfer);
+        if(directPayload){
+            const data = await addUrlToCanvasAssetLibrary(directPayload.url, directPayload.name);
+            if(data) showCanvasAssetStatus('已保存到资产库', 'success');
+            return;
+        }
         if(hasOutputImageDrag(event.dataTransfer)){
-            await addUrlToCanvasAssetLibrary(event.dataTransfer.getData('application/x-canvas-output-image'), 'output');
+            const outputUrl = event.dataTransfer.getData('application/x-canvas-output-image');
+            const data = await addUrlToCanvasAssetLibrary(outputUrl, outputImageName(outputUrl));
+            if(data) showCanvasAssetStatus('已保存到资产库', 'success');
             return;
         }
         const payload = await resolveImageDropPayload(event.dataTransfer);
         if(payload.type === 'files'){
-            const cat = activeCanvasAssetCategory();
-            const data = cat ? await uploadFilesToLibrary(payload.files, activeCanvasAssetLibraryId, cat.id) : null;
-            if(data?.library) {
-                canvasAssetLibrary = data.library;
-                renderCanvasAssetLibrary();
-                setStatus('已保存到资产库');
+            if(canvasAssetLibraryIsLocal()){
+                showCanvasAssetStatus('本地素材请在素材库管理中上传', 'error');
+                return;
             }
+            const cat = activeCanvasAssetCategory();
+            if(!cat){
+                showCanvasAssetStatus('请先创建资产分组', 'error');
+                return;
+            }
+            if(String(cat.type || 'image').toLowerCase() === 'workflow'){
+                showCanvasAssetStatus('当前是工作流分组，请切换到图片分组保存媒体', 'error');
+                return;
+            }
+            showCanvasAssetStatus('正在上传并保存...');
+            const data = await uploadFilesToLibrary(payload.files, activeCanvasAssetLibraryId, cat.id);
+            canvasAssetLibrary = data.library;
+            renderCanvasAssetLibrary();
+            showCanvasAssetStatus('已保存到资产库', 'success');
         } else if(payload.type === 'url') {
-            await addUrlToCanvasAssetLibrary(payload.url, outputImageName(payload.url));
+            const data = await addUrlToCanvasAssetLibrary(payload.url, outputImageName(payload.url));
+            if(data) showCanvasAssetStatus('已保存到资产库', 'success');
+        } else {
+            showCanvasAssetStatus('没有识别到可保存的图片或输出', 'error');
         }
     } catch(err) {
-        showErrorModal(err.message || '保存资产失败', '保存资产失败');
+        const message = err.message || '保存资产失败';
+        showCanvasAssetStatus(message, 'error');
+        showErrorModal(message, '保存资产失败');
     }
 });
+window.addEventListener('dragend', () => canvasAssetDropZone?.classList.remove('drag-over'));
+window.addEventListener('drop', () => canvasAssetDropZone?.classList.remove('drag-over'));
 gateAssetManagerBtn?.addEventListener('click', openAssetManager);
 document.querySelectorAll('[data-manager-tab]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -14551,6 +16313,9 @@ function initOutputCompareEvents(){
         }
     }, {passive:false});
     window.addEventListener('touchend', () => { outputCompareDrag = false; });
+    window.addEventListener('resize', () => {
+        if(outputLightbox.classList.contains('open')) requestAnimationFrame(applyOutputCompareDisplayMode);
+    });
 }
 function openOutputLightbox(url, out){
     if(!url) return;
@@ -14558,10 +16323,11 @@ function openOutputLightbox(url, out){
     currentOutputLightboxOutId = out?.id || '';
     currentOutputLightboxUrl = url;
     const meta = outputMetaFor(url, out);
+    currentOutputCompareUrl = outputCompareUrlFor(url, out);
     markOutputViewed(out, url);
     setupOutputPromptPanel(meta);
     outputResolutionText('--', meta);
-    currentOutputCompareUrl = outputCompareUrlFor(url, out);
+    setOutputCompareDisplayMode('default', false);
     setOutputCompareMode(false);
     const groupDownloadItems = out?.type === 'group' ? groupImageItems(out) : [];
     if(outputDownloadAllBtn){
@@ -14572,6 +16338,7 @@ function openOutputLightbox(url, out){
         };
     }
     const videoMode = mediaKindForOutputItem(meta && Object.keys(meta).length ? {...meta, url} : url) === 'video';
+    setOutputCompareControlsAvailable(!videoMode && !!currentOutputCompareUrl);
     outputLightboxImg.style.display = videoMode ? 'none' : 'block';
     outputLightboxVideo.style.display = videoMode ? 'block' : 'none';
     outputCompareResult.style.display = videoMode ? 'none' : 'block';
@@ -14603,6 +16370,8 @@ function openOutputLightbox(url, out){
     outputLightboxImg.onload = () => {
         outputResolutionText(`${outputLightboxImg.naturalWidth} x ${outputLightboxImg.naturalHeight}`, meta);
     };
+    outputCompareResult.onload = applyOutputCompareDisplayMode;
+    outputCompareOriginal.onload = applyOutputCompareDisplayMode;
     outputLightboxImg.src = canvasDisplayMediaUrl(url, outputDownloadName(url));
     outputCompareResult.src = canvasDisplayMediaUrl(url, outputDownloadName(url));
     outputCompareOriginal.src = currentOutputCompareUrl ? canvasDisplayMediaUrl(currentOutputCompareUrl, outputDownloadName(currentOutputCompareUrl)) : '';
@@ -14630,6 +16399,8 @@ function closeOutputLightbox(){
     outputCompareOriginal.style.display = 'block';
     outputCompareResult.src = '';
     outputCompareOriginal.src = '';
+    outputCompareResult.onload = null;
+    outputCompareOriginal.onload = null;
     outputPreview.ondblclick = null;
     if(outputDownloadAllBtn){
         outputDownloadAllBtn.style.display = 'none';
@@ -14637,6 +16408,8 @@ function closeOutputLightbox(){
     }
     resetOutputPreviewZoom();
     currentOutputCompareUrl = '';
+    setOutputCompareDisplayMode('default', false);
+    setOutputCompareControlsAvailable(false);
     currentOutputMeta = null;
     currentOutputLightboxOutId = '';
     currentOutputLightboxUrl = '';
@@ -14666,7 +16439,7 @@ function groupSelectedImages(){
 function nodeBounds(ids){
     const rects = ids.map(id => {
         const n = nodes.find(item => item.id === id);
-        const el = nodesEl.querySelector(`.node[data-id="${id}"]`);
+        const el = canvasNodeElement(id);
         if(!n) return null;
         return {x:n.x, y:n.y, w:el?.offsetWidth || n.w || 260, h:el?.offsetHeight || n.h || 220};
     }).filter(Boolean);
@@ -14675,6 +16448,49 @@ function nodeBounds(ids){
     const x2 = Math.max(...rects.map(r => r.x + r.w));
     const y2 = Math.max(...rects.map(r => r.y + r.h));
     return {x:x1, y:y1, w:x2 - x1, h:y2 - y1};
+}
+
+function createFrameFromClassicSelection(){
+    if(!canvas || !SpatialFrames || selected.size < 2) return;
+    const frame = SpatialFrames.createFrameAroundSelection(nodes, [...selected], node => nodeRect(node), {
+        id:uid('frame'),
+        title:tr('common.frameDefaultTitle'),
+        titleSize:32,
+        color:'#94a3b8',
+        padding:36,
+        headerHeight:56,
+    });
+    if(!frame) return;
+    pushUndo();
+    nodes.push(frame);
+    selected.clear();
+    selected.add(frame.id);
+    render();
+    scheduleSave();
+}
+
+async function downloadClassicSelectionMedia(){
+    if(!canvas || !SpatialFrames) return;
+    const items = SpatialFrames.collectMediaItems(nodes, [...selected]).map(item => ({
+        ...item,
+        url:canvasOriginalMediaUrl(item.url),
+    }));
+    if(!items.length){
+        setStatus(tr('common.frameNoMedia'));
+        return;
+    }
+    try {
+        const response = await fetch('/api/canvas-assets/download', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({filename:`canvas-selection-${Date.now()}.zip`, items}),
+        });
+        if(!response.ok) throw new Error(await responseErrorMessage(response, tr('common.downloadSelection')));
+        downloadBlob(await response.blob(), `canvas-selection-${Date.now()}.zip`);
+        setStatus(tr('common.frameDownloadReady').replace('{count}', String(items.length)));
+    } catch(error){
+        showErrorModal(error.message || tr('common.downloadSelection'), tr('common.downloadSelection'));
+    }
 }
 
 function startSelection(e){
@@ -14703,7 +16519,7 @@ function finishSelection(){
     const rect = selectionBox.getBoundingClientRect();
     selectionBox.style.display = 'none';
     selected.clear();
-    nodesEl.querySelectorAll('.node').forEach(el => {
+    nodesEl.querySelectorAll('.node:not(.canvas-frame-node)').forEach(el => {
         const r = el.getBoundingClientRect();
         const overlaps = r.left < rect.right && r.right > rect.left && r.top < rect.bottom && r.bottom > rect.top;
         if(overlaps) selected.add(el.dataset.id);
@@ -14718,6 +16534,48 @@ function finishSelection(){
 function renderSelectionHub(){
     selectionHub.innerHTML = '';
     selectionHub.classList.remove('open');
+    if(!canvas) return;
+    const ids = [...selected].filter(id => nodes.some(node => node.id === id));
+    const selectedNodes = ids.map(id => nodes.find(node => node.id === id)).filter(Boolean);
+    const frame = selectedNodes.length === 1 && isCanvasFrameNode(selectedNodes[0]) ? selectedNodes[0] : null;
+    if(frame){
+        selectionHub.innerHTML = `<button class="selection-action" type="button" data-frame-size title="${escapeAttr(tr('common.frameTitleSize'))}" aria-label="${escapeAttr(tr('common.frameTitleSize'))}"><i data-lucide="type"></i></button><label class="selection-action frame-color-action" title="${escapeAttr(tr('common.frameColor'))}" aria-label="${escapeAttr(tr('common.frameColor'))}"><i data-lucide="palette"></i><input type="color" value="${escapeAttr(frame.color || '#94a3b8')}"></label><button class="selection-action danger" type="button" data-frame-delete title="${escapeAttr(tr('common.frameDelete'))}" aria-label="${escapeAttr(tr('common.frameDelete'))}"><i data-lucide="trash-2"></i></button>`;
+        selectionHub.querySelector('[data-frame-size]').onclick = event => {
+            event.stopPropagation();
+            const sizes = [24, 32, 36, 48];
+            const current = Number(frame.titleSize || 32);
+            pushUndo();
+            frame.titleSize = sizes[(Math.max(0, sizes.indexOf(current)) + 1) % sizes.length];
+            render();
+            scheduleSave();
+        };
+        selectionHub.querySelector('input[type="color"]').onchange = event => {
+            pushUndo();
+            frame.color = event.target.value || '#94a3b8';
+            render();
+            scheduleSave();
+        };
+        selectionHub.querySelector('[data-frame-delete]').onclick = event => deleteNode(frame.id, event);
+    } else {
+        if(ids.length < 2 || selectedNodes.some(isCanvasFrameNode)) return;
+        selectionHub.innerHTML = `<button class="selection-action" type="button" data-selection-arrange title="${escapeAttr(tr('common.arrangeSelection'))}" aria-label="${escapeAttr(tr('common.arrangeSelection'))}"><i data-lucide="layout-grid"></i></button><button class="selection-action" type="button" data-selection-frame title="${escapeAttr(tr('common.placeInFrame'))}" aria-label="${escapeAttr(tr('common.placeInFrame'))}"><i data-lucide="panels-top-left"></i></button><button class="selection-action" type="button" data-selection-download title="${escapeAttr(tr('common.downloadSelection'))}" aria-label="${escapeAttr(tr('common.downloadSelection'))}"><i data-lucide="download"></i></button>`;
+        selectionHub.querySelector('[data-selection-arrange]').onclick = event => { event.stopPropagation(); arrangeSelectedCanvasNodes(); };
+        selectionHub.querySelector('[data-selection-frame]').onclick = event => { event.stopPropagation(); createFrameFromClassicSelection(); };
+        selectionHub.querySelector('[data-selection-download]').onclick = event => { event.stopPropagation(); downloadClassicSelectionMedia(); };
+    }
+    const elements = ids.map(canvasNodeElement).filter(Boolean);
+    if(!elements.length) return;
+    const boardRect = board.getBoundingClientRect();
+    const rects = elements.map(el => el.getBoundingClientRect());
+    const left = Math.min(...rects.map(rect => rect.left));
+    const right = Math.max(...rects.map(rect => rect.right));
+    const top = Math.min(...rects.map(rect => rect.top));
+    selectionHub.classList.add('open');
+    const halfWidth = Math.max(22, selectionHub.offsetWidth / 2);
+    selectionHub.style.left = `${Math.max(halfWidth + 8, Math.min(boardRect.width - halfWidth - 8, (left + right) / 2 - boardRect.left))}px`;
+    selectionHub.style.top = `${Math.max(12, top - boardRect.top - 48)}px`;
+    selectionHub.style.transform = 'translateX(-50%)';
+    refreshIcons();
 }
 function startSelectionLink(e, kind){
     e.preventDefault();
@@ -14798,7 +16656,10 @@ function cloneNode(n, dx, dy){
     return copy;
 }
 function duplicateNodesForAltDrag(node, preserveConnections=false){
-    const selectedIds = selected.has(node.id) ? [...selected] : [node.id];
+    const selectedRootIds = selected.has(node.id) ? [...selected] : [node.id];
+    const selectedIds = SpatialFrames
+        ? SpatialFrames.copyClosureIds(nodes, selectedRootIds)
+        : selectedRootIds;
     const duplicated = window.CanvasDuplication.duplicateSelection({
         nodes,
         connections,
@@ -14809,25 +16670,31 @@ function duplicateNodesForAltDrag(node, preserveConnections=false){
         createConnectionId:() => uid('c')
     });
     nodes.push(...duplicated.copies);
+    duplicated.copies.forEach(copy => {
+        if(isCanvasFrameNode(copy)) copy.items = SpatialFrames.remapFrameItems(copy.items, duplicated.idMap);
+    });
     duplicated.copiedConnections.forEach(connection => {
         if(canConnect(connection.from, connection.to)
             && !connections.some(existing => existing.from === connection.from && existing.to === connection.to)){
             connections.push(connection);
         }
     });
+    duplicated.rootCopyIds = selectedRootIds.map(id => duplicated.idMap.get(id)).filter(Boolean);
     return duplicated;
 }
 function copySelectedNodes(){
     if(!canvas || !selected.size) return;
     const el = document.activeElement;
     if(el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) return;
-    const toCopy = [...selected].map(id => nodes.find(n => n.id === id)).filter(Boolean);
+    const copyIds = SpatialFrames ? SpatialFrames.copyClosureIds(nodes, [...selected]) : [...selected];
+    const toCopy = copyIds.map(id => nodes.find(n => n.id === id)).filter(Boolean);
     if(!toCopy.length) return;
     const ids = new Set(toCopy.map(n => n.id));
     const pickedConnections = (connections || []).filter(c => ids.has(c.from) && ids.has(c.to)).map(c => ({...c}));
     clipboard = {
         nodes:JSON.parse(JSON.stringify(serializableCanvasNodes(toCopy))),
-        connections:JSON.parse(JSON.stringify(pickedConnections))
+        connections:JSON.parse(JSON.stringify(pickedConnections)),
+        rootIds:[...selected]
     };
 }
 function clipboardNodeCount(){
@@ -14851,6 +16718,7 @@ function pasteNodes(){
     copies.forEach(c => {
         if((c.type === 'group' || c.type === 'promptGroup') && c.items)
             c.items = c.items.map(id => idMap.get(id) || id);
+        if(isCanvasFrameNode(c)) c.items = SpatialFrames.remapFrameItems(c.items, idMap);
     });
     const newConnections = clipConnections
         .map(c => ({...c, id:uid('c'), from:idMap.get(c.from), to:idMap.get(c.to)}))
@@ -14858,14 +16726,16 @@ function pasteNodes(){
     nodes.push(...copies);
     connections.push(...newConnections);
     selected.clear();
-    copies.forEach(c => selected.add(c.id));
+    const pastedRootIds = (clipboard?.rootIds || clipNodes.map(node => node.id)).map(id => idMap.get(id)).filter(Boolean);
+    pastedRootIds.forEach(id => selected.add(id));
     sanitizeConnections();
     syncGeneratorInputs();
     render();
     scheduleSave();
 }
 function selectedWorkflowPayload(){
-    const ids = new Set([...selected].filter(id => nodes.some(n => n.id === id)));
+    const closure = SpatialFrames ? SpatialFrames.copyClosureIds(nodes, [...selected]) : [...selected];
+    const ids = new Set(closure.filter(id => nodes.some(n => n.id === id)));
     const pickedNodes = [...ids].map(id => nodes.find(n => n.id === id)).filter(Boolean);
     const pickedConnections = connections.filter(c => ids.has(c.from) && ids.has(c.to)).map(c => ({...c}));
     return {
@@ -15065,6 +16935,9 @@ function insertWorkflowIntoCanvas(imported){
         if((node.type === 'group' || node.type === 'promptGroup') && Array.isArray(node.items)){
             node.items = node.items.map(id => idMap.get(id) || id).filter(id => idMap.has(id) || nodes.some(n => n.id === id));
         }
+        if(isCanvasFrameNode(node) && Array.isArray(node.items)){
+            node.items = SpatialFrames.remapFrameItems(node.items, idMap);
+        }
     });
     const newConnections = srcConnections
         .map(c => ({...c, id:uid('c'), from:idMap.get(c.from), to:idMap.get(c.to)}))
@@ -15106,22 +16979,24 @@ function startNodeDrag(e, node){
         const duplicated = duplicateNodesForAltDrag(node, e.shiftKey);
         if(!duplicated.anchorCopy) return;
         selected.clear();
-        duplicated.selectedCopyIds.forEach(id => selected.add(id));
+        (duplicated.rootCopyIds || duplicated.selectedCopyIds).forEach(id => selected.add(id));
         dragTarget = duplicated.anchorCopy;
         sanitizeConnections();
         syncGeneratorInputs();
         render();
     }
     const isGroup = dragTarget.type === 'group' || dragTarget.type === 'promptGroup';
+    const isFrame = isCanvasFrameNode(dragTarget);
+    const rootIds = selected.has(dragTarget.id) && selected.size > 1 ? [...selected] : [dragTarget.id];
     const collected = new Map();
     const collect = n => {
         if(!n || collected.has(n.id) || n.id === dragTarget.id) return;
         collected.set(n.id, {node:n, ox:n.x, oy:n.y});
-        if(n.type === 'group' || n.type === 'promptGroup'){
+        if(n.type === 'group' || n.type === 'promptGroup' || isCanvasFrameNode(n)){
             (n.items || []).map(id => nodes.find(x => x.id === id)).forEach(collect);
         }
     };
-    if(isGroup){
+    if(isGroup || isFrame){
         (dragTarget.items || []).map(id => nodes.find(n => n.id === id)).forEach(collect);
     }
     // 如果被拖节点在多选里，所有其他选中节点（含其组成员）一起移动
@@ -15129,7 +17004,7 @@ function startNodeDrag(e, node){
         [...selected].forEach(id => collect(nodes.find(n => n.id === id)));
     }
     const children = [...collected.values()];
-    dragNode = {node: dragTarget, children, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y, historyCaptured:Boolean(e.altKey)};
+    dragNode = {node: dragTarget, children, rootIds, isFrameDrag:isFrame, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y, historyCaptured:Boolean(e.altKey)};
     document.body.classList.add('canvas-node-drag');
     window.onmousemove = onNodeDrag;
     window.onmouseup = endDrag;
@@ -15144,7 +17019,7 @@ function onNodeDrag(e){
     }
     dragNode.node.x = dragNode.ox + dx;
     dragNode.node.y = dragNode.oy + dy;
-    const el = nodesEl.querySelector(`.node[data-id="${dragNode.node.id}"]`);
+    const el = canvasNodeElement(dragNode.node.id);
     if(el){
         el.style.left = `${dragNode.node.x}px`;
         el.style.top = `${dragNode.node.y}px`;
@@ -15152,7 +17027,7 @@ function onNodeDrag(e){
     (dragNode.children || []).forEach(childDrag => {
         childDrag.node.x = childDrag.ox + dx;
         childDrag.node.y = childDrag.oy + dy;
-        const childEl = nodesEl.querySelector(`.node[data-id="${childDrag.node.id}"]`);
+        const childEl = canvasNodeElement(childDrag.node.id);
         if(childEl){
             childEl.style.left = `${childDrag.node.x}px`;
             childEl.style.top = `${childDrag.node.y}px`;
@@ -15167,7 +17042,7 @@ function startNodeResize(e, node){
     e.preventDefault();
     e.stopPropagation();
     if(document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
-    const el = nodesEl.querySelector(`.node[data-id="${node.id}"]`);
+    const el = canvasNodeElement(node.id);
     const rect = el?.getBoundingClientRect();
     resizeNode = {
         node,
@@ -15190,11 +17065,11 @@ function onNodeResize(e){
         resizeNode.historyCaptured = true;
     }
     const min = defaultNodeSize(resizeNode.node.type);
-    const nextW = Math.max(Math.min(min.w, 220), resizeNode.sw + dx);
-    const nextH = Math.max(96, resizeNode.sh + dy);
+    const nextW = Math.max(isCanvasFrameNode(resizeNode.node) ? 240 : Math.min(min.w, 220), resizeNode.sw + dx);
+    const nextH = Math.max(isCanvasFrameNode(resizeNode.node) ? 160 : 96, resizeNode.sh + dy);
     resizeNode.node.w = Math.round(nextW);
     resizeNode.node.h = Math.round(nextH);
-    const el = nodesEl.querySelector(`.node[data-id="${resizeNode.node.id}"]`);
+    const el = canvasNodeElement(resizeNode.node.id);
     if(el){
         el.classList.add('sized');
         el.style.width = `${resizeNode.node.w}px`;
@@ -15210,6 +17085,7 @@ function startLink(e, originId, originKind){
     const src = portPoint(originId, originKind);
     const source = nodes.find(n => n.id === originId);
     tempLink = {from:originId, originKind, x1:src.x, y1:src.y, x2:src.x, y2:src.y};
+    setClassicLinkTargetPreview(originId, originKind);
     window.onmousemove = e2 => {
         const p = screenToWorld(e2.clientX, e2.clientY);
         tempLink.x2 = p.x;
@@ -15218,18 +17094,14 @@ function startLink(e, originId, originKind){
     };
     window.onmouseup = e2 => {
         const targetKind = originKind === 'out' ? 'in' : 'out';
-        const targetPort = nearestPort(e2.clientX, e2.clientY, targetKind);
+        const compatibleOnly = originKind === 'in' && source?.type === 'loop';
+        const targetPort = nearestPort(e2.clientX, e2.clientY, targetKind, {compatibleOnly});
         const target = targetPort?.closest('.node');
         if(target){
             const targetId = target.dataset.id;
             const fromId = originKind === 'out' ? originId : targetId;
             const toId = originKind === 'out' ? targetId : originId;
-            if(canConnect(fromId, toId)){
-                if(!connections.some(c => c.from === fromId && c.to === toId)){
-                    pushUndo();
-                    connections.push({id:uid('c'), from:fromId, to:toId});
-                    syncLatestGeneratedOutputToConnection(fromId, toId);
-                }
+            if(connectClassicNodes(fromId, toId)){
                 syncGeneratorInputs();
                 scheduleSave();
                 render();
@@ -15252,13 +17124,33 @@ function startLink(e, originId, originKind){
             openLinkCreateMenu(originId, originKind, e2.clientX, e2.clientY);
         }
         tempLink = null;
+        clearClassicLinkTargetPreview();
         window.onmousemove = null;
         window.onmouseup = null;
         renderLinks();
     };
 }
-function nearestPort(clientX, clientY, kind){
-    const selector = `.port.${kind}`;
+function clearClassicLinkTargetPreview(){
+    nodesEl?.querySelectorAll?.('.link-target-compatible').forEach(element => element.classList.remove('link-target-compatible'));
+    nodesEl?.querySelectorAll?.('.link-target-compatible-node').forEach(element => element.classList.remove('link-target-compatible-node'));
+}
+function setClassicLinkTargetPreview(originId, originKind){
+    clearClassicLinkTargetPreview();
+    if(originKind !== 'in') return;
+    const origin = nodes.find(node => node.id === originId);
+    if(origin?.type !== 'loop') return;
+    nodesEl?.querySelectorAll?.('.node').forEach(element => {
+        const candidate = nodes.find(node => node.id === element.dataset.id);
+        if(!candidate || candidate.id === origin.id) return;
+        if(connections.some(connection => connection.from === candidate.id && connection.to === origin.id)) return;
+        const kinds = classicLoopConnectionKinds(candidate, origin);
+        if(!kinds.image && !kinds.prompt) return;
+        element.classList.add('link-target-compatible-node');
+        element.querySelector('.port.out')?.classList.add('link-target-compatible');
+    });
+}
+function nearestPort(clientX, clientY, kind, options={}){
+    const selector = `.port.${kind}${options.compatibleOnly ? '.link-target-compatible' : ''}`;
     const direct = document.elementFromPoint(clientX, clientY)?.closest(selector);
     if(direct) return direct;
     let best = null;
@@ -15294,6 +17186,93 @@ function wouldCreateGeneratorCycle(fromId, toId){
     };
     return walk(toId);
 }
+function classicApiOutputBridgePosition(from, to){
+    const fromRect = nodeRect(from);
+    const toRect = nodeRect(to);
+    const outputSize = defaultNodeSize('output');
+    const outputWidth = Number(outputSize?.w) || 460;
+    const outputHeight = Number(outputSize?.h) || 260;
+    const horizontalGap = toRect.x - (fromRect.x + fromRect.w);
+    if(horizontalGap >= outputWidth + 80){
+        return {
+            x:Math.round(fromRect.x + fromRect.w + (horizontalGap - outputWidth) / 2),
+            y:Math.round((fromRect.cy + toRect.cy) / 2 - outputHeight / 2),
+        };
+    }
+    return {
+        x:Math.round((fromRect.cx + toRect.cx) / 2 - outputWidth / 2),
+        y:Math.round(Math.max(fromRect.y + fromRect.h, toRect.y + toRect.h) + 60),
+    };
+}
+function classicApiOutputNodes(fromId){
+    const outputIds = new Set(
+        connections
+            .filter(connection => connection.from === fromId)
+            .map(connection => connection.to),
+    );
+    return nodes.filter(node => node.type === 'output' && outputIds.has(node.id));
+}
+function nearestClassicApiOutput(fromId, to){
+    const targetRect = nodeRect(to);
+    return classicApiOutputNodes(fromId)
+        .map(node => {
+            const rect = nodeRect(node);
+            return {node, distance:Math.hypot(rect.cx - targetRect.cx, rect.cy - targetRect.cy)};
+        })
+        .sort((a, b) => a.distance - b.distance)[0]?.node || null;
+}
+function hasClassicApiOutputRoute(fromId, toId){
+    return classicApiOutputNodes(fromId).some(output =>
+        connections.some(connection => connection.from === output.id && connection.to === toId),
+    );
+}
+function classicLoopConnectionKinds(from, to){
+    if(to?.type !== 'loop') return {image:false, prompt:false};
+    return {
+        image:['image', 'group', 'output'].includes(from?.type),
+        prompt:['prompt', 'promptGroup', 'loop', 'llm'].includes(from?.type),
+    };
+}
+function connectClassicNodes(fromId, toId, options={}){
+    if(!fromId || !toId || fromId === toId) return false;
+    const from = nodes.find(n => n.id === fromId);
+    const to = nodes.find(n => n.id === toId);
+    if(!from || !to) return false;
+    if(connections.some(c => c.from === fromId && c.to === toId)) return false;
+    const loopKinds = classicLoopConnectionKinds(from, to);
+    if(to.type === 'loop'){
+        if(!loopKinds.image && !loopKinds.prompt) return false;
+    } else if(!canConnect(fromId, toId)){
+        return false;
+    }
+    if(from.type === 'generator' && to.type === 'generator'){
+        if(hasClassicApiOutputRoute(fromId, toId)) return false;
+        if(!options.historyCaptured) pushUndo();
+        let output = nearestClassicApiOutput(fromId, to);
+        if(!output){
+            const point = classicApiOutputBridgePosition(from, to);
+            output = {id:uid('out'), type:'output', x:point.x, y:point.y, images:[]};
+            nodes.push(output);
+            connections.push({id:uid('c'), from:fromId, to:output.id});
+        }
+        connections.push({id:uid('c'), from:output.id, to:toId});
+        syncLatestGeneratedOutputToConnection(fromId, output.id);
+        return true;
+    }
+    if(!options.historyCaptured) pushUndo();
+    if(to.type === 'loop'){
+        if(loopKinds.image) {
+            to.imageInput = true;
+            to.loopStart = Math.max(1, Number(to.loopStart) || 1);
+            to.imageBatchSize = Math.max(1, Math.min(100, Number(to.imageBatchSize) || 1));
+        }
+        if(loopKinds.prompt) to.showPrompt = true;
+        autoSizeLoopForPanels(to);
+    }
+    connections.push({id:uid('c'), from:fromId, to:toId});
+    syncLatestGeneratedOutputToConnection(fromId, toId);
+    return true;
+}
 function canConnect(fromId, toId){
     if(!fromId || !toId || fromId === toId) return false;
     const from = nodes.find(n => n.id === fromId);
@@ -15319,18 +17298,23 @@ function sanitizeConnections(){
     connections = (connections || []).filter(c => canConnect(c.from, c.to));
 }
 function endDrag(event=null){
-    const hadContentDrag = Boolean(dragNode || resizeNode || llmPaneDrag || knifeChanged || tempLink);
+    const hadContentDrag = Boolean(dragNode || resizeNode || llmPaneDrag || promptSplitResize || knifeChanged || tempLink);
     const hadViewportDrag = Boolean(dragBoard || minimapDrag);
     if(dragNode){
         const moved = [dragNode.node, ...(dragNode.children || []).map(c => c.node)].filter(Boolean);
         // 拖动 group/promptGroup 自身时不重新评估（成员跟着一起走，包含关系不变）
         const draggedGroup = moved.some(n => n.type === 'group' || n.type === 'promptGroup');
         if(!draggedGroup) updateGroupMembership(moved);
+        if(!dragNode.isFrameDrag && SpatialFrames?.updateMembershipAfterDrop(nodes, dragNode.rootIds || [dragNode.node.id], node => nodeRect(node))){
+            render();
+        }
     }
     dragNode = null;
     dragBoard = null;
     resizeNode = null;
     llmPaneDrag = null;
+    clearClassicLinkTargetPreview();
+    promptSplitResize = null;
     knifeActive = false;
     knifePoint = null;
     knifeTrail = [];
@@ -15339,7 +17323,7 @@ function endDrag(event=null){
     knifeNeedsRender = false;
     if(!event?.shiftKey) setKnifeMode(false);
     if(textSelectionGuard) textSelectionGuard.active = false;
-    document.body.classList.remove('canvas-node-drag', 'canvas-node-resize', 'canvas-selecting', 'canvas-board-pan');
+    document.body.classList.remove('canvas-node-drag', 'canvas-node-resize', 'canvas-prompt-split-resize', 'canvas-selecting', 'canvas-board-pan');
     window.onmousemove = null;
     window.onmouseup = null;
     if(shouldRenderKnife) render();
@@ -15348,7 +17332,7 @@ function endDrag(event=null){
     else if(hadViewportDrag) scheduleViewportSave();
 }
 function nodeRect(n){
-    const el = nodesEl.querySelector(`.node[data-id="${n.id}"]`);
+    const el = canvasNodeElement(n.id);
     const w = el?.offsetWidth || n.w || 260;
     const h = el?.offsetHeight || n.h || 200;
     return {x:n.x, y:n.y, w, h, cx:n.x + w/2, cy:n.y + h/2};
@@ -15450,7 +17434,7 @@ function arrangeIdsByConnections(ids){
 }
 function arrangeSelectedCanvasNodes(){
     if(!canvas || !selected.size) return;
-    const explicit = [...selected].filter(id => nodes.some(n => n.id === id));
+    const explicit = [...selected].filter(id => nodes.some(n => n.id === id && !isCanvasFrameNode(n)));
     const ids = canvasArrangeAtomicIds(explicit.length > 1 ? explicit : connectedClusterIds(explicit[0]));
     if(ids.length < 2) return;
     pushUndo();
@@ -15569,7 +17553,10 @@ function renderLinks(){
     });
     segments.forEach(({c, a, b}) => {
         const relClass = isConnectionSelected(c) ? ' link-active' : '';
-        linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, `link${relClass}`));
+        const previewClass = classicCascadePreviewLinkClasses(c.id).map(name => ` ${name}`).join('');
+        const visibleLink = pathEl(a.x, a.y, b.x, b.y, `link${relClass}${previewClass}`);
+        visibleLink.dataset.connectionId = c.id;
+        linksEl.appendChild(visibleLink);
         linkControlsEl.appendChild(linkDeleteButton(c, a, b));
         linksEl.appendChild(linkHitEl(a.x, a.y, b.x, b.y, c.id));
     });
@@ -15652,7 +17639,7 @@ function isConnectionSelected(connection){
     return selected.has(connection.from) || selected.has(connection.to);
 }
 function refreshSelectionVisuals(){
-    nodesEl.querySelectorAll('.node').forEach(el => {
+    nodesEl.querySelectorAll('.node,.canvas-frame-node').forEach(el => {
         el.classList.toggle('selected', selected.has(el.dataset.id));
     });
     syncCanvasSelectedImageResolution(nodesEl);
@@ -15722,11 +17709,13 @@ function applyKnifeCut(from, to){
         const r = nodeRect(n);
         if(segmentIntersectsRect(from, to, r)) nodeHits.add(n.id);
     });
-    const next = connections.filter(c => !nodeHits.has(c.from) && !nodeHits.has(c.to) && !knifeHitsConnection(from, to, c));
-    if(next.length === connections.length) return;
+    const removedIds = new Set(connections
+        .filter(c => nodeHits.has(c.from) || nodeHits.has(c.to) || knifeHitsConnection(from, to, c))
+        .map(c => c.id));
+    if(!removedIds.size) return;
     if(!knifeChanged) pushUndo();
     knifeChanged = true;
-    connections = next;
+    removeClassicConnections(connection => removedIds.has(connection.id));
     syncGeneratorInputs();
     refreshGeneratorInputViews();
     knifeNeedsRender = true;
@@ -15962,14 +17951,20 @@ board.addEventListener('drop', async e => {
 });
 window.addEventListener('dragend', () => dropOverlay.classList.remove('active'));
 window.addEventListener('drop', () => dropOverlay.classList.remove('active'));
+function classicSelectedImagePasteTarget(selectedIds, nodeList){
+    const ids = [...(selectedIds || [])];
+    if(ids.length !== 1) return null;
+    const node = (nodeList || []).find(item => item?.id === ids[0]);
+    return node?.type === 'image' ? node : null;
+}
 window.addEventListener('paste', e => {
     if(!canvas) return;
     const files = [...(e.clipboardData?.items || [])].filter(x => x.kind === 'file' && /^(image|video|audio)\//.test(String(x.type || ''))).map(x => x.getAsFile());
     if(!files.length) return;
     e.preventDefault();
     lastImagePasteAt = Date.now();
-    const blank = [...selected].map(id => nodes.find(n => n.id === id)).find(n => n?.type === 'image' && !n.url);
-    if(blank) fillImageNode(blank.id, files);
+    const target = classicSelectedImagePasteTarget(selected, nodes);
+    if(target) fillImageNode(target.id, files);
     else if(files.length > 1) uploadImageGroup(files);
     else uploadImages(files);
 });
@@ -15998,6 +17993,12 @@ window.addEventListener('keydown', e => {
         if(e.repeat) return;
         e.preventDefault();
         toggleZoomPreview();
+        return;
+    }
+    if(!e.ctrlKey && !e.metaKey && !e.altKey && key === 'a' && !isEditableTarget(e.target)){
+        if(e.repeat) return;
+        e.preventDefault();
+        toggleCanvasAssetLibrary();
         return;
     }
     if((e.ctrlKey || e.metaKey) && key === 'g') { e.preventDefault(); groupSelectedImages(); }
@@ -16053,7 +18054,7 @@ window.addEventListener('blur', () => {
         window.onmousemove = null;
         window.onmouseup = null;
     }
-    if(dragNode || resizeNode || llmPaneDrag || dragBoard || minimapDrag || knifeActive) endDrag();
+    if(dragNode || resizeNode || llmPaneDrag || promptSplitResize || dragBoard || minimapDrag || knifeActive) endDrag();
 });
 function deleteSelectedNodes(){
     if(!canvas || selected.size === 0) return;
@@ -16064,14 +18065,15 @@ function deleteSelectedNodes(){
         if(toDelete.has(id)) return;
         toDelete.add(id);
         const n = nodes.find(x => x.id === id);
-        if(n && (n.type === 'group' || n.type === 'promptGroup')){
+        if(n && !isCanvasFrameNode(n) && (n.type === 'group' || n.type === 'promptGroup')){
             (n.items || []).forEach(collect);
         }
     };
     selected.forEach(collect);
     toDelete.forEach(id => destroyLTXEditor(nodes.find(n => n.id === id)));
+    removeClassicConnections(connection => toDelete.has(connection.from) || toDelete.has(connection.to));
     nodes = nodes.filter(n => !toDelete.has(n.id));
-    connections = connections.filter(c => !toDelete.has(c.from) && !toDelete.has(c.to));
+    nodes.filter(isCanvasFrameNode).forEach(frame => { frame.items = (frame.items || []).filter(id => !toDelete.has(id)); });
     selected.clear();
     render();
     scheduleSave();

@@ -427,6 +427,17 @@ body.studio-theme-dark .rh-card-main input, body.studio-theme-dark .rh-card-main
 .rh-card-action { width:30px; height:30px; border-radius:8px; border:1px solid var(--line); color:var(--muted); background:var(--panel); display:flex; align-items:center; justify-content:center; }
 .rh-card-action:hover { color:var(--text); border-color:var(--text); }
 .rh-card-action.danger:hover { color:#dc2626; border-color:#fca5a5; background:#fff5f5; }
+
+.rh-transfer-actions { display:flex; align-items:center; justify-content:flex-end; gap:8px; flex:0 0 auto; }
+.rh-drag-handle { cursor:grab; touch-action:none; }
+.rh-drag-handle:active { cursor:grabbing; }
+.rh-config-card.rh-dragging { opacity:.55; }
+.rh-config-card.rh-drag-before { box-shadow:0 -3px 0 #4f46e5; }
+.rh-config-card.rh-drag-after { box-shadow:0 3px 0 #4f46e5; }
+body.studio-theme-dark .rh-config-card.rh-drag-before,
+html.studio-theme-dark body .rh-config-card.rh-drag-before { box-shadow:0 -3px 0 #818cf8; }
+body.studio-theme-dark .rh-config-card.rh-drag-after,
+html.studio-theme-dark body .rh-config-card.rh-drag-after { box-shadow:0 3px 0 #818cf8; }
 .rh-empty { padding:18px 12px; border:1px dashed var(--line); border-radius:12px; color:var(--faint); font-size:11.5px; font-weight:750; text-align:center; }
 .rh-workflow-editor-overlay { position:fixed; inset:0; z-index:120; display:none; align-items:center; justify-content:center; padding:24px; background:rgba(15,23,42,.42); backdrop-filter:blur(14px); }
 .rh-workflow-editor-overlay.open { display:flex; }

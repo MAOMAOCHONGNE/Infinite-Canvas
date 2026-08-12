@@ -1,14 +1,18 @@
 {
-  "version": "2026.08.04",
-  "updated_at": "2026-08-04T23:32:36+08:00",
+  "version": "2026.08.09-custom.1",
+  "updated_at": "2026-08-09T00:00:00+08:00",
   "items": [
     {
-      "type": "feature",
-      "text": "
-重要更新：
-1. 适配本地ComfyUI调用MiniMax H3，更新后需要手动下载一下workflow文件夹的相关工作流。
-2. 适配RunningHub调用MiniMax H3，由于现在国内站很多工作流不支持调用了，推荐大家在API设置中注册国际站。
-"
+      "type": "custom",
+      "text": "建立 qianse70 定制版身份，并保留原作者 wuli大雄及上游项目署名。"
+    },
+    {
+      "type": "safety",
+      "text": "版本检测和一键更新只使用 MAOMAOCHONGNE/Infinite-Canvas 的 my-custom 分支，不再回退到原作者更新源。"
+    },
+    {
+      "type": "privacy",
+      "text": "增加本地 API、画布、素材、历史记录和生成文件的 GitHub 发布忽略规则。"
     }
   ]
 }

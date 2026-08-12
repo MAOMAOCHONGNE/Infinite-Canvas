@@ -1,0 +1,30 @@
+# Local credentials. API/.env is currently tracked upstream, so publish with
+# selective staging and never stage its local modifications.
+API/.env
+.env
+.env.*
+!API/.env.example
+
+# User data, generated media, and local archives
+data/
+assets/
+output/
+outputs/
+history.json
+global_config.json
+data.zip
+
+# Bundled/local runtimes and caches
+python/
+__pycache__/
+*.py[cod]
+.playwright-cli/
+
+# Local process files and logs
+_self_restart.*
+*.log
+
+# Codex working-memory files
+task_plan.md
+findings.md
+progress.md

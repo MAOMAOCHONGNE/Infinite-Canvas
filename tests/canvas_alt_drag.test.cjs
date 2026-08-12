@@ -99,7 +99,7 @@ test('classic canvas loads duplication helper and records one undo before Alt cl
     assert.match(html, /canvas-duplication\.js[^\n]*\n[^]*canvas\.js/);
     assert.match(source, /selected\.has\(node\.id\) \? \[\.\.\.selected\] : \[node\.id\]/);
     assert.ok(dragSource.indexOf('pushUndo();') < dragSource.indexOf('duplicateNodesForAltDrag'));
-    assert.match(dragSource, /duplicated\.selectedCopyIds\.forEach/);
+    assert.match(dragSource, /\(duplicated\.rootCopyIds \|\| duplicated\.selectedCopyIds\)\.forEach/);
     assert.match(dragSource, /historyCaptured:Boolean\(e\.altKey\)/);
 });
 
@@ -114,6 +114,10 @@ test('smart canvas keeps every Alt-drag copy selected so the whole copy set move
         let selectedImage = {nodeId:'', index:-1};
         const nodes = selectedIds.map((id, index) => ({id, x:index * 100, y:index * 20}));
         const canvas = {connections:[]};
+        const SpatialFrames = {
+            copyClosureIds:(allNodes, rootIds) => rootIds.slice(),
+            remapFrameItems:(items, idMap) => items.map(id => idMap.get(id)).filter(Boolean)
+        };
         const isNodeSelected = id => selectedId === id || selectedIds.includes(id);
         const selectedNodeIds = () => selectedIds.length ? selectedIds.slice() : (selectedId ? [selectedId] : []);
         const pushUndo = () => {};

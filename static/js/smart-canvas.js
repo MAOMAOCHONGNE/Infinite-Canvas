@@ -4,6 +4,14 @@ const sourceProjectId = params.get('project') || '';
 const CANVAS_LIST_PROJECT_KEY = 'canvasListCurrentProjectId';
 const shell = document.getElementById('shell');
 const world = document.getElementById('world');
+const SpatialFrames = window.CanvasSpatialFrames;
+function isCanvasFrameNode(node){ return Boolean(SpatialFrames?.isFrameNode?.(node)); }
+const smartSelectionHub = document.createElement('div');
+smartSelectionHub.className = 'smart-selection-hub';
+smartSelectionHub.setAttribute('role', 'toolbar');
+smartSelectionHub.setAttribute('aria-label', 'Selection actions');
+smartSelectionHub.addEventListener('mousedown', event => event.stopPropagation());
+shell?.appendChild(smartSelectionHub);
 const composer = document.getElementById('composer');
 const createMenu = document.getElementById('createMenu');
 const promptInput = document.getElementById('promptInput');
@@ -32,7 +40,18 @@ const smartArrangeBtn = document.getElementById('smartArrangeBtn');
 const imageEditModal = document.getElementById('imageEditModal');
 const smartLogModal = document.getElementById('smartLogModal');
 const smartLogList = document.getElementById('smartLogList');
+const smartShortcutToggle = document.getElementById('smartShortcutToggle');
 const smartShortcutModal = document.getElementById('smartShortcutModal');
+const smartShortcutList = document.getElementById('smartShortcutList');
+const smartShortcutController = window.CanvasShortcutsHelp?.mountShortcutHelp({
+    modal:smartShortcutModal,
+    toggle:smartShortcutToggle,
+    list:smartShortcutList,
+    profile:'smart',
+    keyboardTarget:window,
+    onOpen:refreshIcons,
+});
+window.StudioI18n?.apply?.();
 const smartWorkflowToggle = document.getElementById('smartWorkflowToggle');
 const smartWorkflowTransferModal = document.getElementById('smartWorkflowTransferModal');
 const smartWorkflowTransferSub = document.getElementById('smartWorkflowTransferSub');
@@ -100,6 +119,8 @@ let didPan = false;
 let portDragState = null;
 let connectionEraseState = null;
 let saveTimer = null;
+let smartCanvasTaskRuntimeId = '';
+const smartPromptLLMSubmissionPromises = new Set();
 let apiProviders = [];
 let comfyWorkflows = [];
 let comfyInstanceCount = 1;
@@ -244,6 +265,10 @@ let cropState = null;
 let cropDrag = null;
 let cropAspectPreset = 'free';
 let cropAspectRatio = null;
+const DEFAULT_OUTPAINT_BACKGROUND = '#808080';
+let outpaintAspectPreset = 'free';
+let outpaintAspectRatio = null;
+let outpaintBackgroundColor = DEFAULT_OUTPAINT_BACKGROUND;
 let imageEditMode = 'crop';
 let imageEditModeTouched = false;
 let imageResizeScale = 0.5;
@@ -386,6 +411,8 @@ const SIZE_MAP = {
     portrait: {'1k':'1024x1536','2k':'1360x2048','4k':'2352x3520'},
     portrait43: {'1k':'1008x1344','2k':'1536x2048','4k':'2448x3264'},
     landscape43: {'1k':'1344x1008','2k':'2048x1536','4k':'3264x2448'},
+    portrait45: {'1k':'1024x1280','2k':'1600x2000','4k':'2560x3200'},
+    landscape54: {'1k':'1280x1024','2k':'2000x1600','4k':'3200x2560'},
     landscape: {'1k':'1536x1024','2k':'2048x1360','4k':'3520x2352'},
     story: {'1k':'720x1280','2k':'1152x2048','4k':'2160x3840'},
     wide: {'1k':'1280x720','2k':'2048x1152','4k':'3840x2160'},
@@ -398,6 +425,8 @@ const API_RATIO_VALUES = {
     landscape:'3:2',
     portrait43:'3:4',
     landscape43:'4:3',
+    portrait45:'4:5',
+    landscape54:'5:4',
     story:'9:16',
     wide:'16:9',
     ultrawide:'21:9',
@@ -405,6 +434,7 @@ const API_RATIO_VALUES = {
 };
 const RES_LONG_SIDE = { '1k':1536, '2k':2048, '4k':3840 };
 const RES_PIXEL_LIMIT = { '1k':1572864, '2k':4194304, '4k':8294400 };
+const ADAPTIVE_RATIO_TOOLS = window.AdaptiveImageRatio || null;
 function tr(key){ return window.StudioI18n?.t ? window.StudioI18n.t(key) : key; }
 function trf(key, values={}){
     return Object.entries(values).reduce((text, [name, value]) => text.replaceAll(`{${name}}`, String(value)), tr(key));
@@ -620,7 +650,7 @@ function smartNodeElementsByIds(ids){
     const wanted = ids instanceof Set ? ids : new Set(ids || []);
     const elements = [];
     if(!wanted.size) return elements;
-    world.querySelectorAll?.('.image-node').forEach(el => {
+    world.querySelectorAll?.('.image-node,.canvas-frame-node').forEach(el => {
         const id = el.dataset?.id || '';
         if(wanted.has(id)) elements.push(el);
     });
@@ -746,6 +776,82 @@ function mediaItemForStorage(item){
     delete clean._inlineVideoActive;
     return clean;
 }
+function smartPromptLLMTaskIsPending(node){
+    const status = String(node?.llmTask?.status || '').toLowerCase();
+    return Boolean(node?.type === 'smart-prompt' && node?.llmTask?.id && ['queued', 'running'].includes(status));
+}
+function syncSmartPromptLLMTaskRuntimeState(node, runtimeId=smartCanvasTaskRuntimeId){
+    if(!node || node.type !== 'smart-prompt') return false;
+    const task = node.llmTask && typeof node.llmTask === 'object' ? node.llmTask : null;
+    if(smartPromptLLMTaskIsPending(node)){
+        if(runtimeId && task.runtimeId && task.runtimeId !== runtimeId){
+            task.status = 'failed';
+            task.error = window.StudioI18n?.lang?.() === 'en'
+                ? 'The LLM task stopped because the local service restarted. Please retry.'
+                : '本地服务已重启，LLM 任务已停止，请重新运行。';
+            node.running = false;
+            node.runStatus = 'failed';
+            node.runError = task.error;
+            return true;
+        }
+        node.running = true;
+        node.runStatus = 'running';
+        node.runError = '';
+        return false;
+    }
+    node.running = false;
+    if(task?.status === 'failed'){
+        node.runStatus = 'failed';
+        node.runError = task.error || node.runError || tr('smart.promptLlmFailed');
+    }
+    return false;
+}
+async function waitForSmartPromptLLMSubmissions(){
+    if(!smartPromptLLMSubmissionPromises.size) return;
+    await Promise.allSettled([...smartPromptLLMSubmissionPromises]);
+}
+async function flushSmartCanvasBeforeLLMTask(){
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    const deadline = Date.now() + 5000;
+    while(canvasSyncInFlight && Date.now() < deadline){
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    await saveCanvas();
+}
+async function submitSmartPromptLLMTask(node, payload){
+    const submission = (async () => {
+        await flushSmartCanvasBeforeLLMTask();
+        const response = await fetch('/api/canvas-llm-tasks', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(payload)
+        });
+        if(!response.ok) throw new Error(await responseErrorMessage(response, tr('smart.promptLlmFailed')));
+        const data = await response.json();
+        if(!data.task_id) throw new Error(tr('smart.promptLlmFailed'));
+        smartCanvasTaskRuntimeId = data.runtime_id || smartCanvasTaskRuntimeId;
+        if(canvas) canvas.updated_at = Number(data.updated_at || canvas.updated_at || 0);
+        node.llmTask = {
+            id:data.task_id,
+            status:data.status || 'queued',
+            mode:'smart-prompt',
+            runtimeId:data.runtime_id || smartCanvasTaskRuntimeId,
+            startedAt:Date.now(),
+            inputKey:payload.input_key || ''
+        };
+        node.running = true;
+        node.runStatus = 'running';
+        node.runError = '';
+        return data;
+    })();
+    smartPromptLLMSubmissionPromises.add(submission);
+    try {
+        return await submission;
+    } finally {
+        smartPromptLLMSubmissionPromises.delete(submission);
+    }
+}
 function canvasForStorage(){
     const clean = JSON.parse(JSON.stringify(canvas || {}));
     clean.settings = settingsForStorage(canvasDefaultSmartSettings || initialSmartSettings);
@@ -755,6 +861,7 @@ function canvasForStorage(){
         if(Array.isArray(node.images)) node.images = node.images.map(mediaItemForStorage);
         if(node.runSettings) node.runSettings = settingsForStorage(node.runSettings);
         if(node.type === 'smart-minimax') node.timelinePlaying = false;
+        if(node.type === 'smart-prompt') clearSmartPromptLLMTransientState(node);
     });
     return clean;
 }
@@ -824,6 +931,13 @@ function clearSmartNodeTransientRunState(node, options={}){
     }
     return node;
 }
+function clearSmartPromptLLMTransientState(node, options={}){
+    if(!node || node.type !== 'smart-prompt') return false;
+    if(options.preserveActive && smartPromptLLMTaskIsPending(node)) return false;
+    const changed = node.running === true;
+    node.running = false;
+    return changed;
+}
 function serializableSmartNode(node){
     const base = JSON.parse(JSON.stringify(node || {}));
     const copy = normalizeLegacySmartNode(base) || {};
@@ -834,7 +948,7 @@ function serializableSmartNode(node){
     return copy;
 }
 function selectedSmartWorkflowPayload(){
-    const ids = selectedNodeIds();
+    const ids = SpatialFrames?.copyClosureIds?.(nodes, selectedNodeIds(), {groupTypes:['smart-group']}) || selectedNodeIds();
     const idSet = new Set(ids);
     const selectedNodes = nodes.filter(node => idSet.has(node.id)).map(serializableSmartNode);
     const selectedSet = new Set(selectedNodes.map(node => node.id));
@@ -938,6 +1052,13 @@ function insertSmartWorkflowIntoCanvas(imported){
         idMap.set(oldId, copy.id);
         return normalizeLegacySmartNode(copy);
     }).filter(Boolean);
+    newNodes.forEach(node => {
+        if(Array.isArray(node.items) && (isCanvasFrameNode(node) || isSmartGroupNode(node))){
+            node.items = SpatialFrames.remapFrameItems(node.items, idMap);
+        }
+        if(Array.isArray(node.inputNodeIds)) node.inputNodeIds = node.inputNodeIds.map(id => idMap.get(id)).filter(Boolean);
+        if(node.sourceNodeId) node.sourceNodeId = idMap.get(node.sourceNodeId) || '';
+    });
     const newConnections = srcConnections
         .map(conn => ({...JSON.parse(JSON.stringify(conn)), from:idMap.get(conn.from), to:idMap.get(conn.to)}))
         .filter(conn => conn.from && conn.to);
@@ -1208,10 +1329,16 @@ function canvasListUrlForProject(projectId){
     const pid = rememberCanvasListProject(projectId);
     return `/static/canvas-list.html?project=${encodeURIComponent(pid)}`;
 }
-function backToCanvasList(){
+async function backToCanvasList(){
+    await waitForSmartPromptLLMSubmissions();
     savePromptDraftForCurrent();
     window.location.href = canvasListUrlForProject(canvas?.project || sourceProjectId || 'default');
 }
+window.addEventListener('beforeunload', event => {
+    if(!smartPromptLLMSubmissionPromises.size) return;
+    event.preventDefault();
+    event.returnValue = '';
+});
 function promptPlainText(){
     return originalPromptTextFromParts(collectPromptParts());
 }
@@ -1319,12 +1446,126 @@ function syncSelectionUi(){
     syncSmartSelectedImageResolution(world);
     syncRunButtonState();
     scheduleConnectionLayerRefresh();
+    renderSmartSelectionHub();
 }
 function isNodeSelected(id){
     return selectedId === id || selectedIds.includes(id);
 }
 function selectedNodeIds(){
     return selectedIds.length ? selectedIds.slice() : (selectedId ? [selectedId] : []);
+}
+function smartFrameRect(node){
+    const normalized = SpatialFrames?.normalizeFrame?.(node) || node || {};
+    return {
+        x:Number(normalized.x) || 0,
+        y:Number(normalized.y) || 0,
+        w:Math.max(240, Number(normalized.w) || 520),
+        h:Math.max(160, Number(normalized.h) || 340),
+    };
+}
+function positionSmartSelectionHub(ids=selectedNodeIds()){
+    if(!smartSelectionHub?.classList.contains('open') || !shell) return;
+    const shellRect = shell.getBoundingClientRect();
+    const rects = smartNodeElementsByIds(ids).map(el => el.getBoundingClientRect()).filter(rect => rect.width && rect.height);
+    if(!rects.length){ smartSelectionHub.classList.remove('open'); return; }
+    const left = Math.min(...rects.map(rect => rect.left));
+    const right = Math.max(...rects.map(rect => rect.right));
+    const top = Math.min(...rects.map(rect => rect.top));
+    const halfWidth = Math.max(22, smartSelectionHub.offsetWidth / 2);
+    smartSelectionHub.style.left = `${Math.max(halfWidth + 8, Math.min(shell.clientWidth - halfWidth - 8, (left + right) / 2 - shellRect.left))}px`;
+    smartSelectionHub.style.top = `${Math.max(12, top - shellRect.top - 48)}px`;
+    smartSelectionHub.style.transform = 'translateX(-50%)';
+}
+function renderSmartSelectionHub(){
+    if(!smartSelectionHub || !shell) return;
+    const ids = selectedNodeIds().filter(id => nodes.some(node => node.id === id));
+    const selectedNodes = ids.map(id => nodes.find(node => node.id === id)).filter(Boolean);
+    const singleFrame = selectedNodes.length === 1 && isCanvasFrameNode(selectedNodes[0]) ? selectedNodes[0] : null;
+    const canShowMulti = selectedNodes.length > 1 && !selectedNodes.some(isCanvasFrameNode);
+    if(!singleFrame && !canShowMulti){
+        smartSelectionHub.classList.remove('open');
+        smartSelectionHub.innerHTML = '';
+        return;
+    }
+    if(singleFrame){
+        const frame = SpatialFrames.normalizeFrame(singleFrame);
+        smartSelectionHub.innerHTML = `
+            <button class="selection-action" type="button" data-frame-action="size" title="${escapeAttr(tr('common.frameTitleSize'))}" aria-label="${escapeAttr(tr('common.frameTitleSize'))}"><i data-lucide="type"></i></button>
+            <label class="selection-action frame-color-action" title="${escapeAttr(tr('common.frameColor'))}" aria-label="${escapeAttr(tr('common.frameColor'))}"><i data-lucide="palette"></i><input type="color" value="${escapeAttr(frame.color)}"></label>
+            <button class="selection-action danger" type="button" data-frame-action="delete" title="${escapeAttr(tr('common.frameDelete'))}" aria-label="${escapeAttr(tr('common.frameDelete'))}"><i data-lucide="trash-2"></i></button>`;
+        smartSelectionHub.querySelector('[data-frame-action="size"]')?.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation();
+            const sizes = [24, 32, 36, 48];
+            const current = Number(singleFrame.titleSize || 32);
+            pushUndo();
+            singleFrame.titleSize = sizes[(Math.max(0, sizes.indexOf(current)) + 1) % sizes.length];
+            render();
+            scheduleSave();
+        });
+        const frameColorInput = smartSelectionHub.querySelector('input[type="color"]');
+        const originalFrameColor = singleFrame.color;
+        frameColorInput?.addEventListener('pointerdown', () => capturePendingUndo(), {once:true});
+        frameColorInput?.addEventListener('input', e => {
+            singleFrame.color = e.target.value;
+            const el = world.querySelector(`.canvas-frame-node[data-id="${CSS.escape(singleFrame.id)}"]`);
+            if(el) el.style.setProperty('--frame-color', singleFrame.color);
+        });
+        frameColorInput?.addEventListener('change', () => {
+            if(singleFrame.color !== originalFrameColor) commitPendingUndo();
+            else discardPendingUndo();
+            render();
+            scheduleSave();
+        });
+        smartSelectionHub.querySelector('[data-frame-action="delete"]')?.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation();
+            deleteNode(singleFrame.id);
+        });
+    } else {
+        const mediaCount = SpatialFrames?.collectMediaItems?.(nodes, ids, {groupTypes:['smart-group']})?.length || 0;
+        smartSelectionHub.innerHTML = `
+            <button class="selection-action" type="button" data-selection-action="arrange" title="${escapeAttr(tr('common.arrangeSelection'))}" aria-label="${escapeAttr(tr('common.arrangeSelection'))}"><i data-lucide="wand-sparkles"></i></button>
+            <button class="selection-action" type="button" data-selection-action="frame" title="${escapeAttr(tr('common.placeInFrame'))}" aria-label="${escapeAttr(tr('common.placeInFrame'))}"><i data-lucide="square-dashed"></i></button>
+            <button class="selection-action" type="button" data-selection-action="download" ${mediaCount ? '' : 'disabled'} title="${escapeAttr(tr('common.downloadSelection'))}" aria-label="${escapeAttr(tr('common.downloadSelection'))}"><i data-lucide="download"></i></button>`;
+        smartSelectionHub.querySelector('[data-selection-action="arrange"]')?.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation(); arrangeSelectedSmartNodes();
+        });
+        smartSelectionHub.querySelector('[data-selection-action="frame"]')?.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation(); createFrameFromSmartSelection();
+        });
+        smartSelectionHub.querySelector('[data-selection-action="download"]')?.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation(); downloadSmartSelectionMedia();
+        });
+    }
+    smartSelectionHub.classList.add('open');
+    positionSmartSelectionHub(ids);
+    refreshIcons();
+}
+function createFrameFromSmartSelection(){
+    if(!canvas || !SpatialFrames) return;
+    const ids = selectedNodeIds();
+    const frame = SpatialFrames.createFrameAroundSelection(nodes, ids, node => {
+        const rect = nodeRect(node);
+        return {x:rect.x, y:rect.y, w:rect.width, h:rect.height};
+    }, {
+        id:uid('frame'),
+        title:tr('common.frameDefaultTitle'),
+        groupTypes:['smart-group'],
+    });
+    if(!frame) return;
+    pushUndo();
+    nodes.push(frame);
+    selectedId = frame.id;
+    selectedIds = [];
+    selectedImage = {nodeId:'', index:-1};
+    render();
+    scheduleSave();
+}
+async function downloadSmartSelectionMedia(){
+    if(!SpatialFrames) return;
+    const items = SpatialFrames.collectMediaItems(nodes, selectedNodeIds(), {groupTypes:['smart-group']});
+    if(!items.length){ toast(tr('common.frameNoMedia')); return; }
+    await zipDownloadImageItems('canvas-selection', items);
+    toast(String(tr('common.frameDownloadReady')).replace('{count}', String(items.length)));
 }
 function isEditableTarget(target){
     const el = target || document.activeElement;
@@ -1765,6 +2006,7 @@ function smartNodeInputThumbsHtml(images, opts={}){
     const refs = (images || []).filter(img => img?.url);
     if(!refs.length) return '';
     const limit = Math.min(10, refs.length);
+    const skippedBefore = Math.max(0, Math.min(refs.length, Number(opts.skippedBefore) || 0));
     const items = refs.slice(0, limit).map((img, index) => {
         const label = opts.labelPrefix ? `${opts.labelPrefix}${index + 1}` : (window.StudioI18n?.lang?.() === 'en' ? `Image ${index + 1}` : `图${index + 1}`);
         const media = isAudioMediaItem(img)
@@ -1772,7 +2014,8 @@ function smartNodeInputThumbsHtml(images, opts={}){
             : isVideoMediaItem(img)
             ? smartVideoPreviewHtml(img, 256, 'alt=""')
             : smartPreviewImgHtml(img, 256, 'alt=""');
-        return `<div class="smart-node-input-thumb" title="${escapeHtml(label)}">${media}<span class="smart-node-input-badge">${escapeHtml(label)}</span></div>`;
+        const skippedClass = index < skippedBefore ? ' is-skipped' : '';
+        return `<div class="smart-node-input-thumb${skippedClass}" title="${escapeHtml(label)}">${media}<span class="smart-node-input-badge">${escapeHtml(label)}</span></div>`;
     }).join('');
     const more = refs.length > limit ? `<div class="smart-node-input-thumb smart-node-input-more">+${refs.length - limit}</div>` : '';
     return `<div class="smart-node-input-thumbs">${items}${more}</div>`;
@@ -1790,11 +2033,16 @@ function promptLlmInstructionHeight(node){
     return Math.max(PROMPT_LLM_INSTRUCTION_MIN_H, Math.min(PROMPT_LLM_INSTRUCTION_MAX_H, Math.round(h)));
 }
 function promptNodeSeparator(node){
-    const raw = String(node?.promptSeparator ?? ';');
-    return raw === '' ? ';' : raw;
+    if(node && Number(node.promptSeparatorDefaultVersion || 0) < 2){
+        if(node.promptSeparator == null || node.promptSeparator === ';') node.promptSeparator = '----';
+        node.promptSeparatorDefaultVersion = 2;
+    }
+    const raw = String(node?.promptSeparator ?? '----');
+    return raw === '' ? '----' : raw;
 }
-function promptNodePromptItems(node){
-    const text = String(node?.text || '').trim();
+function promptNodePromptItems(node, textOverride){
+    const sourceText = arguments.length > 1 ? textOverride : node?.text;
+    const text = String(sourceText || '').trim();
     if(!text) return [];
     if(node?.promptSplitEnabled !== true) return [text];
     const sep = promptNodeSeparator(node);
@@ -1826,7 +2074,10 @@ function promptNodeMinHeight(node){
 }
 function promptTextItemsForNode(node, ctx=smartLoopContext){
     if(!node) return [];
-    if(node.type === 'smart-prompt') return promptNodePromptItems(node);
+    if(node.type === 'smart-prompt'){
+        const text = node.llmEnabled ? smartPromptLLMResultText(node, ctx) : node.text;
+        return promptNodePromptItems(node, text);
+    }
     if(node.type === 'smart-loop'){
         const text = smartLoopPrompt(node, ctx);
         return text ? [text] : [];
@@ -1847,8 +2098,64 @@ function promptNodeUpstreamPromptText(node, ctx=smartLoopContext){
 }
 function promptNodeLLMInputText(node, ctx=smartLoopContext){
     const upstream = promptNodeUpstreamPromptText(node, ctx).trim();
-    const instruction = String(node?.llmInstruction || '').trim() || promptNodePromptItems(node).join('\n\n').trim();
+    const explicit = String(node?.llmInstruction || '').trim();
+    const seed = String(node?.llmInputSeed || '').trim();
+    const hasCompletedResult = node?.runStatus === 'done' || node?.llmResultKey || (Array.isArray(node?.llmResultMemory) && node.llmResultMemory.length);
+    const legacyDraft = hasCompletedResult ? '' : promptNodePromptItems(node).join('\n\n').trim();
+    const instruction = explicit || seed || legacyDraft;
     return [upstream, instruction].filter(Boolean).join('\n\n');
+}
+const smartPromptLLMKeyVisiting = new Set();
+function smartPromptLLMInputKey(node, ctx=smartLoopContext){
+    if(!node?.id || !window.CanvasLLMResultMemory) return '';
+    if(smartPromptLLMKeyVisiting.has(node.id)) return `smart-llm-cycle-${node.id}`;
+    smartPromptLLMKeyVisiting.add(node.id);
+    try {
+        const provider = resolveChatProviderId(node.llmProvider || '');
+        const model = resolveChatModel(node.llmModel || '', provider);
+        const refs = promptNodeInputMediaForLLM(node);
+        const mediaIdentity = ref => window.CanvasLLMResultMemory.mediaIdentity(ref?.url || ref);
+        return window.CanvasLLMResultMemory.keyFor({
+            version:'smart-prompt-v1',
+            message:promptNodeLLMInputText(node, ctx),
+            images:imageRefsOnly(refs).map(mediaIdentity),
+            videos:videoRefsOnly(refs).map(mediaIdentity),
+            provider,
+            model,
+            systemPrompt:node.llmSystemEnabled ? ((node.llmSystemPrompt || '').trim() || 'You are a helpful prompt assistant.') : ''
+        });
+    } finally {
+        smartPromptLLMKeyVisiting.delete(node.id);
+    }
+}
+function smartPromptLLMResultText(node, ctx=smartLoopContext){
+    if(!node) return '';
+    if(!node.llmEnabled) return String(node.text || '');
+    const inputKey = smartPromptLLMInputKey(node, ctx);
+    const cached = window.CanvasLLMResultMemory?.read(node, inputKey) || '';
+    if(cached) return cached;
+    const current = String(node.text || '');
+    if(node.llmResultKey === inputKey) return current;
+    if(!node.llmResultKey && current && inputKey && node.runStatus === 'done'){
+        window.CanvasLLMResultMemory?.remember(node, inputKey, current);
+        node.llmResultKey = inputKey;
+        return current;
+    }
+    const hasRememberedResult = Boolean(node.llmResultKey || (Array.isArray(node.llmResultMemory) && node.llmResultMemory.length) || node.runStatus === 'done');
+    return hasRememberedResult ? '' : current;
+}
+function smartPromptLLMHasAnyResult(node){
+    return Boolean(node?.llmResultKey || node?.runStatus === 'done' || (Array.isArray(node?.llmResultMemory) && node.llmResultMemory.length));
+}
+function rememberSmartLoopDownstreamLLMResults(loopNode){
+    if(!loopNode?.id) return;
+    const seen = new Set();
+    (canvas?.connections || []).filter(conn => conn.from === loopNode.id).forEach(conn => {
+        const target = nodes.find(node => node.id === conn.to);
+        if(target?.type !== 'smart-prompt' || !target.llmEnabled || seen.has(target.id)) return;
+        seen.add(target.id);
+        smartPromptLLMResultText(target);
+    });
 }
 function promptNodeExpandedHeight(node){
     // 指令文本框（发送给 LLM 的内容）可拖动加高，超出默认高度的部分要叠加进节点高度。
@@ -1971,11 +2278,12 @@ function smartLoopWidth(node){
 }
 function smartLoopHeight(node){
     let h = 168;
-    if(node?.imageInput) h += 72;
+    if(node?.imageInput) h += 64;
     if(node?.showPrompt) {
         const promptCount = Math.max(1, smartLoopPromptFieldValues(node).length);
-        h += 94 + promptCount * 58 + smartLoopUpstreamPromptPreviewHeight(node);
+        h += 82 + promptCount * 58;
     }
+    if(node?.imageInput || node?.showPrompt) h += 50;
     h += smartNodeInputThumbsHeight(smartLoopPreviewImages(node));
     return h;
 }
@@ -1991,6 +2299,10 @@ function smartMinimaxLayoutSize(node){
 }
 
 function nodeRect(node){
+    if(isCanvasFrameNode(node)){
+        const frame = smartFrameRect(node);
+        return {x:frame.x, y:frame.y, width:frame.w, height:frame.h};
+    }
     const layout = imageLayout(node.images || [], nodeScale(node), node);
     return {x:node.x || 0, y:node.y || 0, width:layout.width, height:layout.height};
 }
@@ -2111,6 +2423,7 @@ function applyViewport(){
     shell.style.backgroundSize = '24px 24px';
     shell.style.backgroundPosition = '0 0';
     renderMinimap();
+    positionSmartSelectionHub();
     scheduleSmartImageResolutionSync(world, 120);
 }
 function screenToWorld(event){
@@ -2754,7 +3067,11 @@ function apiImageSize(ratioValue, resolutionValue, customRatioValue='', customSi
     if(resolutionValue === 'auto') return 'auto';
     if(resolutionValue === 'custom') return String(customSizeValue || '').trim();
     const resolutionKey = resolutionValue || '1k';
-    if(ratioValue === 'custom' || ratioValue === 'source'){
+    if(ratioValue === 'source'){
+        const matched = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatioValue(customRatioValue) || '1:1';
+        return ADAPTIVE_RATIO_TOOLS?.pixelSizeForRatio(matched, resolutionKey) || SIZE_MAP.square[resolutionKey] || SIZE_MAP.square['1k'];
+    }
+    if(ratioValue === 'custom'){
         const parsed = parseRatioValue(customRatioValue);
         const longSide = RES_LONG_SIDE[resolutionKey] || 1024;
         if(parsed){
@@ -3148,7 +3465,7 @@ function renderSizeControls(prefix='', includeSource=false){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
     const ratios = [
-        ['square','1:1'], ['portrait','2:3'], ['landscape','3:2'], ['portrait43','3:4'], ['landscape43','4:3'], ['story','9:16'], ['wide','16:9'], ['ultrawide','21:9'], ['ultratall','9:21'],
+        ['square','1:1'], ['portrait','2:3'], ['landscape','3:2'], ['portrait43','3:4'], ['landscape43','4:3'], ['portrait45','4:5'], ['landscape54','5:4'], ['story','9:16'], ['wide','16:9'], ['ultrawide','21:9'], ['ultratall','9:21'],
         ...(includeSource ? [['source', tr('canvas.adaptiveRatio') || '适配比例']] : []),
         ['custom', tr('canvas.custom') || '自定义']
     ];
@@ -3164,7 +3481,7 @@ function ratioLabel(prefix=''){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const customKey = prefix ? `${prefix}CustomRatio` : 'customRatio';
     const sourceLabel = sourceImageRatioLabel(prefix) || tr('smart.imageRatio');
-    const map = {square:'1:1', portrait:'2:3', landscape:'3:2', portrait43:'3:4', landscape43:'4:3', story:'9:16', wide:'16:9', ultrawide:'21:9', ultratall:'9:21', source:sourceLabel, custom:settings[customKey] || tr('smart.custom')};
+    const map = {square:'1:1', portrait:'2:3', landscape:'3:2', portrait43:'3:4', landscape43:'4:3', portrait45:'4:5', landscape54:'5:4', story:'9:16', wide:'16:9', ultrawide:'21:9', ultratall:'9:21', source:settings[customKey] || sourceLabel, custom:settings[customKey] || tr('smart.custom')};
     return map[settings[ratioKey] || 'square'] || '1:1';
 }
 function gcdInt(a, b){
@@ -3204,12 +3521,14 @@ function applySourceRatioToSettings(prefix=''){
     if(settings[ratioKey] !== 'source') return;
     const ratio = reducedRatioForImage(sourceRatioImageForNode(activeComposerNode() || selectedNode()));
     if(!ratio) return;
+    const matched = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(ratio.w, ratio.h) || '1:1';
+    const matchedParts = ADAPTIVE_RATIO_TOOLS?.ratioParts(matched) || {width:1, height:1};
     const customKey = prefix ? `${prefix}CustomRatio` : 'customRatio';
     const wKey = prefix ? `${prefix}CustomRatioWidth` : 'customRatioWidth';
     const hKey = prefix ? `${prefix}CustomRatioHeight` : 'customRatioHeight';
-    settings[wKey] = ratio.w;
-    settings[hKey] = ratio.h;
-    settings[customKey] = `${ratio.w}:${ratio.h}`;
+    settings[wKey] = matchedParts.width;
+    settings[hKey] = matchedParts.height;
+    settings[customKey] = matched;
 }
 function resolutionLabel(prefix=''){
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
@@ -3220,9 +3539,9 @@ function resolutionLabel(prefix=''){
 }
 function ratioIconClass(value){
     if(value === 'portrait') return 'r-portrait';
-    if(value === 'portrait43') return 'r-portrait43';
+    if(value === 'portrait43' || value === 'portrait45') return 'r-portrait43';
     if(value === 'landscape') return 'r-landscape';
-    if(value === 'landscape43') return 'r-landscape43';
+    if(value === 'landscape43' || value === 'landscape54') return 'r-landscape43';
     if(value === 'wide' || value === 'ultrawide') return 'r-wide';
     if(value === 'story' || value === 'ultratall') return 'r-story';
     if(value === 'source') return 'r-source';
@@ -3293,7 +3612,7 @@ function renderRatioControl(prefix='', includeSource=false){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
     const ratios = [
-        ['square','1:1'], ['portrait','2:3'], ['landscape','3:2'], ['portrait43','3:4'], ['landscape43','4:3'],
+        ['square','1:1'], ['portrait','2:3'], ['landscape','3:2'], ['portrait43','3:4'], ['landscape43','4:3'], ['portrait45','4:5'], ['landscape54','5:4'],
         ['story','9:16'], ['wide','16:9'], ['ultrawide','21:9'], ['ultratall','9:21'],
         ...(includeSource ? [['source', tr('smart.imageRatio')]] : []),
         ['custom', tr('smart.custom')]
@@ -3362,7 +3681,7 @@ function renderSizePickerControl(prefix='', includeSource=false){
     const currentCustomRatio = settings[customRatioKey] || (currentRatio === 'source' ? sourceImageRatioLabel(prefix) : '');
     const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
     const ratios = [
-        ['square','1:1','正方形'], ['portrait','2:3','竖图'], ['landscape','3:2','横图'], ['portrait43','3:4','竖图'], ['landscape43','4:3','横图'],
+        ['square','1:1','正方形'], ['portrait','2:3','竖图'], ['landscape','3:2','横图'], ['portrait43','3:4','竖图'], ['landscape43','4:3','横图'], ['portrait45','4:5','竖图'], ['landscape54','5:4','横图'],
         ['story','9:16','竖屏'], ['wide','16:9','宽屏'], ['ultrawide','21:9','超宽'], ['ultratall','9:21','超竖'],
         ...(includeSource ? [['source', sourceImageRatioLabel(prefix) || '原图', '适配输入']] : [])
     ];
@@ -4662,6 +4981,73 @@ function restorePromptTemplateScroll(snapshot){
         if(detail) detail.scrollTop = snapshot.detailTop || 0;
     });
 }
+async function reorderPromptTemplateGroups(movedId, targetId, after=false){
+    const order = window.PromptTemplateOrder;
+    const library = activePromptLibrary();
+    if(!order || !library || library.readonly) return;
+    const currentIds = (library.categories || []).map(group => group?.id).filter(Boolean);
+    const orderedIds = order.moveId(currentIds, movedId, targetId, after);
+    if(orderedIds.join('\u0000') === currentIds.join('\u0000')) return;
+    try {
+        const data = await fetch('/api/prompt-libraries/categories/reorder', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({library_id:library.id, ordered_ids:orderedIds})
+        }).then(async response => {
+            if(!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || '分组排序失败');
+            return response.json();
+        });
+        promptLibraries = data.library?.libraries || promptLibraries;
+        renderPromptTemplatePanel();
+    } catch(error){ if(typeof setStatus === 'function') setStatus(error.message || '分组排序失败'); }
+}
+async function reorderPromptTemplateItems(movedId, targetId, after=false){
+    const order = window.PromptTemplateOrder;
+    const library = activePromptLibrary();
+    const query = String(promptTemplateSearch?.value || '').trim();
+    if(!order || !library || library.readonly || !order.canSortItems({category:promptTemplateCategory, query})) return;
+    const records = Array.isArray(library.items) ? library.items : [];
+    const subsetIds = records.filter(item => item?.category === promptTemplateCategory).map(item => item.id).filter(Boolean);
+    if(!subsetIds.includes(movedId) || !subsetIds.includes(targetId)) return;
+    const currentIds = records.map(item => item?.id).filter(Boolean);
+    const orderedIds = order.mergeSubsetOrder(records, subsetIds, movedId, targetId, after);
+    if(orderedIds.join('\u0000') === currentIds.join('\u0000')) return;
+    try {
+        const data = await fetch('/api/prompt-libraries/items/reorder', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({library_id:library.id, ordered_ids:orderedIds})
+        }).then(async response => {
+            if(!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || '提示词排序失败');
+            return response.json();
+        });
+        promptLibraries = data.library?.libraries || promptLibraries;
+        renderPromptTemplatePanel();
+    } catch(error){ if(typeof setStatus === 'function') setStatus(error.message || '提示词排序失败'); }
+}
+function bindPromptTemplateOrdering(query=''){
+    promptTemplateCats._promptOrderCleanup?.();
+    promptTemplateCats._promptOrderCleanup = null;
+    promptTemplateBody._promptOrderCleanup?.();
+    promptTemplateBody._promptOrderCleanup = null;
+    const order = window.PromptTemplateOrder;
+    const library = activePromptLibrary();
+    if(!order || !library || library.readonly) return;
+    if(promptTemplateGroupEditMode){
+        promptTemplateCats._promptOrderCleanup = order.bindSortable(promptTemplateCats, {
+            handleSelector:'[data-template-group-drag]', targetSelector:'[data-template-group-order-id]',
+            handleId:element => element?.dataset?.templateGroupDrag,
+            targetId:element => element?.dataset?.templateGroupOrderId,
+            onDrop:({movedId,targetId,after}) => reorderPromptTemplateGroups(movedId,targetId,after)
+        });
+    }
+    if(order.canSortItems({category:promptTemplateCategory, query})){
+        promptTemplateBody._promptOrderCleanup = order.bindSortable(promptTemplateBody, {
+            handleSelector:'[data-template-item-drag]', targetSelector:'[data-template-item-order-id]',
+            handleId:element => element?.dataset?.templateItemDrag,
+            targetId:element => element?.dataset?.templateItemOrderId,
+            onDrop:({movedId,targetId,after}) => reorderPromptTemplateItems(movedId,targetId,after)
+        });
+    }
+}
 function renderPromptTemplatePanel(options={}){
     if(!promptTemplatePanel || !promptTemplateBody || !promptTemplateCats) return;
     renderPromptLibrarySelect();
@@ -4669,6 +5055,10 @@ function renderPromptTemplatePanel(options={}){
     const query = String(promptTemplateSearch?.value || '').trim().toLowerCase();
     const allTemplates = promptTemplateItems();
     const activeGroups = activePromptTemplateGroups();
+    const activeLibrary = activePromptLibrary();
+    const canReorderLibrary = Boolean(window.PromptTemplateOrder && activeLibrary && !activeLibrary.readonly);
+    const reorderableItemIds = new Set((activeLibrary?.items || []).map(item => item?.id).filter(Boolean));
+    const canReorderItems = Boolean(canReorderLibrary && window.PromptTemplateOrder.canSortItems({category:promptTemplateCategory, query}));
     // 防御：若当前分类筛选不属于当前词库（例如刚切换词库或分类已被删除），回到“全部”，避免列表被过滤为空。
     if(promptTemplateCategory !== 'all' && !activeGroups.some(g => g.id === promptTemplateCategory)) promptTemplateCategory = 'all';
     const categories = [{id:'all', name:tr('smart.tplAll')}, ...activeGroups.map(group => ({...group, name:promptTemplateCategoryLabel(group.id)}))];
@@ -4690,7 +5080,8 @@ function renderPromptTemplatePanel(options={}){
             </div>
             <div class="prompt-template-group-list">
                 ${activeGroups.map(group => `
-                    <div class="prompt-template-group-row has-delete">
+                    <div class="prompt-template-group-row ${canReorderLibrary ? 'has-order' : ''} has-delete" data-template-group-order-id="${escapeHtml(group.id)}">
+                        ${canReorderLibrary ? `<button type="button" class="group-tool prompt-template-drag-handle" draggable="true" data-template-group-drag="${escapeHtml(group.id)}" title="${escapeAttr(tr('smart.tplDragSort'))}"><i data-lucide="grip-vertical"></i></button>` : ''}
                         <button type="button" class="group-name ${group.id === promptTemplateCategory ? 'active' : ''}" data-template-cat="${escapeHtml(group.id)}">
                             <span>${escapeHtml(promptTemplateCategoryLabel(group.id))}</span>
                             <small>${groupCounts[group.id] || 0}</small>
@@ -4726,7 +5117,6 @@ function renderPromptTemplatePanel(options={}){
         : (selected ? currentPromptPreset(selected.sourceId) : null);
     const target = promptTemplatePanel.dataset.target || 'node';
     const node = nodes.find(n => n.id === promptTemplatePanel.dataset.nodeId);
-    const activeLibrary = activePromptLibrary();
     // 系统库 readonly=false，其条目也可编辑/删除（经后端持久化），因此只看 readonly。
     const canEditCurrentLibrary = !activeLibrary.readonly;
     const editMode = Boolean(promptTemplateEditing && selectedPreset);
@@ -4736,7 +5126,8 @@ function renderPromptTemplatePanel(options={}){
                 <button type="button" data-template-save-current><i data-lucide="bookmark-plus"></i><span>${escapeHtml(tr('smart.tplSaveCurrent'))}</span></button>
                 <button type="button" data-template-new><i data-lucide="file-plus-2"></i><span>${escapeHtml(tr('smart.tplNewTemplate'))}</span></button>
             </div>
-            ${items.length ? items.map(item => `<button type="button" class="prompt-template-card ${item.id === selected?.id ? 'active' : ''}" data-template-id="${escapeHtml(item.id)}">
+            ${items.length ? items.map(item => `<button type="button" class="prompt-template-card ${item.id === selected?.id ? 'active' : ''}" data-template-id="${escapeHtml(item.id)}" data-template-item-order-id="${escapeHtml(item.id)}">
+                ${canReorderItems && reorderableItemIds.has(item.id) ? `<span class="prompt-template-drag-handle prompt-template-card-drag" draggable="true" data-template-item-drag="${escapeHtml(item.id)}" title="${escapeAttr(tr('smart.tplDragSort'))}"><i data-lucide="grip-vertical"></i></span>` : ''}
                 <span class="prompt-template-card-top">
                     <span class="prompt-template-name">${escapeHtml(promptTemplateName(item))}</span>
                     <span class="prompt-template-source">${escapeHtml(item.builtin ? tr('smart.tplBuiltin') : tr('smart.tplMine'))}</span>
@@ -4799,6 +5190,7 @@ function renderPromptTemplatePanel(options={}){
             ` : `<div class="prompt-template-empty">${escapeHtml(tr('smart.tplPickOrCreate'))}</div>`}
         </div>
     `;
+    bindPromptTemplateOrdering(query);
     refreshIcons();
     restorePromptTemplateScroll(scrollSnapshot);
 }
@@ -5224,7 +5616,7 @@ function mergeSmartImageLists(localImgs, remoteImgs){
 }
 function smartNodeInFlight(node){
     if(smartNodeHasCompletedResult(node)) return false;
-    return Boolean(node && (node.running || node.pending || node.queued || node.jimengPending || smartPendingTasks(node).length));
+    return Boolean(node && (node.running || smartPromptLLMTaskIsPending(node) || node.pending || node.queued || node.jimengPending || smartPendingTasks(node).length));
 }
 function smartNodeHasDisplayResult(node){
     return Boolean((node?.images || []).some(img => img?.url && !img.loopInputPreview));
@@ -5364,6 +5756,13 @@ function syncRunButtonState(node=selectedNode()){
     runBtn.disabled = !isSmartRunnableNode(node) || smartNodeInFlight(node) || smartCascadeIsLoopRunning(node?.id);
 }
 function mergeSmartNode(local, remote){
+    if(local?.type === 'smart-prompt' || remote?.type === 'smart-prompt'){
+        const localTaskId = String(local?.llmTask?.id || '');
+        const remoteTaskId = String(remote?.llmTask?.id || '');
+        if(localTaskId && !remoteTaskId) return remote;
+        if(remoteTaskId) return {...remote, running:smartPromptLLMTaskIsPending(remote)};
+        return remote;
+    }
     const images = mergeSmartImageLists(local.images, remote.images);
     const localDone = smartNodeHasCompletedResult(local);
     const remoteDone = smartNodeHasCompletedResult(remote);
@@ -5413,12 +5812,17 @@ function mergeSmartConnections(localConns, remoteConns, nodeIds){
     });
     return out;
 }
-function applyMergedServerCanvas(serverCanvas){
+function applyMergedServerCanvas(serverCanvas, runtimeId=smartCanvasTaskRuntimeId){
     if(!serverCanvas || !canvas) return false;
     const remoteNodes = (Array.isArray(serverCanvas.nodes) ? serverCanvas.nodes : []).map(normalizeLegacySmartNode).filter(Boolean);
     const mergedNodes = mergeSmartNodeLists(nodes, remoteNodes);
     const nodeIds = new Set(mergedNodes.map(n => n.id));
     nodes = mergedNodes;
+    const cleanedPromptLlmState = nodes.reduce((changed, node) => {
+        const cleared = clearSmartPromptLLMTransientState(node, {preserveActive:true});
+        const repaired = syncSmartPromptLLMTaskRuntimeState(node, runtimeId);
+        return cleared || repaired || changed;
+    }, false);
     canvas.connections = mergeSmartConnections(canvas.connections, serverCanvas.connections, nodeIds);
     const cleanedState = clearCompletedNodeBusyStates();
     const recoveredLoopOutputs = recoverStuckLoopOutputsFromLogs();
@@ -5430,7 +5834,7 @@ function applyMergedServerCanvas(serverCanvas){
     }
     render();
     if(typeof scheduleConnectionLayerRefresh === 'function') scheduleConnectionLayerRefresh();
-    if(cleanedState || recoveredLoopOutputs) scheduleSave();
+    if(cleanedPromptLlmState || cleanedState || recoveredLoopOutputs) scheduleSave();
     resumeSmartPendingTasks();
     resumeJimengPendingNodes();
     return true;
@@ -5446,7 +5850,10 @@ async function mergeReloadCanvasNow(){
         const res = await fetch(`/api/canvases/${encodeURIComponent(canvasId)}`);
         if(!res.ok) return;
         const data = await res.json();
-        if(data && data.canvas) applyMergedServerCanvas(data.canvas);
+        if(data && data.canvas){
+            smartCanvasTaskRuntimeId = data.task_runtime_id || smartCanvasTaskRuntimeId;
+            applyMergedServerCanvas(data.canvas, smartCanvasTaskRuntimeId);
+        }
     } catch(e) {}
 }
 function scheduleCanvasMergeReload(delay=200){
@@ -5472,6 +5879,14 @@ function startCanvasMetaPoll(){
             const res = await fetch(`/api/canvases/${encodeURIComponent(canvasId)}/meta`);
             if(!res.ok) return;
             const meta = await res.json();
+            smartCanvasTaskRuntimeId = meta.task_runtime_id || smartCanvasTaskRuntimeId;
+            const repairedLLMTasks = nodes.reduce((changed, node) => (
+                syncSmartPromptLLMTaskRuntimeState(node, smartCanvasTaskRuntimeId) || changed
+            ), false);
+            if(repairedLLMTasks){
+                render();
+                scheduleSave();
+            }
             if(Number(meta.updated_at || 0) > Number(canvas.updated_at || 0)) mergeReloadCanvasNow();
         } catch(e) {}
     }, 8000);
@@ -6008,6 +6423,7 @@ async function loadCanvas(){
         if(!res.ok) return;
         const data = await res.json();
         canvas = data.canvas;
+        smartCanvasTaskRuntimeId = data.task_runtime_id || smartCanvasTaskRuntimeId;
         rememberCanvasListProject(canvas.project || 'default');
         canvasUsesConnections = Object.prototype.hasOwnProperty.call(canvas || {}, 'connections');
         document.title = canvas.title || tr('canvas.smartCanvas');
@@ -6015,7 +6431,10 @@ async function loadCanvas(){
         nodes = (Array.isArray(canvas.nodes) ? canvas.nodes : []).map(normalizeLegacySmartNode).filter(Boolean);
         migrateSmartGroupImageMembers();
         canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
+        let cleanedPromptLlmState = false;
         nodes.forEach(n => {
+            if(clearSmartPromptLLMTransientState(n)) cleanedPromptLlmState = true;
+            if(syncSmartPromptLLMTaskRuntimeState(n, smartCanvasTaskRuntimeId)) cleanedPromptLlmState = true;
             if(n.type === 'smart-minimax') n.timelinePlaying = false;
             const pendingTasks = smartPendingTasks(n);
             if(pendingTasks.length){
@@ -6045,7 +6464,7 @@ async function loadCanvas(){
         updateProviderModels();
         applyViewport();
         render();
-        if(cleanedDetachedInputs || cleanedCompletedState || recoveredLoopOutputs || hiddenCompletedTimers) scheduleSave();
+        if(cleanedPromptLlmState || cleanedDetachedInputs || cleanedCompletedState || recoveredLoopOutputs || hiddenCompletedTimers) scheduleSave();
         resumeSmartPendingTasks();
         resumeJimengPendingNodes();
         startCanvasMetaPoll();
@@ -6142,7 +6561,8 @@ function createPromptNode(x, y, options={}){
         h:240,
         title:'Prompt',
         text:'',
-        promptSeparator:';',
+        promptSeparator:'----',
+        promptSeparatorDefaultVersion:2,
         promptSplitEnabled:false,
         llmEnabled:false,
         llmProvider:providerId,
@@ -6226,6 +6646,8 @@ function cloneSmartNode(node, dx=0, dy=0){
             ? 'group'
             : node.type === 'smart-minimax'
             ? 'minimax'
+            : isCanvasFrameNode(node)
+            ? 'frame'
             : 'smart'
     );
     copy.x = (Number(node.x) || 0) + dx;
@@ -6236,14 +6658,15 @@ function cloneSmartNode(node, dx=0, dy=0){
 }
 function copySelectedNodes(){
     if(!canvas || isEditableTarget(document.activeElement)) return;
-    const ids = selectedNodeIds();
+    const ids = SpatialFrames?.copyClosureIds?.(nodes, selectedNodeIds(), {groupTypes:['smart-group']}) || selectedNodeIds();
     const copiedNodes = ids.map(id => nodes.find(n => n.id === id)).filter(Boolean);
     if(!copiedNodes.length) return;
     const idSet = new Set(copiedNodes.map(n => n.id));
     const copiedConnections = (canvas.connections || []).filter(c => idSet.has(c.from) && idSet.has(c.to));
     nodeClipboard = {
         nodes:JSON.parse(JSON.stringify(copiedNodes)),
-        connections:JSON.parse(JSON.stringify(copiedConnections))
+        connections:JSON.parse(JSON.stringify(copiedConnections)),
+        rootIds:selectedNodeIds(),
     };
     toast(`已复制 ${copiedNodes.length} 个节点`);
 }
@@ -6266,6 +6689,9 @@ function pasteNodes(){
         return copy;
     });
     copies.forEach(copy => {
+        if(Array.isArray(copy.items) && (isCanvasFrameNode(copy) || isSmartGroupNode(copy))){
+            copy.items = SpatialFrames.remapFrameItems(copy.items, idMap);
+        }
         if(Array.isArray(copy.inputNodeIds)){
             copy.inputNodeIds = copy.inputNodeIds.map(id => idMap.get(id)).filter(Boolean);
         }
@@ -6278,8 +6704,9 @@ function pasteNodes(){
     })).filter(conn => conn.from && conn.to && conn.from !== conn.to);
     canvas.connections = [...(canvas.connections || []), ...newConnections];
     nodes.push(...copies);
-    selectedId = copies.length === 1 ? copies[0].id : '';
-    selectedIds = copies.length > 1 ? copies.map(n => n.id) : [];
+    const pastedRootIds = (nodeClipboard.rootIds || sourceNodes.map(node => node.id)).map(id => idMap.get(id)).filter(Boolean);
+    selectedId = pastedRootIds.length === 1 ? pastedRootIds[0] : '';
+    selectedIds = pastedRootIds.length > 1 ? pastedRootIds : [];
     selectedImage = {nodeId:'', index:-1};
     render();
     scheduleSave();
@@ -6324,7 +6751,8 @@ function pasteAssetsFromInbox(){
     return true;
 }
 function duplicateForAltDrag(node, preserveConnections=false){
-    const ids = (isNodeSelected(node.id) ? selectedNodeIds() : [node.id]);
+    const selectedRoots = isNodeSelected(node.id) ? selectedNodeIds() : [node.id];
+    const ids = SpatialFrames?.copyClosureIds?.(nodes, selectedRoots, {groupTypes:['smart-group']}) || selectedRoots;
     const sourceNodes = ids.map(id => nodes.find(n => n.id === id)).filter(Boolean);
     if(!sourceNodes.length) return node;
     pushUndo();
@@ -6335,6 +6763,9 @@ function duplicateForAltDrag(node, preserveConnections=false){
         return copy;
     });
     copies.forEach(copy => {
+        if(Array.isArray(copy.items) && (isCanvasFrameNode(copy) || isSmartGroupNode(copy))){
+            copy.items = SpatialFrames.remapFrameItems(copy.items, idMap);
+        }
         if(Array.isArray(copy.inputNodeIds)){
             copy.inputNodeIds = preserveConnections
                 ? copy.inputNodeIds.map(id => idMap.get(id) || id).filter(Boolean)
@@ -6362,8 +6793,9 @@ function duplicateForAltDrag(node, preserveConnections=false){
     }
     nodes.push(...copies);
     const dragCopy = copies.find(c => c.id === idMap.get(node.id)) || copies[0];
-    selectedId = copies.length === 1 ? dragCopy.id : '';
-    selectedIds = copies.length > 1 ? copies.map(copy => copy.id) : [];
+    const copiedRootIds = selectedRoots.map(id => idMap.get(id)).filter(Boolean);
+    selectedId = copiedRootIds.length === 1 ? copiedRootIds[0] : '';
+    selectedIds = copiedRootIds.length > 1 ? copiedRootIds : [];
     selectedImage = {nodeId:'', index:-1};
     render();
     scheduleSave();
@@ -6475,7 +6907,7 @@ function moveNodeElementsDuringDrag(){
     const groupItems = dragState.group || [{id:dragState.id}];
     groupItems.map(item => item.id).forEach(id => {
         const n = nodes.find(x => x.id === id);
-        const el = world.querySelector(`.image-node[data-id="${CSS.escape(id)}"]`);
+        const el = world.querySelector(`.image-node[data-id="${CSS.escape(id)}"],.canvas-frame-node[data-id="${CSS.escape(id)}"]`);
         if(n && el){
             el.style.left = `${n.x || 0}px`;
             el.style.top = `${n.y || 0}px`;
@@ -6485,13 +6917,21 @@ function moveNodeElementsDuringDrag(){
     if(active && (dragState.group || [{id:dragState.id}]).some(item => item.id === active.id)){
         positionComposerForNode(active);
     }
+    positionSmartSelectionHub();
     scheduleInteractionLayerRefresh();
 }
 function updateNodeElementDuringResize(node){
     if(!node) return;
-    const el = world.querySelector(`.image-node[data-id="${CSS.escape(node.id)}"]`);
+    const el = world.querySelector(`.image-node[data-id="${CSS.escape(node.id)}"],.canvas-frame-node[data-id="${CSS.escape(node.id)}"]`);
     if(!el){
         render();
+        return;
+    }
+    if(isCanvasFrameNode(node)){
+        const frame = smartFrameRect(node);
+        el.style.width = `${frame.w}px`;
+        el.style.height = `${frame.h}px`;
+        scheduleInteractionLayerRefresh();
         return;
     }
     const imgs = isSmartGroupNode(node) ? smartGroupImageRefs(node).map(ref => ref.item) : (node.images || []);
@@ -7237,11 +7677,10 @@ function closeSmartCanvasLog(){
     smartLogModal.classList.remove('open');
 }
 function openSmartCanvasShortcuts(){
-    smartShortcutModal?.classList.add('open');
-    refreshIcons();
+    smartShortcutController?.open();
 }
 function closeSmartCanvasShortcuts(){
-    smartShortcutModal?.classList.remove('open');
+    smartShortcutController?.close();
 }
 function promptNodeBodyHtml(node){
     node.llmProvider = resolveChatProviderId(node.llmProvider || '');
@@ -7253,7 +7692,9 @@ function promptNodeBodyHtml(node){
     const systemPrompt = (node.llmSystemPrompt || '').trim();
     const inputThumbs = smartNodeInputThumbsHtml(promptNodeInputImages(node));
     const templateActive = activePromptTemplateNodeId() === node.id;
-    const promptItems = promptNodePromptItems(node);
+    const llmResultText = node.llmEnabled ? smartPromptLLMResultText(node) : String(node.text || '');
+    const noResultForInput = node.llmEnabled && !llmResultText && smartPromptLLMHasAnyResult(node);
+    const promptItems = promptNodePromptItems(node, llmResultText);
     const promptSplitPreviewH = promptNodeSplitPreviewHeight(node);
     const upstreamPromptItems = promptNodeUpstreamPromptItems(node);
     const upstreamPromptHtml = upstreamPromptItems.length ? `<div class="prompt-node-upstream">
@@ -7276,14 +7717,14 @@ function promptNodeBodyHtml(node){
             ${node.llmSystemEnabled ? `<textarea class="prompt-node-control prompt-llm-system" placeholder="${escapeHtml(tr('smart.promptLlmSystemPlaceholder'))}">${escapeHtml(systemPrompt || 'You are a helpful prompt assistant.')}</textarea>` : ''}
         </div>` : '';
     return `<div class="prompt-node-card">
-        <textarea class="prompt-node-text prompt-node-control" ${readonly} placeholder="${escapeHtml(tr('smart.promptPlaceholderNode'))}">${escapeHtml(node.text || '')}</textarea>
+        <textarea class="prompt-node-text prompt-node-control" ${readonly} placeholder="${escapeHtml(noResultForInput ? tr('smart.promptLlmNoResultForInput') : tr('smart.promptPlaceholderNode'))}">${escapeHtml(llmResultText)}</textarea>
         <div class="prompt-node-tools">
             <button class="prompt-node-pill prompt-node-control prompt-preset-edit ${templateActive ? 'active' : ''}" type="button"><i data-lucide="library"></i><span>模板库</span></button>
             <button class="prompt-node-pill prompt-node-control prompt-split-toggle ${node.promptSplitEnabled ? 'active' : ''}" type="button"><i data-lucide="split"></i><span>分隔符</span></button>
             <button class="prompt-node-pill prompt-llm-toggle ${node.llmEnabled ? 'active' : ''}" type="button"><i data-lucide="sparkles"></i><span>LLM</span></button>
         </div>
         ${node.promptSplitEnabled ? `<div class="prompt-node-split-row">
-            <label class="prompt-node-split-control prompt-node-control"><span>分隔符</span><input class="prompt-node-separator" type="text" value="${escapeHtml(node.promptSeparator)}" maxlength="8" placeholder=";"></label>
+            <label class="prompt-node-split-control prompt-node-control"><span>分隔符</span><input class="prompt-node-separator" type="text" value="${escapeHtml(node.promptSeparator)}" maxlength="8" placeholder="----"></label>
             <span class="prompt-node-split-count">${promptItems.length || 0} 段</span>
         </div>
         <div class="prompt-node-segments" style="height:${promptSplitPreviewH}px">${promptItems.length ? promptItems.map((item, index) => `<div class="prompt-node-segment"><span>${index + 1}</span><p>${escapeHtml(item)}</p></div>`).join('') : ''}</div>
@@ -7839,15 +8280,27 @@ function smartLoopBodyHtml(node){
     node.imageBatchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
     node.showPrompt = Boolean(node.showPrompt);
     node.imageInput = Boolean(node.imageInput);
-    const imageCount = smartLoopInputImages(node, {index:node.loopStart}).length;
-    const loopThumbs = smartNodeInputThumbsHtml(smartLoopPreviewImages(node));
+    const previewImages = smartLoopPreviewImages(node);
+    const imageWindow = smartLoopWindowState(previewImages.length, node.loopStart, node.imageBatchSize);
+    const loopThumbs = smartNodeInputThumbsHtml(previewImages, {skippedBefore:imageWindow.skippedCount});
     const promptItems = smartLoopInputPromptItems(node);
     const promptFields = smartLoopPromptFieldValues(node);
     const visiblePromptFields = promptFields.length ? promptFields : [''];
-    const promptHint = promptItems.length
-        ? trf('smart.loopPromptHintFound', {n:promptItems.length})
-        : tr('smart.loopPromptHintVariable');
-    const currentUpstreamPrompt = smartLoopSelectedInputPrompt(node, {index:node.loopStart});
+    const rangeText = range => {
+        if(!range) return tr('smart.loopSummaryNoImages');
+        return range.start === range.end
+            ? trf('smart.loopSummaryImageSingle', {n:range.start})
+            : trf('smart.loopSummaryImageRange', {start:range.start, end:range.end});
+    };
+    const imageSummary = !node.imageInput
+        ? tr('smart.loopSummaryImageDisabled')
+        : `${trf('smart.loopSummaryCurrentImages', {range:rangeText(imageWindow.current)})}　${imageWindow.next ? trf('smart.loopSummaryNextImages', {range:rangeText(imageWindow.next)}) : tr('smart.loopSummaryNoNextImages')}`;
+    const effectivePrompt = String(smartLoopPrompt(node, {index:node.loopStart, total:node.count}) || '').replace(/\s+/g, ' ').trim();
+    const promptSummary = !node.showPrompt
+        ? tr('smart.loopSummaryPromptDisabled')
+        : effectivePrompt
+        ? trf('smart.loopSummaryPrompt', {n:promptItems.length, text:effectivePrompt})
+        : trf('smart.loopSummaryPromptEmpty', {n:promptItems.length});
     const defaultPrompt = smartLoopDefaultPromptText();
     const loopRunState = smartCascadeRunForLoop(node.id);
     const loopRunning = Boolean(loopRunState);
@@ -7868,13 +8321,12 @@ function smartLoopBodyHtml(node){
             <div class="loop-smart-mini">
                 ${loopNumberControlHtml({label:tr('canvas.loopBatchSize'), value:node.imageBatchSize, key:'imageBatchSize', max:100, quick:[1,2,3,4,5,6,8,10]})}
             </div>
-            <div class="loop-smart-note">${imageCount ? escapeHtml(trf('canvas.loopImageWillOutput', {n:imageCount})) : escapeHtml(tr('canvas.loopImageEmpty'))}</div>
+        </div>` : ''}
+        ${(node.imageInput || node.showPrompt) ? `<div class="loop-smart-summary" aria-live="polite">
+            <div class="loop-smart-summary-row loop-smart-summary-images" title="${escapeHtml(imageSummary)}">${escapeHtml(imageSummary)}</div>
+            <div class="loop-smart-summary-row loop-smart-summary-prompt" title="${escapeHtml(promptSummary)}">${escapeHtml(promptSummary)}</div>
         </div>` : ''}
         ${node.showPrompt ? `<div class="loop-smart-panel prompt-panel">
-            ${currentUpstreamPrompt ? `<div class="loop-smart-upstream">
-                <div class="loop-smart-upstream-label">${escapeHtml(promptHint)}</div>
-                <div class="loop-smart-upstream-text">${escapeHtml(currentUpstreamPrompt)}</div>
-            </div>` : ''}
             <div class="loop-smart-prompt-list">
                 ${visiblePromptFields.map((value, index) => {
                     const displayValue = promptItems.length && isSmartLoopDefaultPrompt(value) ? '' : value;
@@ -7886,14 +8338,12 @@ function smartLoopBodyHtml(node){
                 }).join('')}
             </div>
             <div class="loop-smart-row loop-smart-prompt-actions">
-                <button class="loop-smart-control loop-smart-token loop-smart-counter-token" type="button" data-loop-token="《计数》">${escapeHtml(tr('canvas.counterToken'))}</button>
-                <span class="loop-smart-note">${escapeHtml(promptHint)}</span>
                 <button class="loop-smart-control loop-smart-add-prompt" type="button" data-loop-prompt-add="1" title="新增" aria-label="新增"><i data-lucide="plus"></i></button>
             </div>
         </div>` : ''}
         <div class="loop-smart-footer">
             ${loopNumberControlHtml({label:tr('canvas.loopImageStart'), value:node.loopStart, key:'loopStart', max:9999, quick:[1,2,3,4,5,6,8,10]})}
-            ${loopNumberControlHtml({label:tr('canvas.loopCount'), value:node.count, key:'count', max:100, quick:[1,2,3,4,5,6,8,10]})}
+            ${loopNumberControlHtml({label:tr('smart.loopTotalRounds'), value:node.count, key:'count', max:100, quick:[1,2,3,4,5,6,8,10]})}
             <button class="loop-smart-control loop-smart-run ${loopRunning ? 'is-stop' : ''}" type="button" data-loop-run="${escapeHtml(node.id)}" ${loopStopping ? 'disabled' : ''}><i data-lucide="${loopRunning ? 'square' : 'workflow'}"></i><span>${escapeHtml(loopRunning ? smartCascadeStopText(loopStopping) : tr('smart.loopRunAll'))}</span></button>
         </div>
     </div>`;
@@ -8396,6 +8846,95 @@ function rememberInlineVideoActivations(){
         if(image && mediaKindForItem(image) === 'video') image._inlineVideoActive = true;
     });
 }
+function smartFrameHtml(rawNode){
+    const frame = SpatialFrames.normalizeFrame(rawNode);
+    Object.assign(rawNode, frame);
+    return `<div class="canvas-frame-node ${isNodeSelected(frame.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(frame.id) || dragState?.id === frame.id) ? 'dragging' : ''}" data-id="${escapeHtml(frame.id)}" style="left:${frame.x}px;top:${frame.y}px;width:${frame.w}px;height:${frame.h}px;--frame-color:${escapeHtml(frame.color)};--frame-opacity:${frame.fillOpacity}">
+        <div class="canvas-frame-header" title="${escapeHtml(frame.title)}">
+            <div class="canvas-frame-title" style="font-size:${frame.titleSize}px">${escapeHtml(frame.title)}</div>
+        </div>
+        <div class="canvas-frame-resize" data-frame-resize="1" title="${escapeHtml(tr('canvas.resize'))}"></div>
+    </div>`;
+}
+function bindSmartFrameEvents(){
+    world.querySelectorAll('.canvas-frame-node').forEach(el => {
+        const id = el.dataset.id;
+        const header = el.querySelector('.canvas-frame-header');
+        const title = el.querySelector('.canvas-frame-title');
+        header?.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation();
+            if(title?.isContentEditable) return;
+            selectedId = id;
+            selectedIds = [];
+            selectedImage = {nodeId:'', index:-1};
+            syncSelectionUi();
+            updateComposer();
+        });
+        title?.addEventListener('dblclick', e => {
+            e.preventDefault(); e.stopPropagation();
+            const frame = nodes.find(node => node.id === id && isCanvasFrameNode(node));
+            if(!frame) return;
+            pushUndo();
+            title.contentEditable = 'true';
+            title.focus();
+            document.execCommand?.('selectAll', false, null);
+            const finish = () => {
+                title.contentEditable = 'false';
+                frame.title = String(title.textContent || '').trim() || tr('common.frameDefaultTitle');
+                title.textContent = frame.title;
+                scheduleSave();
+            };
+            title.onkeydown = event => {
+                if(event.key === 'Enter'){ event.preventDefault(); title.blur(); }
+                if(event.key === 'Escape'){ event.preventDefault(); title.textContent = frame.title; title.blur(); }
+            };
+            title.onblur = finish;
+        });
+        header?.addEventListener('mousedown', e => {
+            if(e.button !== 0 || title?.isContentEditable) return;
+            e.preventDefault(); e.stopPropagation();
+            let frame = nodes.find(node => node.id === id && isCanvasFrameNode(node));
+            if(!frame) return;
+            let historyCaptured = false;
+            if(e.altKey){
+                const sourceId = frame.id;
+                frame = duplicateForAltDrag(frame, e.shiftKey);
+                historyCaptured = frame.id !== sourceId;
+            }
+            const rootIds = isNodeSelected(frame.id) ? selectedNodeIds() : [frame.id];
+            const dragIds = SpatialFrames.collectMoveIds(nodes, rootIds, {groupTypes:['smart-group']});
+            const group = dragIds.map(dragId => {
+                const node = nodes.find(item => item.id === dragId);
+                return node ? {id:node.id, ox:Number(node.x) || 0, oy:Number(node.y) || 0} : null;
+            }).filter(Boolean);
+            dragState = {
+                id:frame.id,
+                startX:e.clientX,
+                startY:e.clientY,
+                ox:Number(frame.x) || 0,
+                oy:Number(frame.y) || 0,
+                group,
+                groupIds:group.map(item => item.id),
+                rootIds,
+                isFrameDrag:true,
+                ctrlGroup:false,
+                historyCaptured,
+            };
+            document.body.classList.add('smart-node-drag');
+            if(!historyCaptured) capturePendingUndo();
+        });
+        el.querySelector('[data-frame-resize]')?.addEventListener('mousedown', e => {
+            if(e.button !== 0) return;
+            e.preventDefault(); e.stopPropagation();
+            const frame = nodes.find(node => node.id === id && isCanvasFrameNode(node));
+            if(!frame) return;
+            const rect = nodeRect(frame);
+            resizeState = {id, startX:e.clientX, startY:e.clientY, startW:rect.width, startH:rect.height};
+            document.body.classList.add('smart-node-resize');
+            capturePendingUndo();
+        });
+    });
+}
 function render(){
     if(smartWorkflowTransferModal?.classList.contains('open')) updateSmartWorkflowTransferMeta();
     rememberInlineVideoActivations();
@@ -8410,8 +8949,9 @@ function render(){
         const node = nodes.find(n => n.id === el.dataset.id);
         if(smartNodeHasLiveMedia(node)) reusableNodes.set(node.id, el);
     });
+    const frameHtml = nodes.filter(isCanvasFrameNode).map(smartFrameHtml).join('');
     const nodeHtmlEntries = nodes
-        .filter(node => node.id !== SMART_LOG_PREVIEW_NODE_ID)
+        .filter(node => node.id !== SMART_LOG_PREVIEW_NODE_ID && !isCanvasFrameNode(node))
         // 分组节点先渲染（DOM 靠前→层级在下），作为成员的背板；成员渲染在后、盖在分组之上，
         // 否则缩小分组把成员挪进卡片区域时会被分组卡片背景遮住而“消失”。
         .slice()
@@ -8467,6 +9007,7 @@ function render(){
     // 用户正在提示词框输入时不要移动 composer:移动 DOM 会打断输入法合成、中断输入。
     // composer 已在 keepEls 中(未被移除),不重排也不影响显示(z-index 固定)。
     if(composerEl && !promptHadFocus) world.appendChild(composerEl);
+    if(frameHtml) world.insertAdjacentHTML('beforeend', frameHtml);
     world.insertAdjacentHTML('beforeend', renderConnections());
     nodeHtmlEntries.forEach(entry => {
         const fresh = renderedNodeEls.get(entry.node.id);
@@ -8480,6 +9021,7 @@ function render(){
     });
     restoreMediaPlaybackStates(mediaStates);
     bindNodeEvents();
+    bindSmartFrameEvents();
     bindConnectionEvents();
     updateComposer();
     renderMinimap();
@@ -8488,6 +9030,7 @@ function render(){
     syncSmartSelectedImageResolution(world);
     measureSmartNodeImages();
     refreshRunTimerPills();
+    renderSmartSelectionHub();
     return;
     world.innerHTML = '';
     if(composerEl) world.appendChild(composerEl);
@@ -8657,7 +9200,7 @@ function bindPromptNodeControls(el, node){
     if(separatorEl) {
         separatorEl.oninput = e => {
             const prevExtra = promptNodeSplitExtraHeight(node);
-            node.promptSeparator = e.target.value || ';';
+            node.promptSeparator = e.target.value || '----';
             refreshPromptNodeSegmentsUi(el, node);
             syncPromptNodeHeightForSplit(node, prevExtra);
             updateNodeElementDuringResize(node);
@@ -8771,6 +9314,7 @@ function bindLoopNodeControls(el, node){
     };
     const setLoopNumber = (key, rawValue, rerender=true, source=null) => {
         const value = normalizeLoopNumber(key, rawValue);
+        rememberSmartLoopDownstreamLLMResults(node);
         if(key === 'count') node.count = smartLoopCount({count:value});
         if(key === 'loopStart') node.loopStart = value;
         if(key === 'imageBatchSize') node.imageBatchSize = value;
@@ -8824,10 +9368,8 @@ function bindLoopNodeControls(el, node){
             .map(input => smartLoopEditorText(input));
         setSmartLoopPromptFieldValues(node, values);
     };
-    let activePromptEditor = null;
     el.querySelectorAll('.loop-smart-text').forEach(text => {
         bindScrollableText(text);
-        text.onfocus = () => { activePromptEditor = text; };
         text.oninput = () => { syncPromptFieldsFromDom(); scheduleSave(); };
         text.addEventListener('click', e => {
             const remove = e.target.closest?.('.loop-smart-token-chip button');
@@ -8863,20 +9405,6 @@ function bindLoopNodeControls(el, node){
             setSmartLoopPromptFieldValues(node, values);
             fitSmartLoopNode(node);
             render();
-            scheduleSave();
-        };
-    });
-    const firstText = el.querySelector('.loop-smart-text');
-    const targetPromptEditor = () => activePromptEditor && el.contains(activePromptEditor) ? activePromptEditor : firstText;
-    el.querySelectorAll('[data-loop-token]').forEach(btn => {
-        btn.onclick = e => {
-            e.preventDefault();
-            e.stopPropagation();
-            const text = targetPromptEditor();
-            if(!text) return;
-            const token = btn.dataset.loopToken || '《计数》';
-            insertSmartLoopToken(text, token);
-            syncPromptFieldsFromDom();
             scheduleSave();
         };
     });
@@ -9911,16 +10439,13 @@ function bindNodeEvents(){
                 node = duplicateForAltDrag(node, e.shiftKey);
                 historyCaptured = node.id !== sourceId;
             }
-            let dragIds = selectedIds.includes(node.id) ? selectedIds.slice() : [node.id];
-            if(isSmartGroupNode(node)){
-                const memberIds = smartGroupMembers(node).map(member => member.id);
-                dragIds = Array.from(new Set([...dragIds, ...memberIds]));
-            }
+            const rootIds = isNodeSelected(node.id) ? selectedNodeIds() : [node.id];
+            const dragIds = SpatialFrames?.collectMoveIds?.(nodes, rootIds, {groupTypes:['smart-group']}) || rootIds;
             const group = dragIds.map(dragId => {
                 const n = nodes.find(x => x.id === dragId);
                 return n ? {id:n.id, ox:Number(n.x) || 0, oy:Number(n.y) || 0} : null;
             }).filter(Boolean);
-            dragState = {id:node.id, startX:e.clientX, startY:e.clientY, ox:node.x || 0, oy:node.y || 0, group, groupIds:group.map(item => item.id), ctrlGroup:Boolean(e.ctrlKey), historyCaptured};
+            dragState = {id:node.id, startX:e.clientX, startY:e.clientY, ox:node.x || 0, oy:node.y || 0, group, groupIds:group.map(item => item.id), rootIds, isFrameDrag:false, ctrlGroup:Boolean(e.ctrlKey), historyCaptured};
             document.body.classList.add('smart-node-drag');
             if(!historyCaptured) capturePendingUndo();
         };
@@ -10027,6 +10552,7 @@ function deleteNode(id){
     nodes.forEach(node => {
         if(Array.isArray(node.inputNodeIds)) node.inputNodeIds = node.inputNodeIds.filter(inputId => !deleteIds.has(inputId));
         if(isSmartGroupNode(node) && Array.isArray(node.items)) node.items = node.items.filter(itemId => !deleteIds.has(itemId));
+        if(isCanvasFrameNode(node) && Array.isArray(node.items)) node.items = node.items.filter(itemId => !deleteIds.has(itemId));
     });
     if(selectedId === id) selectedId = '';
     selectedIds = selectedIds.filter(selected => !deleteIds.has(selected));
@@ -10626,6 +11152,7 @@ function setImageEditMode(mode, userTouched=false){
     document.querySelectorAll('[data-image-edit-mode]').forEach(btn => btn.classList.toggle('active', btn.dataset.imageEditMode === imageEditMode));
     document.getElementById('imagePreviewTools').classList.toggle('active', isPreview && !isVideoPreview);
     document.getElementById('imageCropTools')?.classList.toggle('active', imageEditMode === 'crop');
+    document.getElementById('imageOutpaintTools')?.classList.toggle('active', imageEditMode === 'outpaint');
     document.getElementById('imageMaskTools').classList.toggle('active', imageEditMode === 'mask');
     document.getElementById('imageBrushTools').classList.toggle('active', imageEditMode === 'brush');
     document.getElementById('imageResizeTools')?.classList.toggle('active', imageEditMode === 'resize');
@@ -10675,6 +11202,7 @@ function setImageEditMode(mode, userTouched=false){
         }
     }
     resizeEditDrawCanvas();
+    if(imageEditMode === 'mask') refreshMaskPreviewStyle();
     if(imageEditMode === 'grid') refreshGridSplitPreview();
     else if(imageEditMode === 'crop' || imageEditMode === 'resize' || imageEditMode === 'outpaint' || prev === 'grid') clearEditDrawing(true);
     syncEditDrawingHistoryButtons();
@@ -11399,7 +11927,9 @@ function editDrawSnapshot(){
 function restoreEditDrawSnapshot(snapshot){
     if(!snapshot) return;
     removeEditTextInlineEditor(false);
-    editDrawCanvas().getContext('2d').putImageData(snapshot.imageData || snapshot, 0, 0);
+    const canvasEl = editDrawCanvas();
+    canvasEl.getContext('2d').putImageData(snapshot.imageData || snapshot, 0, 0);
+    normalizeMaskPreviewCanvas(canvasEl);
     if(snapshot.labelCounter) brushLabelCounter = snapshot.labelCounter;
     editTextItems = (snapshot.textItems || []).map(item => ({...item}));
     editTextSelectedId = snapshot.textSelectedId || '';
@@ -11500,31 +12030,42 @@ function setGridCustomLinePos(index, point){
         ? Math.max(0.001, Math.min(0.999, point.y / Math.max(1, canvasEl.height)))
         : Math.max(0.001, Math.min(0.999, point.x / Math.max(1, canvasEl.width)));
 }
-const MASK_BRUSH_ALPHA = 115;
-const MASK_BRUSH_COLOR = `rgba(255,255,255,${MASK_BRUSH_ALPHA / 255})`;
+const MASK_EXPORT_ALPHA_THRESHOLD = 8;
+const MASK_DRAW_ALPHA = CanvasMaskPreviewStyle.DEFAULT_DRAW_ALPHA;
 function editBrushSize(){ return Number(document.getElementById(imageEditMode === 'mask' ? 'maskBrushSize' : 'paintBrushSize')?.value || 20); }
 function brushColor(){ return document.getElementById('paintBrushColor')?.value || '#ff2d55'; }
+function maskPreviewColor(){ return CanvasMaskPreviewStyle.normalizeColor(document.getElementById('maskPreviewColor')?.value); }
+function maskPreviewOpacity(){ return CanvasMaskPreviewStyle.normalizeOpacityPercent(document.getElementById('maskPreviewOpacity')?.value); }
+function syncMaskPreviewControls(){
+    const colorInput = document.getElementById('maskPreviewColor');
+    const opacityInput = document.getElementById('maskPreviewOpacity');
+    const opacityValue = document.getElementById('maskPreviewOpacityValue');
+    const color = maskPreviewColor();
+    const opacity = maskPreviewOpacity();
+    if(colorInput && colorInput.value !== color) colorInput.value = color;
+    if(opacityInput && Number(opacityInput.value) !== opacity) opacityInput.value = String(opacity);
+    if(opacityValue) opacityValue.textContent = `${Math.round(opacity)}%`;
+}
+function refreshMaskPreviewStyle(){ syncMaskPreviewControls(); normalizeMaskPreviewCanvas(); }
 function setupDrawStyle(ctx){
     ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.lineWidth = editBrushSize();
-    ctx.strokeStyle = imageEditMode === 'mask' ? MASK_BRUSH_COLOR : brushColor();
-    ctx.fillStyle = imageEditMode === 'mask' ? MASK_BRUSH_COLOR : brushColor();
+    const drawColor = imageEditMode === 'mask'
+        ? CanvasMaskPreviewStyle.drawRgba(maskPreviewColor(), MASK_DRAW_ALPHA)
+        : brushColor();
+    ctx.strokeStyle = drawColor;
+    ctx.fillStyle = drawColor;
     ctx.globalCompositeOperation = 'source-over';
 }
 function normalizeMaskPreviewCanvas(canvasEl=editDrawCanvas()){
     if(imageEditMode !== 'mask' || !canvasEl?.width || !canvasEl?.height) return;
     const ctx = canvasEl.getContext('2d');
     const imageData = ctx.getImageData(0, 0, canvasEl.width, canvasEl.height);
-    const data = imageData.data;
-    let changed = false;
-    for(let i = 0; i < data.length; i += 4){
-        if(data[i + 3] <= 0) continue;
-        data[i] = 255;
-        data[i + 1] = 255;
-        data[i + 2] = 255;
-        if(data[i + 3] > MASK_BRUSH_ALPHA) data[i + 3] = MASK_BRUSH_ALPHA;
-        changed = true;
-    }
-    if(changed) ctx.putImageData(imageData, 0, 0);
+    const result = CanvasMaskPreviewStyle.recolorImageData(imageData, {
+        color:maskPreviewColor(),
+        opacityPercent:maskPreviewOpacity(),
+        threshold:MASK_EXPORT_ALPHA_THRESHOLD
+    });
+    if(result.changed) ctx.putImageData(imageData, 0, 0);
 }
 function strokeFreeDrawPoint(point){
     if(!editDrawState) return;
@@ -12182,14 +12723,15 @@ function renderCropBox(){
     const img = document.getElementById('cropImage');
     const draw = editDrawCanvas();
     const textCanvas = editTextCanvas();
+    cropCanvasEl?.style.setProperty('--outpaint-background', outpaintBackgroundColor);
     let boxX = cropState.x;
     let boxY = cropState.y;
     if(imageEditMode === 'outpaint' && cropCanvasEl && img){
-        cropCanvasEl.style.width = `${Math.round(cropState.w)}px`;
-        cropCanvasEl.style.height = `${Math.round(cropState.h)}px`;
+        cropCanvasEl.style.width = `${cropState.w}px`;
+        cropCanvasEl.style.height = `${cropState.h}px`;
         img.style.position = 'absolute';
-        img.style.left = `${Math.round(cropState.x)}px`;
-        img.style.top = `${Math.round(cropState.y)}px`;
+        img.style.left = `${cropState.x}px`;
+        img.style.top = `${cropState.y}px`;
         boxX = 0;
         boxY = 0;
         if(draw){
@@ -12228,16 +12770,36 @@ function renderCropBox(){
         outpaintFrame.style.height = `${cropState.h}px`;
     }
 }
-function outpaintNaturalSize(){
+function currentOutpaintOutputGeometry(){
     const img = document.getElementById('cropImage');
-    if(!img || !cropState) return {w:1, h:1};
+    if(!img || !cropState) return {w:1, h:1, dx:0, dy:0};
     const display = cropImageDisplaySize();
+    const geometry = window.ImageOutpaintGeometry;
+    if(geometry?.outputGeometry){
+        return window.ImageOutpaintGeometry.outputGeometry({
+            canvasW:cropState.w,
+            canvasH:cropState.h,
+            sourceX:cropState.x,
+            sourceY:cropState.y,
+            sourceDisplayW:display.w || img.clientWidth || 1,
+            sourceDisplayH:display.h || img.clientHeight || 1,
+            naturalW:img.naturalWidth || 1,
+            naturalH:img.naturalHeight || 1,
+            preset:outpaintAspectPreset
+        });
+    }
     const scaleX = Math.max(1, Number(img.naturalWidth || 1)) / Math.max(1, Number(display.w || img.clientWidth || 1));
     const scaleY = Math.max(1, Number(img.naturalHeight || 1)) / Math.max(1, Number(display.h || img.clientHeight || 1));
     return {
         w:Math.max(1, Math.round((cropState.w || 1) * scaleX)),
-        h:Math.max(1, Math.round((cropState.h || 1) * scaleY))
+        h:Math.max(1, Math.round((cropState.h || 1) * scaleY)),
+        dx:Math.round((cropState.x || 0) * scaleX),
+        dy:Math.round((cropState.y || 0) * scaleY)
     };
+}
+function outpaintNaturalSize(){
+    const geometry = currentOutpaintOutputGeometry();
+    return {w:geometry.w, h:geometry.h};
 }
 function updateOutpaintResolutionLabel(){
     const label = document.getElementById('outpaintResolution');
@@ -12261,10 +12823,10 @@ function resetOutpaintBox(){
     ensureImageEditBaseSize(true);
     applyImageEditZoom();
     const {w, h} = cropBounds();
-    cropState.w = w;
-    cropState.h = h;
-    cropState.x = 0;
-    cropState.y = 0;
+    const next = outpaintAspectRatio && window.ImageOutpaintGeometry?.minimumCanvasForSource
+        ? window.ImageOutpaintGeometry.minimumCanvasForSource(w, h, outpaintAspectPreset)
+        : {x:0, y:0, w, h};
+    Object.assign(cropState, next);
     clampOutpaint();
     renderCropBox();
 }
@@ -12281,6 +12843,36 @@ function syncCropRatioButtons(){
     document.querySelectorAll('[data-crop-ratio]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.cropRatio === cropAspectPreset);
     });
+}
+function syncOutpaintRatioButtons(){
+    document.querySelectorAll('[data-outpaint-ratio]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.outpaintRatio === outpaintAspectPreset);
+    });
+}
+function syncOutpaintBackgroundControls(){
+    const input = document.getElementById('outpaintBackgroundColor');
+    const label = document.getElementById('outpaintBackgroundValue');
+    if(input && input.value.toLowerCase() !== outpaintBackgroundColor) input.value = outpaintBackgroundColor;
+    if(label) label.textContent = outpaintBackgroundColor.toUpperCase();
+    document.getElementById('cropCanvas')?.style.setProperty('--outpaint-background', outpaintBackgroundColor);
+}
+function setOutpaintBackgroundColor(value=DEFAULT_OUTPAINT_BACKGROUND){
+    outpaintBackgroundColor = window.ImageOutpaintGeometry?.normalizeColor
+        ? window.ImageOutpaintGeometry.normalizeColor(value, DEFAULT_OUTPAINT_BACKGROUND)
+        : (/^#[0-9a-f]{6}$/i.test(String(value || '')) ? String(value).toLowerCase() : DEFAULT_OUTPAINT_BACKGROUND);
+    syncOutpaintBackgroundControls();
+}
+function setOutpaintAspectPreset(preset='free'){
+    outpaintAspectPreset = preset || 'free';
+    outpaintAspectRatio = cropRatioFromPreset(outpaintAspectPreset);
+    syncOutpaintRatioButtons();
+    if(cropState && imageEditMode === 'outpaint' && outpaintAspectRatio){
+        const {w, h} = cropBounds();
+        const next = window.ImageOutpaintGeometry?.minimumCanvasForSource?.(w, h, outpaintAspectPreset);
+        if(next) Object.assign(cropState, next);
+        clampOutpaint();
+        renderCropBox();
+    }
 }
 function fitCropRectToAspect(ratio, sourceRect=null){
     const {w:boundsW, h:boundsH} = cropBounds();
@@ -12407,6 +12999,8 @@ function openImageEditor(nodeId, imageIndex=0){
     gridOperationMode = 'split'; gridJoinLayout = null; gridJoinDrag = null; gridJoinImageCache = new Map(); gridJoinUserMoved = false; gridJoinGroupId = '';
     imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageResizeScale = 0.5; imageEditModeTouched = false;
     cropAspectPreset = 'free'; cropAspectRatio = null; syncCropRatioButtons();
+    outpaintAspectPreset = 'free'; outpaintAspectRatio = null; outpaintBackgroundColor = DEFAULT_OUTPAINT_BACKGROUND;
+    syncOutpaintRatioButtons(); syncOutpaintBackgroundControls();
     editTextItems = []; editTextSelectedId = ''; editTextDrag = null; editTextDirty = false;
     const toggle = document.getElementById('gridCustomToggle');
     if(toggle){ toggle.classList.add('secondary'); toggle.classList.remove('primary'); }
@@ -12508,6 +13102,8 @@ function closeImageEditor(){
     previewNavState = {nodeId:'', index:0, count:0};
     imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageResizeScale = 0.5; imageEditModeTouched = false;
     cropAspectPreset = 'free'; cropAspectRatio = null; syncCropRatioButtons();
+    outpaintAspectPreset = 'free'; outpaintAspectRatio = null; outpaintBackgroundColor = DEFAULT_OUTPAINT_BACKGROUND;
+    syncOutpaintRatioButtons(); syncOutpaintBackgroundControls();
     disposePanoramaPreview();
     previewPanDrag = null; previewCompareDrag = false; imageEditPanDrag = null; resetPreviewTransform();
     document.getElementById('imageEditStage')?.classList.remove('overflow-x', 'overflow-y', 'preview-mode');
@@ -12538,6 +13134,15 @@ function beginCropDrag(event, mode){
 function resizeOutpaintFromDrag(dx, dy){
     const start = cropDrag?.start;
     if(!start) return;
+    if(outpaintAspectRatio && window.ImageOutpaintGeometry?.resizeCanvasAroundSource){
+        const {w, h} = cropBounds();
+        const handle = String(cropDrag.mode || '').replace(/^outpaint-/, '') || 'corner';
+        Object.assign(cropState, window.ImageOutpaintGeometry.resizeCanvasAroundSource(
+            start, w, h, handle, dx, dy, outpaintAspectPreset
+        ));
+        clampOutpaint();
+        return;
+    }
     let growX = 0, growY = 0;
     if(cropDrag.mode === 'outpaint-left') growX = -dx;
     else if(cropDrag.mode === 'outpaint-right') growX = dx;
@@ -12686,15 +13291,15 @@ async function applyImageOutpaint(){
     const img = document.getElementById('cropImage');
     if(!node || !image || !img.naturalWidth || !img.naturalHeight) return;
     clampOutpaint();
-    const scaleX = img.naturalWidth / (img.clientWidth || 1), scaleY = img.naturalHeight / (img.clientHeight || 1);
-    const outW = Math.max(img.naturalWidth, Math.round(cropState.w * scaleX));
-    const outH = Math.max(img.naturalHeight, Math.round(cropState.h * scaleY));
-    const dx = Math.round(cropState.x * scaleX);
-    const dy = Math.round(cropState.y * scaleY);
+    const output = currentOutpaintOutputGeometry();
+    const outW = output.w;
+    const outH = output.h;
+    const dx = output.dx;
+    const dy = output.dy;
     const canvasEl = document.createElement('canvas');
     canvasEl.width = outW; canvasEl.height = outH;
     const ctx = canvasEl.getContext('2d');
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = outpaintBackgroundColor;
     ctx.fillRect(0, 0, outW, outH);
     ctx.drawImage(img, dx, dy, img.naturalWidth, img.naturalHeight);
     const blob = await new Promise(resolve => canvasEl.toBlob(resolve, 'image/png'));
@@ -12702,7 +13307,7 @@ async function applyImageOutpaint(){
     const file = blob ? await uploadCroppedBlob(blob, `${base}_outpaint.png`) : null;
     if(file && replaceEditedImage(file)){
         applyOutpaintSizeToSmartParams(outW, outH);
-        setPromptDraftForNode(node, 'Remove white area and fill the scene');
+        setPromptDraftForNode(node, 'Remove the solid-color padding and fill the scene');
         promptInput.dataset.preserveDraftOnce = '1';
         closeImageEditor();
         render();
@@ -14009,6 +14614,27 @@ function smartLoopPrompt(node, ctx=smartLoopContext){
         .replaceAll('[进度]', `${index}/${total}`)
         .trim();
 }
+function smartLoopImageStartForRound(roundValue, batchValue){
+    const round = Math.max(1, Number(roundValue) || 1);
+    const batchSize = Math.max(1, Math.min(100, Number(batchValue) || 1));
+    return (round - 1) * batchSize;
+}
+function smartLoopWindowState(totalValue, roundValue, batchValue){
+    const total = Math.max(0, Math.floor(Number(totalValue) || 0));
+    const batchSize = Math.max(1, Math.min(100, Number(batchValue) || 1));
+    const startIndex = smartLoopImageStartForRound(roundValue, batchSize);
+    const rangeAt = index => {
+        if(index >= total) return null;
+        const count = Math.min(batchSize, total - index);
+        return {start:index + 1, end:index + count, count};
+    };
+    return {
+        total,
+        skippedCount:Math.min(total, startIndex),
+        current:rangeAt(startIndex),
+        next:rangeAt(startIndex + batchSize),
+    };
+}
 function smartLoopInputImages(node, ctx=smartLoopContext){
     if(!node?.imageInput) return [];
     const refs = inputNodesFor(node).flatMap(input => {
@@ -14018,9 +14644,10 @@ function smartLoopInputImages(node, ctx=smartLoopContext){
     if(!refs.length) return [];
     const startBase = Math.max(1, Number(node.loopStart) || 1);
     const batchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
-    const currentIndex = Math.max(1, Number(ctx?.index || startBase) || startBase);
-    return refs.slice(Math.max(0, currentIndex - 1), Math.max(0, currentIndex - 1) + batchSize)
-        .map((img, i) => ({...img, name:img.name || trf('canvas.loopImageLabel', {n:currentIndex + i})}));
+    const currentRound = Math.max(1, Number(ctx?.index || startBase) || startBase);
+    const start = smartLoopImageStartForRound(currentRound, batchSize);
+    return refs.slice(start, start + batchSize)
+        .map((img, i) => ({...img, name:img.name || trf('canvas.loopImageLabel', {n:start + i + 1})}));
 }
 function smartLoopPreviewImages(node){
     if(!node?.imageInput) return [];
@@ -14043,7 +14670,10 @@ function selfReferenceImagesForNode(node, consume=false, ctx=smartLoopContext){
 }
 function textForNode(node, ctx=smartLoopContext){
     if(!node) return '';
-    if(node.type === 'smart-prompt') return promptNodePromptItems(node).join('\n\n');
+    if(node.type === 'smart-prompt'){
+        const text = node.llmEnabled ? smartPromptLLMResultText(node, ctx) : node.text;
+        return promptNodePromptItems(node, text).join('\n\n');
+    }
     if(node.type === 'smart-loop') return smartLoopPrompt(node, ctx);
     if(node.type === 'smart-group') return smartGroupMembers(node).map(member => textForNode(member, ctx)).filter(Boolean).join('\n\n');
     return '';
@@ -15857,8 +16487,7 @@ async function runSmartCascade(targetNode=null){
     pushUndo();
     const totalRounds = loop?.count || 1;
     const startIndex = Math.max(1, Number(loop?.node?.loopStart) || 1);
-    const batchSize = loop?.node?.imageInput ? Math.max(1, Math.min(100, Number(loop.node.imageBatchSize) || 1)) : 1;
-    const endIndex = startIndex + (totalRounds - 1) * batchSize;
+    const endIndex = startIndex + totalRounds - 1;
     const loopMode = loop?.mode === 'parallel' ? 'parallel' : 'serial';
     const parallelLimit = loopMode === 'parallel' && totalRounds > 1 ? smartCascadeParallelLimit(chain) : 1;
     const precreateSingleSlots = singleNodeLoopRun && loopMode === 'parallel' && totalRounds > 1 && parallelLimit > 1;
@@ -15869,7 +16498,7 @@ async function runSmartCascade(targetNode=null){
     }
     if(singleNodeLoopRun){
         singleLoopSlots = Array.from({length:totalRounds}, (_, round) => {
-            const loopIndex = startIndex + round * batchSize;
+            const loopIndex = startIndex + round;
             const slot = loopOutputSlotForRound(tail, loop.node, loopIndex, round);
             return slot ? tagLoopOutputSlot(slot, tail, loop.node, loopIndex, round) : null;
         });
@@ -15877,7 +16506,7 @@ async function runSmartCascade(targetNode=null){
         if(precreateSingleSlots){
             for(let slotOffset = 0; slotOffset < totalRounds; slotOffset++){
                 if(singleLoopSlots[slotOffset]) continue;
-                const loopIndex = startIndex + slotOffset * batchSize;
+                const loopIndex = startIndex + slotOffset;
                 singleLoopSlots[slotOffset] = createLoopOutputSlot(tail, loopIndex, slotOffset, {queued:true, loopNode:loop.node, slotIndex:slotOffset, runState});
             }
         }
@@ -15902,7 +16531,7 @@ async function runSmartCascade(targetNode=null){
             if(singleNodeLoopRun){
                 const refs = refsForDirectLoopRound(loop.node, loopIndex, endIndex);
                 if(directLoopTargetRun && parallelLimit === 1) showDirectLoopRoundPreview(loop.node, tail, refs, loopIndex, endIndex);
-                const slotIndex = Math.max(0, Math.floor((loopIndex - startIndex) / batchSize));
+                const slotIndex = Math.max(0, loopIndex - startIndex);
                 const outputTarget = tagLoopOutputSlot(
                     options.outputTarget || singleLoopSlots[slotIndex] || loopOutputSlotForRound(tail, loop.node, loopIndex, slotIndex) || createLoopOutputSlot(tail, loopIndex, slotIndex, {loopNode:loop.node, slotIndex, runState}),
                     tail,
@@ -15995,7 +16624,7 @@ async function runSmartCascade(targetNode=null){
             producedRefs.set(graph.root.id, rootRefs);
             await runBranch(graph.root, rootRefs);
         };
-        const roundIndexes = Array.from({length:totalRounds}, (_, round) => startIndex + round * batchSize);
+        const roundIndexes = Array.from({length:totalRounds}, (_, round) => startIndex + round);
         if(loopMode === 'parallel' && totalRounds > 1){
             const parallelTargets = singleNodeLoopRun
                 ? singleLoopSlots
@@ -16231,11 +16860,19 @@ async function runGeneration(){
 async function runPromptLLMNode(nodeId){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || node.type !== 'smart-prompt') return;
+    if(node.running || smartPromptLLMTaskIsPending(node)) return;
+    const hasCompletedResult = node.runStatus === 'done' || node.llmResultKey || (Array.isArray(node.llmResultMemory) && node.llmResultMemory.length);
+    if(!String(node.llmInstruction || '').trim() && !String(node.llmInputSeed || '').trim() && !hasCompletedResult){
+        node.llmInputSeed = promptNodePromptItems(node).join('\n\n').trim();
+    }
     const message = promptNodeLLMInputText(node).trim();
     if(!message){ toast(tr('smart.promptLlmNeedText')); return; }
+    const inputKey = smartPromptLLMInputKey(node);
     const systemPrompt = (node.llmSystemPrompt || '').trim();
     node.llmEnabled = true;
     node.running = true;
+    node.runStatus = 'running';
+    node.runError = '';
     render();
     try {
         const provider = resolveChatProviderId(node.llmProvider || '');
@@ -16243,32 +16880,31 @@ async function runPromptLLMNode(nodeId){
         const mediaRefs = promptNodeInputMediaForLLM(node);
         const images = imageRefsOnly(mediaRefs).map(img => img.url).filter(Boolean);
         const videos = videoRefsOnly(mediaRefs).map(video => video.url).filter(Boolean);
-        const result = await fetch('/api/canvas-llm', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({
-                message,
-                messages:[],
-                images,
-                videos,
-                model,
-                provider,
-                ms_model: provider === 'modelscope' ? model : '',
-                system_prompt:node.llmSystemEnabled ? (systemPrompt || 'You are a helpful prompt assistant.') : ''
-            })
-        }).then(async r => {
-            if(!r.ok) throw new Error(await r.text());
-            return r.json();
+        await submitSmartPromptLLMTask(node, {
+            canvas_id:canvasId,
+            node_id:node.id,
+            mode:'smart-prompt',
+            client_id:smartClientId,
+            message,
+            messages:[],
+            images,
+            videos,
+            model,
+            provider,
+            ms_model: provider === 'modelscope' ? model : '',
+            system_prompt:node.llmSystemEnabled ? (systemPrompt || 'You are a helpful prompt assistant.') : '',
+            input_key:inputKey
         });
-        node.text = (result.text || '').trim();
         node.llmProvider = provider;
         node.llmModel = model;
-        scheduleSave();
-    } catch(e) {
-        toast((e.message || tr('smart.promptLlmFailed')).slice(0, 160));
-    } finally {
-        node.running = false;
         render();
+    } catch(e) {
+        clearSmartPromptLLMTransientState(node);
+        node.runStatus = 'failed';
+        node.runError = e.message || tr('smart.promptLlmFailed');
+        toast(node.runError.slice(0, 160));
+        render();
+        scheduleSave();
     }
 }
 function comfyFieldKind(field){
@@ -16277,19 +16913,33 @@ function comfyFieldKind(field){
     if(field?.type === 'textarea' || /prompt|text|提示词|正向|负向/.test(key)) return 'prompt';
     return 'setting';
 }
+function adaptiveRatioForRun(refs, runSettings=settings){
+    if(runSettings?.ratio !== 'source') return '';
+    const sizedRef = imageRefsOnly(refs).find(ref => imageSizeForRatio(ref));
+    const sourceSize = imageSizeForRatio(sizedRef);
+    if(sourceSize){
+        return ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(sourceSize.w, sourceSize.h) || '1:1';
+    }
+    return ADAPTIVE_RATIO_TOOLS?.closestSupportedRatioValue(runSettings.customRatio || '') || '1:1';
+}
 async function runApiGeneration(prompt, refs, runSettings=settings){
     if(!runSettings.provider_id || !runSettings.model) throw new Error(tr('smart.errNoApiModel'));
     const count = Math.max(1, Math.min(8, Number(runSettings.count || 1)));
+    const adaptiveRatio = adaptiveRatioForRun(refs, runSettings);
+    const requestSettings = adaptiveRatio ? {...runSettings, customRatio:adaptiveRatio} : runSettings;
+    const referenceImages = imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX).map(ref => (
+        adaptiveRatio ? {...ref, stretch_aspect_ratio:adaptiveRatio} : ref
+    ));
     const payload = {
         prompt,
         provider_id:runSettings.provider_id,
         model:runSettings.model,
-        size:sizeForRun(runSettings),
-        aspect_ratio:API_RATIO_VALUES[runSettings.ratio] || (runSettings.ratio === 'custom' ? String(runSettings.customRatio || '').trim() : ''),
+        size:sizeForRun(requestSettings),
+        aspect_ratio:adaptiveRatio || API_RATIO_VALUES[runSettings.ratio] || (runSettings.ratio === 'custom' ? String(runSettings.customRatio || '').trim() : ''),
         resolution:['1k','2k','4k'].includes(runSettings.resolution) ? runSettings.resolution : '',
         quality:runSettings.quality || 'auto',
         n:1,
-        reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX)
+        reference_images:referenceImages
     };
     const tasks = await Promise.all(Array.from({length:count}, () => fetch('/api/canvas-image-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(async r => {
         if(!r.ok) throw new Error(await r.text());
@@ -17233,7 +17883,7 @@ function finishSelection(event){
     const b = screenToWorld(event);
     const minX = Math.min(a.x, b.x), minY = Math.min(a.y, b.y);
     const maxX = Math.max(a.x, b.x), maxY = Math.max(a.y, b.y);
-    selectedIds = nodes.filter(node => {
+    selectedIds = nodes.filter(node => !isCanvasFrameNode(node)).filter(node => {
         const r = nodeRect(node);
         return r.x < maxX && r.x + r.width > minX && r.y < maxY && r.y + r.height > minY;
     }).map(n => n.id);
@@ -17670,8 +18320,8 @@ window.onmousemove = e => {
         if(!node) return;
         const dx = (e.clientX - resizeState.startX) / viewport.scale;
         const dy = (e.clientY - resizeState.startY) / viewport.scale;
-        const minW = node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : node.type === 'smart-group' ? SMART_GROUP_MIN_WIDTH : 48;
-        const minH = node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : node.type === 'smart-group' ? SMART_GROUP_MIN_HEIGHT : 48;
+        const minW = isCanvasFrameNode(node) ? 240 : node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : node.type === 'smart-group' ? SMART_GROUP_MIN_WIDTH : 48;
+        const minH = isCanvasFrameNode(node) ? 160 : node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : node.type === 'smart-group' ? SMART_GROUP_MIN_HEIGHT : 48;
         if(node.type === 'smart-group' && smartGroupImageRefs(node).some(ref => ref.item?.url)){
             // 图片分组：和普通节点一样直接改 w/h，缩略图网格按新尺寸实时重排。不要走下面的“成员缩放”那套，
             // 否则拖动过程里会按成员包围盒/缩放比例收缩，松手才回到拖动宽度（用户反馈的“变宽时先缩小”）。
@@ -17948,7 +18598,7 @@ window.onmouseup = e => {
         // 拖入分组：单个节点、多选（批量拖入）或整个分组（其成员会并入目标分组）都允许并入主分组下的目标分组。
         // 目标分组由主拖动节点的中心命中决定；smartGroupTargetForDraggedNode 已排除正在被拖动的节点/分组。
         const draggedNodes = (dragState.group || []).map(item => nodes.find(n => n.id === item.id)).filter(Boolean);
-        const smartGroupTarget = draggedNode ? smartGroupTargetForDraggedNode(draggedNode) : null;
+        const smartGroupTarget = draggedNode && !dragState.isFrameDrag ? smartGroupTargetForDraggedNode(draggedNode) : null;
         if(
             insertHit &&
             insertLoopNodeIntoConnection(draggedNode, insertHit)
@@ -18009,7 +18659,19 @@ window.onmouseup = e => {
         }
         if(dragState.thumbDetached) stateChanged = true;
         // 拖出（没落到任何分组上）：普通节点退出所在分组；子分组退出时把它并入过的成员从主分组里撤掉。
-        if(draggedNode && !smartGroupTarget && pruneSmartGroupMembershipsForNode(draggedNode)){
+        if(draggedNode && !dragState.isFrameDrag && !smartGroupTarget && pruneSmartGroupMembershipsForNode(draggedNode)){
+            stateChanged = true;
+            render();
+        }
+        if(!dragState.isFrameDrag && SpatialFrames?.updateMembershipAfterDrop?.(
+            nodes,
+            dragState.rootIds || [dragState.id],
+            node => {
+                const rect = nodeRect(node);
+                return {x:rect.x, y:rect.y, w:rect.width, h:rect.height};
+            },
+            {groupTypes:['smart-group']}
+        )){
             stateChanged = true;
             render();
         }
@@ -18019,6 +18681,7 @@ window.onmouseup = e => {
         clearDropHighlight();
         loopInsertPreview = null;
         dragState = null;
+        renderSmartSelectionHub();
         scheduleSave();
         scheduleConnectionLayerRefresh();
     }
@@ -18706,6 +19369,15 @@ document.querySelectorAll('[data-crop-ratio]').forEach(btn => {
         setCropAspectPreset(btn.dataset.cropRatio || 'free');
     });
 });
+document.querySelectorAll('[data-outpaint-ratio]').forEach(btn => {
+    btn.addEventListener('click', event => {
+        event.stopPropagation();
+        setOutpaintAspectPreset(btn.dataset.outpaintRatio || 'free');
+    });
+});
+document.getElementById('outpaintBackgroundColor')?.addEventListener('input', event => {
+    setOutpaintBackgroundColor(event.target.value);
+});
 document.getElementById('outpaintFrame').addEventListener('mousedown', event => {
     if(event.target.closest('[data-outpaint-handle]')) return;
     beginCropDrag(event, 'image');
@@ -18839,6 +19511,9 @@ document.getElementById('editTextCanvas')?.addEventListener('dblclick', event =>
     if(!control) return;
     control.addEventListener('input', syncSelectedEditTextStyleFromBrush);
     control.addEventListener('change', () => { editTextDirty = false; });
+});
+['maskPreviewColor','maskPreviewOpacity'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', refreshMaskPreviewStyle);
 });
 ['gridHorizontalLines','gridVerticalLines','gridGapSize'].forEach(id => {
     document.getElementById(id).addEventListener('input', () => {

@@ -1,4 +1,5 @@
 import json
+import copy
 import uuid
 import base64
 import hashlib
@@ -38,6 +39,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
+
+# The bundled Windows runtime uses an isolated python._pth and does not add the
+# script directory to sys.path automatically. Keep repository-local helpers
+# importable both there and in a regular Python environment.
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+import backup_transfer as backup_io
 
 QUIET_ACCESS_PATHS = {
     "/api/queue_status",
@@ -162,20 +173,15 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.06.03"
-GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
-GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
-GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
-GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main"
+APP_VERSION = "2026.08.09-custom.1"
+CUSTOM_MAINTAINER = "qianse70"
+CUSTOM_UPDATE_BRANCH = "my-custom"
+UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
+GITHUB_REPO_URL = "https://github.com/MAOMAOCHONGNE/Infinite-Canvas"
+GITHUB_VERSION_URL = f"https://raw.githubusercontent.com/MAOMAOCHONGNE/Infinite-Canvas/{CUSTOM_UPDATE_BRANCH}/VERSION"
+GITHUB_TREE_URL = f"https://api.github.com/repos/MAOMAOCHONGNE/Infinite-Canvas/git/trees/{CUSTOM_UPDATE_BRANCH}?recursive=1"
+GITHUB_RAW_ROOT = f"https://raw.githubusercontent.com/MAOMAOCHONGNE/Infinite-Canvas/{CUSTOM_UPDATE_BRANCH}"
 GITHUB_UPDATE_NOTES_URL = GITHUB_RAW_ROOT + "/static/update-notes.json"
-MODELSCOPE_REPO_URL = "https://modelscope.ai/studios/daniel8152/Infinite-Canvas"
-MODELSCOPE_RAW_ROOT = "https://www.modelscope.ai/studios/daniel8152/Infinite-Canvas/raw/main"
-# ModelScope 仓库默认分支为 master；raw 网页路径会返回 HTML，必须用仓库文件 API 才能拿到纯文本
-# 注意：.ai 站命名空间为小写 daniel8152，API 路径大小写敏感（推送/文件 API 用大写会 404/拒绝）
-MODELSCOPE_FILE_API_ROOT = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo?Revision=master&FilePath="
-MODELSCOPE_VERSION_URL = MODELSCOPE_FILE_API_ROOT + "VERSION"
-MODELSCOPE_UPDATE_NOTES_URL = MODELSCOPE_FILE_API_ROOT + "static/update-notes.json"
-MODELSCOPE_TREE_URL = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo/files?Revision=master&Recursive=true"
 
 @app.on_event("startup")
 async def startup_event():
@@ -235,6 +241,8 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 CONVERSATION_DIR = os.path.join(DATA_DIR, "conversations")
 CANVAS_DIR = os.path.join(DATA_DIR, "canvases")
 MEDIA_PREVIEW_DIR = os.path.join(DATA_DIR, "media_previews")
+MEDIA_PREVIEW_BUILD_REGISTRY_GUARD = Lock()
+MEDIA_PREVIEW_BUILD_REGISTRY = {}
 ASSET_LIBRARY_PATH = os.path.join(DATA_DIR, "asset_library.json")
 PROMPT_LIBRARY_PATH = os.path.join(DATA_DIR, "prompt_libraries.json")
 API_PROVIDERS_FILE = os.path.join(DATA_DIR, "api_providers.json")
@@ -302,6 +310,9 @@ HISTORY_LOCK = Lock()
 GLOBAL_CONFIG_LOCK = Lock()
 CONVERSATION_LOCK = Lock()
 CANVAS_LOCK = Lock()
+BACKUP_IMPORT_LOCK = Lock()
+BACKUP_DOWNLOAD_LOCK = Lock()
+BACKUP_DOWNLOADS = {}
 LOAD_LOCK = Lock()
 RUNNINGHUB_WORKFLOW_LOCK = Lock()
 NEXT_TASK_ID = 1
@@ -975,7 +986,7 @@ def normalize_ms_loras(values):
         })
     return normalized
 
-def normalize_runninghub_entry(raw, kind):
+def normalize_runninghub_entry(raw, kind, fallback_order=0):
     if not isinstance(raw, dict):
         return None
     raw_id = raw.get("appId") if kind == "app" else raw.get("workflowId")
@@ -997,6 +1008,10 @@ def normalize_runninghub_entry(raw, kind):
         "thumbnail": thumb,
         "enabled": bool(raw.get("enabled", True)),
     }
+    try:
+        entry["sortOrder"] = max(0, int(raw.get("sortOrder", raw.get("sort_order", fallback_order))))
+    except Exception:
+        entry["sortOrder"] = max(0, int(fallback_order or 0))
     if raw.get("hidden") is True:
         entry["hidden"] = True
     fields = raw.get("fields")
@@ -1026,13 +1041,13 @@ def normalize_runninghub_entry(raw, kind):
 def normalize_runninghub_entries(values, kind):
     normalized = []
     seen = set()
-    for raw in values or []:
-        entry = normalize_runninghub_entry(raw, kind)
+    for source_index, raw in enumerate(values or []):
+        entry = normalize_runninghub_entry(raw, kind, source_index)
         if not entry or entry["id"] in seen:
             continue
         seen.add(entry["id"])
         normalized.append(entry)
-    return normalized
+    return sorted(normalized, key=lambda entry: int(entry.get("sortOrder", 0)))
 
 def runninghub_entry_id(entry, kind):
     if not isinstance(entry, dict):
@@ -1107,7 +1122,7 @@ def merge_runninghub_system_entries(system_entries, user_entries, kind):
         else:
             index[entry_id] = len(merged)
             merged.append(entry)
-    return merged
+    return sorted(merged, key=lambda entry: int(entry.get("sortOrder", 0)))
 
 def load_static_runninghub_provider():
     if not os.path.exists(STATIC_RUNNINGHUB_API_PROVIDERS_FILE):
@@ -1652,12 +1667,8 @@ def fetch_remote_update_notes(url: str, version: str = "", timeout: float = 5.0)
     return info
 
 def fetch_update_notes_with_fallback(preferred_source: str, version: str, timeout: float = 3.0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    urls = {
-        "github": GITHUB_UPDATE_NOTES_URL,
-        "modelscope": MODELSCOPE_UPDATE_NOTES_URL,
-    }
-    preferred = preferred_source if preferred_source in urls else "github"
-    order = [preferred, "modelscope" if preferred == "github" else "github"]
+    urls = {"github": GITHUB_UPDATE_NOTES_URL}
+    order = ["github"]
     notes_by_source: Dict[str, Any] = {}
     best_notes: Dict[str, Any] = {"version": version, "items": []}
     for source in order:
@@ -1853,20 +1864,16 @@ def app_info():
         "repo_url": GITHUB_REPO_URL,
         "version_url": GITHUB_VERSION_URL,
         "tree_url": GITHUB_TREE_URL,
+        "edition": CUSTOM_MAINTAINER,
+        "update_channel": CUSTOM_UPDATE_BRANCH,
+        "upstream_repo_url": UPSTREAM_REPO_URL,
         "sources": {
             "github": {
-                "label": "GitHub",
+                "label": "qianse70 GitHub",
                 "repo_url": GITHUB_REPO_URL,
                 "version_url": GITHUB_VERSION_URL,
                 "tree_url": GITHUB_TREE_URL,
                 "update_notes_url": GITHUB_UPDATE_NOTES_URL,
-            },
-            "modelscope": {
-                "label": "ModelScope",
-                "repo_url": MODELSCOPE_REPO_URL,
-                "version_url": MODELSCOPE_VERSION_URL,
-                "tree_url": MODELSCOPE_TREE_URL,
-                "update_notes_url": MODELSCOPE_UPDATE_NOTES_URL,
             },
         },
         "update_notes": read_local_update_notes(version),
@@ -1907,12 +1914,9 @@ def connectivity_probe(name: str, url: str, timeout: float = 5.0) -> Dict[str, A
 
 def update_connectivity_targets() -> List[Tuple[str, str, str, bool]]:
     return [
-        ("GitHub 更新列表", GITHUB_TREE_URL, "github", True),
-        ("GitHub 版本文件", GITHUB_VERSION_URL, "github", True),
-        ("GitHub 主页", "https://github.com/", "github", False),
-        ("ModelScope 版本文件", MODELSCOPE_VERSION_URL, "modelscope", True),
-        ("ModelScope 空间页面", MODELSCOPE_REPO_URL, "modelscope", False),
-        ("ModelScope 主页", "https://modelscope.cn/", "modelscope", False),
+        ("定制版更新列表", GITHUB_TREE_URL, "github", True),
+        ("定制版版本文件", GITHUB_VERSION_URL, "github", True),
+        ("定制版项目主页", GITHUB_REPO_URL, "github", False),
         ("Google 连通性", "https://www.google.com/generate_204", "reference", False),
     ]
 
@@ -1937,7 +1941,7 @@ def update_connectivity():
         item["required"] = required
         results.append(item)
     sources = {}
-    for source in ("github", "modelscope"):
+    for source in ("github",):
         source_required = [item for item in results if item.get("source") == source and item.get("required")]
         sources[source] = {
             "ok": all(item["ok"] for item in source_required),
@@ -1948,7 +1952,7 @@ def update_connectivity():
         "results": results,
         "sources": sources,
         "required": sources["github"]["required"],
-        "optional": ["GitHub 主页", "ModelScope 空间页面", "ModelScope 主页", "Google 连通性"],
+        "optional": ["定制版项目主页", "Google 连通性"],
     }
 
 def fetch_remote_version(url: str, timeout: float = 5.0) -> Dict[str, Any]:
@@ -1992,29 +1996,13 @@ def version_gt(a: str, b: str) -> bool:
 
 @app.get("/api/check-update")
 def check_update():
-    """服务端检测 GitHub 与 ModelScope 两个源的远端版本（走系统代理，避免浏览器跨域/被墙）。"""
+    """只检测 qianse70 定制仓库，避免任何上游回退覆盖本地定制。"""
     current = current_app_version()
-    # 并发检测两个源，避免串行 8s+8s 拖慢首屏更新提示
-    holder: Dict[str, Dict[str, Any]] = {}
-    def _probe(key: str, url: str):
-        item = fetch_remote_version(url, timeout=5.0)
-        item["source"] = key
-        holder[key] = item
-    threads = [
-        Thread(target=_probe, args=("github", GITHUB_VERSION_URL), daemon=True),
-        Thread(target=_probe, args=("modelscope", MODELSCOPE_VERSION_URL), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=5.5)
-    github = holder.get("github") or {"version": "", "ok": False, "error": "检测超时（超过 5s）", "url": GITHUB_VERSION_URL, "source": "github"}
-    modelscope = holder.get("modelscope") or {"version": "", "ok": False, "error": "检测超时（超过 5s）", "url": MODELSCOPE_VERSION_URL, "source": "modelscope"}
+    github = fetch_remote_version(GITHUB_VERSION_URL, timeout=5.0)
+    github["source"] = "github"
     best: Dict[str, Any] = {}
-    for item in (github, modelscope):
-        if item["ok"] and item["version"]:
-            if not best or version_gt(item["version"], best["version"]):
-                best = {"source": item["source"], "version": item["version"]}
+    if github["ok"] and github["version"]:
+        best = {"source": "github", "version": github["version"]}
     update_available = bool(best and version_gt(best["version"], current))
     notes_by_source: Dict[str, Any] = {}
     if best and best.get("version"):
@@ -2023,12 +2011,11 @@ def check_update():
     return {
         "current": current,
         "github": github,
-        "modelscope": modelscope,
         "latest": best,
         "update_notes": best.get("update_notes") if best else {},
         "update_notes_sources": notes_by_source,
         "update_available": update_available,
-        "reachable": bool(github["ok"] or modelscope["ok"]),
+        "reachable": bool(github["ok"]),
     }
 
 def update_allowed_file(path: str) -> bool:
@@ -2099,49 +2086,6 @@ def download_github_update_files(files: List[str], staging_root: str) -> None:
         os.makedirs(os.path.dirname(stage_path), exist_ok=True)
         with open(stage_path, "wb") as f:
             f.write(data)
-
-def modelscope_update_file_list() -> List[str]:
-    """通过 ModelScope 仓库文件 API 列出所有允许更新的文件（不依赖 git）。"""
-    resp = github_get(MODELSCOPE_TREE_URL, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=30)
-    payload = json.loads(resp.content.decode("utf-8", errors="replace"))
-    files_node = ((payload.get("Data") or {}).get("Files")) or []
-    out: List[str] = []
-    for entry in files_node:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("Type") != "blob":
-            continue
-        path = str(entry.get("Path") or "").replace("\\", "/")
-        if update_allowed_file(path):
-            out.append(path)
-    return sorted(set(out))
-
-def modelscope_file_bytes(rel: str) -> bytes:
-    url = MODELSCOPE_FILE_API_ROOT + urllib.parse.quote(rel, safe="/")
-    resp = github_get(url, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=60)
-    return resp.content
-
-def download_modelscope_update_files(staging_root: str) -> List[str]:
-    # 用 HTTP 仓库文件 API 下载（与 GitHub raw 同样思路），不依赖本机安装 Git。
-    # 之前用 git clone 会要求目标机装 Git for Windows，很多用户没装 → 一键更新失败。
-    files = modelscope_update_file_list()
-    if not files:
-        raise RuntimeError("ModelScope 未返回任何文件")
-    if "main.py" not in files or "VERSION" not in files:
-        raise RuntimeError("ModelScope 更新源缺少 main.py 或 VERSION")
-    if not any(f.startswith("static/") for f in files):
-        raise RuntimeError("ModelScope 未返回 static 文件，已取消更新")
-    staging_root_abs = os.path.abspath(staging_root)
-    for rel in files:
-        safe_update_target(rel)
-        data = modelscope_file_bytes(rel)
-        stage_path = os.path.abspath(os.path.join(staging_root_abs, *rel.split("/")))
-        if os.path.commonpath([staging_root_abs, stage_path]) != staging_root_abs:
-            raise ValueError(f"更新暂存路径不安全：{rel}")
-        os.makedirs(os.path.dirname(stage_path), exist_ok=True)
-        with open(stage_path, "wb") as f:
-            f.write(data)
-    return files
 
 def safe_update_target(path: str) -> str:
     rel = str(path or "").replace("\\", "/").lstrip("/")
@@ -2239,7 +2183,7 @@ class UpdateRequest(BaseModel):
     auto_restart: bool = False
     restart_delay: int = 3
     source: str = "github"
-    fallback: bool = True
+    fallback: bool = False
 
 def github_update_file_list() -> Tuple[List[str], List[str], List[str]]:
     tree_data = github_json(GITHUB_TREE_URL, use_etag_cache=True)
@@ -2285,21 +2229,15 @@ def staged_update_file_list(staging_root: str) -> Tuple[List[str], List[str], Li
     static_files = sorted(set(static_files))
     return root_files, static_files, root_files + static_files
 
-UPDATE_SOURCE_LABELS = {"github": "GitHub", "modelscope": "ModelScope"}
+UPDATE_SOURCE_LABELS = {"github": "qianse70 GitHub"}
 
 def normalize_update_source(value: str) -> str:
-    source = str(value or "github").strip().lower()
-    if source == "ms":
-        return "modelscope"
-    if source not in {"github", "modelscope"}:
-        return "github"
-    return source
+    return "github"
 
 def stage_update_from_source(source: str, staging_root: str) -> Tuple[List[str], List[str], List[str]]:
     """下载指定源的更新文件到 staging，返回 (root_files, static_files, files)。失败抛异常。"""
-    if source == "modelscope":
-        download_modelscope_update_files(staging_root)
-        return staged_update_file_list(staging_root)
+    if source != "github":
+        raise RuntimeError("qianse70 定制版只允许从自有 GitHub 分支更新")
     root_files, static_files, files = github_update_file_list()
     download_github_update_files(files, staging_root)
     return root_files, static_files, files
@@ -2457,16 +2395,13 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         raise HTTPException(status_code=409, detail="正在更新中，请稍后再试")
     staging_root = ""
     requested_source = normalize_update_source(req.source)
-    # 冗余设计：先用用户选择的源，失败后自动切换到另一个源兜底，全部失败才报错
-    source_order = [requested_source]
-    if req.fallback:
-        other = "modelscope" if requested_source == "github" else "github"
-        source_order.append(other)
+    # 定制版只信任自己的发布分支；连接失败就安全停止，绝不回退到上游覆盖定制代码。
+    source_order = ["github"]
     try:
         backup_root = ""
         backup_manifest: Dict[str, Any] = {}
 
-        # 下载阶段（带兜底切换），任意源成功即停止
+        # 下载阶段只访问 qianse70 自有 GitHub 分支。
         source = requested_source
         root_files = static_files = files = None
         download_errors: List[str] = []
@@ -2790,6 +2725,7 @@ class AIReference(BaseModel):
     original_url: str = ""
     source_url: str = ""
     originalLocalUrl: str = ""
+    stretch_aspect_ratio: str = ""
 
 class OnlineImageRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
@@ -2837,6 +2773,8 @@ class ImageTaskQueryRequest(BaseModel):
 
 CANVAS_TASKS: Dict[str, Dict[str, Any]] = {}
 CANVAS_TASK_LOCK = Lock()
+CANVAS_TASK_RUNTIME_ID = uuid.uuid4().hex
+CANVAS_LLM_BACKGROUND_TASKS = set()
 
 class CanvasVideoRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=VIDEO_PROMPT_MAX_LENGTH)
@@ -2994,6 +2932,13 @@ class CanvasLLMRequest(BaseModel):
     images: List[str] = []   # 可以是 /output/*.png、/assets/*.png 本地路径 或 http(s) URL 或 data URL
     videos: List[str] = []   # 可以是 /output/*.mp4、/assets/*.mp4 本地路径 或 http(s) URL 或 data URL
 
+class CanvasLLMTaskRequest(CanvasLLMRequest):
+    canvas_id: str = Field(min_length=1, max_length=120)
+    node_id: str = Field(min_length=1, max_length=160)
+    mode: str = "node"
+    client_id: str = ""
+    input_key: str = Field(default="", max_length=160)
+
 class ConversationCreateRequest(BaseModel):
     title: str = "新对话"
 
@@ -3049,6 +2994,16 @@ class CanvasWorkflowExportRequest(BaseModel):
     library_id: str = ""
     category_id: str = ""
     name: str = ""
+
+class BackupExportRequest(BaseModel):
+    project_ids: List[str] = []
+    canvas_ids: List[str] = []
+    include_assets: bool = True
+    include_logs: bool = False
+    provider_ids: List[str] = []
+    runninghub_app_ids: List[str] = []
+    runninghub_workflow_ids: List[str] = []
+    prompt_library_ids: List[str] = []
 
 class SmartCanvasGroupExportItem(BaseModel):
     kind: str = ""
@@ -3200,6 +3155,10 @@ class PromptLibraryBatchDeleteRequest(BaseModel):
 class PromptLibraryCategoryRequest(BaseModel):
     name: str = "新分组"
     library_id: str = ""
+
+class PromptLibraryReorderRequest(BaseModel):
+    library_id: str = ""
+    ordered_ids: List[str] = []
 
 # --- 负载均衡 ---
 
@@ -3573,8 +3532,28 @@ def canvas_path(canvas_id):
         raise HTTPException(status_code=400, detail="无效的画布 ID")
     return os.path.join(CANVAS_DIR, f"{cleaned}.json")
 
+def next_canvas_updated_at(canvas):
+    return max(now_ms(), int((canvas or {}).get("updated_at") or 0) + 1)
+
+def mutate_canvas_latest(canvas_id, mutator, *, update_timestamp=True, allow_deleted=False):
+    """Read, mutate, and write one canvas under a single lock."""
+    path = canvas_path(canvas_id)
+    with CANVAS_LOCK:
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="画布不存在")
+        with open(path, 'r', encoding='utf-8') as f:
+            canvas = json.load(f)
+        if canvas.get("deleted_at") and not allow_deleted:
+            raise HTTPException(status_code=404, detail="画布已在回收站")
+        mutator(canvas)
+        if update_timestamp:
+            canvas["updated_at"] = next_canvas_updated_at(canvas)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(canvas, f, ensure_ascii=False, indent=2)
+        return canvas
+
 def save_canvas(canvas):
-    canvas["updated_at"] = now_ms()
+    canvas["updated_at"] = next_canvas_updated_at(canvas)
     with CANVAS_LOCK:
         with open(canvas_path(canvas["id"]), 'w', encoding='utf-8') as f:
             json.dump(canvas, f, ensure_ascii=False, indent=2)
@@ -7063,6 +7042,24 @@ def media_preview_cache_paths(path: str, width: int):
         os.path.join(MEDIA_PREVIEW_DIR, f"{key}.png"),
     )
 
+def acquire_media_preview_build_entry(cache_key: str):
+    with MEDIA_PREVIEW_BUILD_REGISTRY_GUARD:
+        entry = MEDIA_PREVIEW_BUILD_REGISTRY.get(cache_key)
+        if entry is None:
+            entry = {"lock": Lock(), "users": 0}
+            MEDIA_PREVIEW_BUILD_REGISTRY[cache_key] = entry
+        entry["users"] += 1
+        return entry
+
+def release_media_preview_build_entry(cache_key: str, entry):
+    with MEDIA_PREVIEW_BUILD_REGISTRY_GUARD:
+        current = MEDIA_PREVIEW_BUILD_REGISTRY.get(cache_key)
+        if current is not entry:
+            return
+        entry["users"] = max(0, int(entry.get("users", 1)) - 1)
+        if entry["users"] == 0:
+            MEDIA_PREVIEW_BUILD_REGISTRY.pop(cache_key, None)
+
 def is_video_preview_file(path: str) -> bool:
     return os.path.splitext(str(path or "").split("?", 1)[0])[1].lower() in {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv"}
 
@@ -7109,21 +7106,31 @@ async def media_preview(url: str, w: int = 512):
         return FileResponse(png_path, media_type="image/png")
 
     def _build_preview():
-        # 同步 PIL 处理 + 落盘，放到线程里执行，避免阻塞事件循环（几十张首次生成会卡死整个 loop → 缩略图全空白）
-        os.makedirs(MEDIA_PREVIEW_DIR, exist_ok=True)
-        if is_video_preview_file(path):
-            img = generate_video_preview_image(path, width)
-        else:
-            with Image.open(path) as source:
-                img = ImageOps.exif_transpose(source)
-                img.thumbnail((width, width), Image.LANCZOS)
-                img = img.convert("RGBA" if image_has_alpha(img) else "RGB")
+        cache_key = os.path.abspath(webp_path)
+        entry = acquire_media_preview_build_entry(cache_key)
         try:
-            img.save(webp_path, format="WEBP", quality=80, method=1)   # method=1 生成更快（缩略图不追求极致压缩）
-            return webp_path, "image/webp"
-        except Exception:
-            img.save(png_path, format="PNG")
-            return png_path, "image/png"
+            with entry["lock"]:
+                if os.path.exists(webp_path):
+                    return webp_path, "image/webp"
+                if os.path.exists(png_path):
+                    return png_path, "image/png"
+                # 同步 PIL 处理 + 落盘，放到线程里执行，避免阻塞事件循环（几十张首次生成会卡死整个 loop → 缩略图全空白）
+                os.makedirs(MEDIA_PREVIEW_DIR, exist_ok=True)
+                if is_video_preview_file(path):
+                    img = generate_video_preview_image(path, width)
+                else:
+                    with Image.open(path) as source:
+                        img = ImageOps.exif_transpose(source)
+                        img.thumbnail((width, width), Image.LANCZOS)
+                        img = img.convert("RGBA" if image_has_alpha(img) else "RGB")
+                try:
+                    img.save(webp_path, format="WEBP", quality=80, method=1)   # method=1 生成更快（缩略图不追求极致压缩）
+                    return webp_path, "image/webp"
+                except Exception:
+                    img.save(png_path, format="PNG")
+                    return png_path, "image/png"
+        finally:
+            release_media_preview_build_entry(cache_key, entry)
 
     try:
         out_path, media_type = await asyncio.to_thread(_build_preview)
@@ -8047,6 +8054,21 @@ def normalize_prompt_libraries(data):
         active = "system" if any(lib["id"] == "system" for lib in libraries) else (libraries[0]["id"] if libraries else "system")
     return {"active_library_id": active, "libraries": libraries, "updated_at": int(data.get("updated_at") or now_ms())}
 
+def reorder_prompt_library_records(records, ordered_ids):
+    current = records if isinstance(records, list) else []
+    if any(not isinstance(item, dict) for item in current):
+        raise ValueError("排序数据格式无效")
+    current_ids = [str(item.get("id") or "").strip() for item in current]
+    requested_ids = [str(item or "").strip() for item in (ordered_ids if isinstance(ordered_ids, list) else [])]
+    if any(not item_id for item_id in current_ids + requested_ids):
+        raise ValueError("排序数据包含无效 ID")
+    if len(current_ids) != len(set(current_ids)) or len(requested_ids) != len(set(requested_ids)):
+        raise ValueError("排序数据包含重复 ID")
+    if len(current_ids) != len(requested_ids) or set(current_ids) != set(requested_ids):
+        raise ValueError("列表已发生变化，请刷新后重试")
+    by_id = {str(item.get("id") or "").strip(): item for item in current}
+    return [by_id[item_id] for item_id in requested_ids]
+
 def load_prompt_libraries():
     if not os.path.exists(PROMPT_LIBRARY_PATH):
         data = default_prompt_libraries()
@@ -8194,8 +8216,62 @@ def convert_output_to_jpg(url, quality=88):
         print(f"转换 JPG 失败: {e}")
         return url
 
+ADAPTIVE_STRETCH_RATIOS = {
+    "1:1", "2:3", "3:2", "3:4", "4:3",
+    "4:5", "5:4", "9:16", "16:9", "21:9",
+}
+
+def normalized_stretch_aspect_ratio(value):
+    text = str(value or "").strip()
+    return text if text in ADAPTIVE_STRETCH_RATIOS else ""
+
+def stretch_dimensions_to_aspect(width, height, aspect_ratio):
+    width = max(1, int(round(float(width or 0))))
+    height = max(1, int(round(float(height or 0))))
+    ratio = normalized_stretch_aspect_ratio(aspect_ratio)
+    if not ratio:
+        return width, height
+    ratio_width, ratio_height = (int(part) for part in ratio.split(":"))
+    scale = max(1, int(round(height / ratio_height)))
+    return ratio_width * scale, ratio_height * scale
+
+def stretched_reference_image(ref, max_size=None):
+    ratio = normalized_stretch_aspect_ratio((ref or {}).get("stretch_aspect_ratio"))
+    path = output_file_from_url((ref or {}).get("url", ""))
+    if not ratio or not path:
+        return None
+    try:
+        with Image.open(path) as source:
+            source.load()
+            image = ImageOps.exif_transpose(source)
+            target_size = stretch_dimensions_to_aspect(image.width, image.height, ratio)
+            if image.size != target_size:
+                resampling = getattr(Image, "Resampling", Image).LANCZOS
+                image = image.resize(target_size, resampling)
+            if max_size and max(image.size) > max_size:
+                image.thumbnail((max_size, max_size), getattr(Image, "Resampling", Image).LANCZOS)
+            has_alpha = image_has_alpha(image)
+            image = image.convert("RGBA" if has_alpha else "RGB")
+            fmt = "PNG" if has_alpha else "JPEG"
+            mime = "image/png" if has_alpha else "image/jpeg"
+            suffix = ".png" if has_alpha else ".jpg"
+            filename = f"{os.path.splitext(os.path.basename(path))[0]}-adapted{suffix}"
+            buffer = BytesIO()
+            save_options = {"format": fmt}
+            if fmt == "JPEG":
+                save_options.update({"quality": 92, "optimize": True})
+            image.save(buffer, **save_options)
+            return {"bytes": buffer.getvalue(), "mime": mime, "filename": filename, "size": image.size}
+    except Exception as exc:
+        print(f"adaptive reference stretch failed, fallback to source: {exc}")
+        return None
+
 def reference_to_data_url(ref, max_size=None):
     """把本地输出文件转为 data URL（base64）。max_size 限制最长边像素，避免 payload 过大。"""
+    stretched = stretched_reference_image(ref, max_size=max_size)
+    if stretched:
+        encoded = base64.b64encode(stretched["bytes"]).decode("ascii")
+        return f"data:{stretched['mime']};base64,{encoded}"
     path = output_file_from_url(ref.get("url", ""))
     if not path:
         return ref.get("url", "")
@@ -11331,6 +11407,10 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             edit_failed_text = ""
             try:
                 for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]:
+                    stretched = stretched_reference_image(ref)
+                    if stretched:
+                        files.append(("image", (stretched["filename"], stretched["bytes"], stretched["mime"])))
+                        continue
                     path = output_file_from_url(ref.get("url", ""))
                     if not path:
                         continue
@@ -11338,8 +11418,11 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                     opened.append(fh)
                     files.append(("image", (os.path.basename(path), fh, content_type_for_path(path))))
                 if mask_refs:
-                    mask_path = output_file_from_url(mask_refs[0].get("url", ""))
-                    if mask_path:
+                    stretched_mask = stretched_reference_image(mask_refs[0])
+                    mask_path = output_file_from_url(mask_refs[0].get("url", "")) if not stretched_mask else None
+                    if stretched_mask:
+                        files.append(("mask", (stretched_mask["filename"], stretched_mask["bytes"], stretched_mask["mime"])))
+                    elif mask_path:
                         fh = open(mask_path, "rb")
                         opened.append(fh)
                         files.append(("mask", (os.path.basename(mask_path), fh, content_type_for_path(mask_path))))
@@ -15960,8 +16043,7 @@ async def canvas_video(payload: CanvasVideoRequest):
 
 # --- Canvas LLM ---
 
-@app.post("/api/canvas-llm")
-async def canvas_llm(payload: CanvasLLMRequest):
+async def execute_canvas_llm(payload: CanvasLLMRequest):
     _provider = get_api_provider(payload.provider)
     if is_codex_provider(_provider):
         model = selected_model(payload.model, (_provider.get("chat_models") or CODEX_DEFAULT_CHAT_MODELS)[0])
@@ -16051,6 +16133,266 @@ async def canvas_llm(payload: CanvasLLMRequest):
     raw_data = unwrap_apimart_response(raw) if isinstance(raw, dict) else {}
     return {"text": text, "model": model, "raw_usage": raw_data.get("usage")}
 
+LLM_RESULT_MEMORY_MAX_ENTRIES = 20
+LLM_RESULT_MEMORY_MAX_CHARS = 120000
+
+def remember_canvas_llm_result(node: Dict[str, Any], input_key: str, result_text: str):
+    """Keep a bounded text-only LRU list keyed by the submitted effective input."""
+    key = str(input_key or "")[:160]
+    text = str(result_text or "")
+    if not key:
+        return
+    raw_entries = node.get("llmResultMemory") if isinstance(node.get("llmResultMemory"), list) else []
+    entries = []
+    seen = set()
+    for item in reversed(raw_entries):
+        if not isinstance(item, dict):
+            continue
+        item_key = str(item.get("key") or "")[:160]
+        item_text = str(item.get("text") or "")
+        if not item_key or not item_text or item_key == key or item_key in seen:
+            continue
+        if len(item_text) > LLM_RESULT_MEMORY_MAX_CHARS:
+            continue
+        seen.add(item_key)
+        entries.append({
+            "key": item_key,
+            "text": item_text,
+            "updatedAt": int(item.get("updatedAt") or 0),
+        })
+    entries.reverse()
+    if text and len(text) <= LLM_RESULT_MEMORY_MAX_CHARS:
+        entries.append({"key": key, "text": text, "updatedAt": now_ms()})
+    total_chars = sum(len(entry["text"]) for entry in entries)
+    while len(entries) > LLM_RESULT_MEMORY_MAX_ENTRIES or total_chars > LLM_RESULT_MEMORY_MAX_CHARS:
+        removed = entries.pop(0)
+        total_chars -= len(removed["text"])
+    node["llmResultMemory"] = entries
+    node["llmResultKey"] = key
+
+def update_canvas_llm_task_node(
+    canvas_id: str,
+    node_id: str,
+    task_id: str,
+    mode: str,
+    status: str,
+    *,
+    message: str = "",
+    result_text: str = "",
+    error: str = "",
+    provider: str = "",
+    model: str = "",
+    runtime_id: str = "",
+    input_key: str = "",
+):
+    """Persist only the target LLM node so background completion cannot overwrite other edits."""
+    normalized_mode = str(mode or "node").strip().lower()
+    if normalized_mode not in {"node", "chat", "smart-prompt"}:
+        raise HTTPException(status_code=400, detail="不支持的画布 LLM 任务模式")
+    path = canvas_path(canvas_id)
+    with CANVAS_LOCK:
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="画布不存在")
+        with open(path, "r", encoding="utf-8") as handle:
+            canvas = json.load(handle)
+        if canvas.get("deleted_at"):
+            raise HTTPException(status_code=404, detail="画布已在回收站")
+        nodes = canvas.get("nodes") if isinstance(canvas.get("nodes"), list) else []
+        node = next((item for item in nodes if isinstance(item, dict) and str(item.get("id") or "") == node_id), None)
+        if not node:
+            raise HTTPException(status_code=404, detail="LLM 节点不存在")
+        expected_type = "smart-prompt" if normalized_mode == "smart-prompt" else "llm"
+        if node.get("type") != expected_type:
+            raise HTTPException(status_code=400, detail="任务模式与节点类型不匹配")
+
+        current_task = node.get("llmTask") if isinstance(node.get("llmTask"), dict) else {}
+        current_task_id = str(current_task.get("id") or "")
+        if status not in {"queued", "running"} and current_task_id != task_id:
+            return False
+
+        timestamp = next_canvas_updated_at(canvas)
+        if status in {"queued", "running"}:
+            task_state = {
+                "id": task_id,
+                "status": status,
+                "mode": normalized_mode,
+                "runtimeId": runtime_id or CANVAS_TASK_RUNTIME_ID,
+                "startedAt": int(current_task.get("startedAt") or timestamp),
+                "inputKey": input_key or current_task.get("inputKey") or "",
+            }
+            node["llmTask"] = task_state
+            node["runStatus"] = "running"
+            node["runError"] = ""
+            if provider:
+                node["llmProvider"] = provider
+            if model:
+                if normalized_mode == "smart-prompt":
+                    node["llmModel"] = model
+                else:
+                    node["model"] = model
+                    if provider == "modelscope":
+                        node["llmMsModel"] = model
+            if normalized_mode == "chat" and status == "queued" and current_task_id != task_id:
+                messages = node.get("messages") if isinstance(node.get("messages"), list) else []
+                messages.append({"role": "user", "content": message})
+                node["messages"] = messages
+                node["chatInput"] = ""
+        elif status == "succeeded":
+            if normalized_mode == "smart-prompt":
+                node["text"] = result_text
+            elif normalized_mode == "chat":
+                messages = node.get("messages") if isinstance(node.get("messages"), list) else []
+                messages.append({"role": "assistant", "content": result_text})
+                node["messages"] = messages
+            else:
+                node["outputText"] = result_text
+            if normalized_mode == "node" and input_key:
+                remember_canvas_llm_result(node, input_key, result_text)
+            node.pop("llmTask", None)
+            node["runStatus"] = "done"
+            node["runError"] = ""
+        else:
+            task_state = dict(current_task)
+            task_state.update({
+                "id": task_id,
+                "status": "failed",
+                "mode": normalized_mode,
+                "error": str(error or "LLM 运行失败")[:1000],
+                "finishedAt": timestamp,
+            })
+            node["llmTask"] = task_state
+            node["runStatus"] = "failed"
+            node["runError"] = task_state["error"]
+
+        canvas["updated_at"] = timestamp
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(canvas, handle, ensure_ascii=False, indent=2)
+        return timestamp
+
+async def run_canvas_llm_task(task_id: str, payload: CanvasLLMTaskRequest):
+    with CANVAS_TASK_LOCK:
+        if task_id in CANVAS_TASKS:
+            CANVAS_TASKS[task_id]["status"] = "running"
+            CANVAS_TASKS[task_id]["updated_at"] = time.time()
+    updated_at = 0
+    try:
+        result = await execute_canvas_llm(payload)
+        result_text = str((result or {}).get("text") or "").strip()
+        updated_at = update_canvas_llm_task_node(
+            payload.canvas_id,
+            payload.node_id,
+            task_id,
+            payload.mode,
+            "succeeded",
+            result_text=result_text,
+            input_key=payload.input_key,
+        ) or 0
+        with CANVAS_TASK_LOCK:
+            if task_id in CANVAS_TASKS:
+                CANVAS_TASKS[task_id].update({
+                    "status": "succeeded",
+                    "result": {"text": result_text, "model": (result or {}).get("model")},
+                    "error": "",
+                    "updated_at": time.time(),
+                })
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        try:
+            updated_at = update_canvas_llm_task_node(
+                payload.canvas_id,
+                payload.node_id,
+                task_id,
+                payload.mode,
+                "failed",
+                error=str(detail),
+                input_key=payload.input_key,
+            ) or 0
+        except Exception:
+            updated_at = 0
+        with CANVAS_TASK_LOCK:
+            if task_id in CANVAS_TASKS:
+                CANVAS_TASKS[task_id].update({
+                    "status": "failed",
+                    "result": None,
+                    "error": str(detail)[:1000],
+                    "updated_at": time.time(),
+                })
+    if updated_at:
+        await manager.broadcast_canvas_updated(payload.canvas_id, int(updated_at), "")
+
+def prune_canvas_llm_task_records_locked(max_completed: int = 500, max_age_seconds: int = 21600):
+    now = time.time()
+    completed = []
+    for task_id, task in list(CANVAS_TASKS.items()):
+        if task.get("type") != "canvas-llm" or task.get("status") in {"queued", "running"}:
+            continue
+        updated_at = float(task.get("updated_at") or task.get("created_at") or 0)
+        if updated_at and now - updated_at > max_age_seconds:
+            CANVAS_TASKS.pop(task_id, None)
+            continue
+        completed.append((updated_at, task_id))
+    completed.sort(reverse=True)
+    for _updated_at, task_id in completed[max_completed:]:
+        CANVAS_TASKS.pop(task_id, None)
+
+@app.post("/api/canvas-llm-tasks")
+async def create_canvas_llm_task(payload: CanvasLLMTaskRequest):
+    mode = str(payload.mode or "node").strip().lower()
+    if mode not in {"node", "chat", "smart-prompt"}:
+        raise HTTPException(status_code=400, detail="不支持的画布 LLM 任务模式")
+    task_id = f"canvas_llm_{uuid.uuid4().hex}"
+    updated_at = update_canvas_llm_task_node(
+        payload.canvas_id,
+        payload.node_id,
+        task_id,
+        mode,
+        "queued",
+        message=payload.message,
+        provider=payload.provider,
+        model=payload.model or payload.ms_model,
+        runtime_id=CANVAS_TASK_RUNTIME_ID,
+        input_key=payload.input_key,
+    )
+    with CANVAS_TASK_LOCK:
+        prune_canvas_llm_task_records_locked()
+        CANVAS_TASKS[task_id] = {
+            "id": task_id,
+            "type": "canvas-llm",
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "result": None,
+            "error": "",
+            "canvas_id": payload.canvas_id,
+            "node_id": payload.node_id,
+            "mode": mode,
+            "runtime_id": CANVAS_TASK_RUNTIME_ID,
+            "input_key": payload.input_key,
+        }
+    background_task = asyncio.create_task(run_canvas_llm_task(task_id, payload))
+    CANVAS_LLM_BACKGROUND_TASKS.add(background_task)
+    background_task.add_done_callback(CANVAS_LLM_BACKGROUND_TASKS.discard)
+    await manager.broadcast_canvas_updated(payload.canvas_id, int(updated_at or now_ms()), payload.client_id)
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "runtime_id": CANVAS_TASK_RUNTIME_ID,
+        "updated_at": updated_at,
+        "input_key": payload.input_key,
+    }
+
+@app.get("/api/canvas-llm-tasks/{task_id}")
+async def get_canvas_llm_task(task_id: str):
+    with CANVAS_TASK_LOCK:
+        task = dict(CANVAS_TASKS.get(task_id) or {})
+    if not task or task.get("type") != "canvas-llm":
+        raise HTTPException(status_code=404, detail="LLM 任务不存在，可能服务已重启或任务已过期")
+    return task
+
+@app.post("/api/canvas-llm")
+async def canvas_llm(payload: CanvasLLMRequest):
+    return await execute_canvas_llm(payload)
+
 # --- 对话管理 ---
 
 @app.get("/api/conversations")
@@ -16075,6 +16417,697 @@ async def delete_conversation(conversation_id: str, request: Request, x_user_id:
     if os.path.exists(path):
         os.remove(path)
     return {"ok": True}
+
+# --- 可移植备份（项目 / 画布 / 无密钥配置）---
+
+BACKUP_HISTORY_PATH = os.path.join(DATA_DIR, "backup_import_history.json")
+BACKUP_UPLOAD_LIMIT = 16 * 1024 * 1024 * 1024
+BACKUP_DOWNLOAD_TTL_MS = 30 * 60 * 1000
+
+def backup_cleanup_downloads():
+    cutoff = now_ms() - BACKUP_DOWNLOAD_TTL_MS
+    expired = []
+    with BACKUP_DOWNLOAD_LOCK:
+        for token, item in list(BACKUP_DOWNLOADS.items()):
+            if int(item.get("created_at") or 0) < cutoff or not os.path.isfile(str(item.get("path") or "")):
+                expired.append(BACKUP_DOWNLOADS.pop(token, None))
+    for item in expired:
+        try:
+            path = str((item or {}).get("path") or "")
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+def backup_register_download(path, filename):
+    backup_cleanup_downloads()
+    token = uuid.uuid4().hex
+    with BACKUP_DOWNLOAD_LOCK:
+        BACKUP_DOWNLOADS[token] = {"path": path, "filename": filename, "created_at": now_ms()}
+    return token
+
+def backup_finish_download(token):
+    with BACKUP_DOWNLOAD_LOCK:
+        item = BACKUP_DOWNLOADS.pop(token, None)
+    try:
+        path = str((item or {}).get("path") or "")
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+def backup_id_set(values, limit=5000):
+    result = []
+    seen = set()
+    for raw in values or []:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+        if len(result) >= limit:
+            break
+    return result
+
+def backup_runninghub_provider():
+    provider = next((item for item in load_api_providers() if item.get("id") == "runninghub"), None)
+    if not provider:
+        return default_runninghub_static_provider()
+    try:
+        return runninghub_provider_with_workflow_store(provider)
+    except Exception:
+        return provider
+
+def backup_options_payload():
+    project_rows = list_projects()
+    canvas_rows = list_canvases()
+    canvas_by_project = {}
+    for canvas in canvas_rows:
+        canvas_by_project.setdefault(canvas.get("project") or DEFAULT_PROJECT_ID, []).append({
+            "id": canvas.get("id"),
+            "title": canvas.get("title") or "未命名画布",
+            "kind": normalize_canvas_kind(canvas.get("kind")),
+            "node_count": int(canvas.get("node_count") or 0),
+        })
+    projects_payload = []
+    for project in project_rows:
+        projects_payload.append({
+            "id": project.get("id"),
+            "name": project.get("name") or "未命名项目",
+            "canvases": canvas_by_project.get(project.get("id"), []),
+        })
+    providers_payload = []
+    for provider in load_api_providers():
+        if provider.get("id") == "runninghub":
+            continue
+        providers_payload.append({
+            "id": provider.get("id"),
+            "name": provider.get("name") or provider.get("id") or "API 平台",
+            "protocol": provider.get("protocol") or "openai",
+        })
+    runninghub = backup_runninghub_provider()
+    apps_payload = [{
+        "id": str(item.get("appId") or item.get("id") or ""),
+        "title": item.get("title") or item.get("name") or str(item.get("appId") or item.get("id") or "AI 应用"),
+    } for item in runninghub.get("rh_apps") or [] if isinstance(item, dict) and (item.get("appId") or item.get("id"))]
+    workflows_payload = [{
+        "id": str(item.get("workflowId") or item.get("id") or ""),
+        "title": item.get("title") or item.get("name") or str(item.get("workflowId") or item.get("id") or "工作流"),
+    } for item in runninghub.get("rh_workflows") or [] if isinstance(item, dict) and (item.get("workflowId") or item.get("id"))]
+    prompt_data = load_prompt_libraries()
+    prompt_payload = [{
+        "id": library.get("id"),
+        "name": library.get("name") or "提示词库",
+        "item_count": len(library.get("items") or []),
+    } for library in prompt_data.get("libraries") or [] if isinstance(library, dict) and library.get("id")]
+    return {
+        "projects": projects_payload,
+        "providers": providers_payload,
+        "runninghub": {"apps": apps_payload, "workflows": workflows_payload},
+        "prompt_libraries": prompt_payload,
+    }
+
+def backup_file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def backup_json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+
+def backup_archive_json(archive, member, default=None, max_bytes=64 * 1024 * 1024):
+    if not member or not backup_io.is_safe_archive_member(member):
+        raise ValueError("备份 JSON 路径无效")
+    try:
+        info = archive.getinfo(member)
+    except KeyError as exc:
+        if default is not None:
+            return copy.deepcopy(default)
+        raise ValueError(f"备份缺少文件：{member}") from exc
+    if info.file_size > max_bytes:
+        raise ValueError(f"备份 JSON 文件过大：{member}")
+    try:
+        return json.loads(archive.read(info).decode("utf-8-sig"))
+    except Exception as exc:
+        raise ValueError(f"备份 JSON 无法解析：{member}") from exc
+
+def backup_read_manifest(archive):
+    backup_io.validate_archive_infos(archive.infolist())
+    manifest = backup_archive_json(archive, "manifest.json", max_bytes=8 * 1024 * 1024)
+    if not isinstance(manifest, dict) or manifest.get("format") != backup_io.BACKUP_FORMAT:
+        raise ValueError("不是 Infinite Canvas 备份文件")
+    if int(manifest.get("version") or 0) != backup_io.BACKUP_VERSION:
+        raise ValueError(f"暂不支持备份版本 {manifest.get('version')}")
+    return manifest
+
+def backup_summary_from_manifest(manifest):
+    projects = []
+    for project in manifest.get("projects") or []:
+        if not isinstance(project, dict):
+            continue
+        projects.append({
+            "id": project.get("id"),
+            "name": project.get("name") or "未命名项目",
+            "canvases": [canvas for canvas in (project.get("canvases") or []) if isinstance(canvas, dict)],
+        })
+    resources = [item for item in manifest.get("resources") or [] if isinstance(item, dict)]
+    return {
+        "format": manifest.get("format"),
+        "version": manifest.get("version"),
+        "backup_id": manifest.get("backup_id") or "",
+        "created_at": manifest.get("created_at") or 0,
+        "projects": projects,
+        "providers": manifest.get("providers") or [],
+        "runninghub": manifest.get("runninghub") or {"apps": [], "workflows": []},
+        "prompt_libraries": manifest.get("prompt_libraries") or [],
+        "resource_count": len(resources),
+        "resource_bytes": sum(max(0, int(item.get("size") or 0)) for item in resources),
+        "missing_resources": manifest.get("missing_resources") or [],
+    }
+
+def backup_load_history():
+    try:
+        with open(BACKUP_HISTORY_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def backup_save_history(items):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(BACKUP_HISTORY_PATH, "w", encoding="utf-8") as handle:
+        json.dump(list(items)[-100:], handle, ensure_ascii=False, indent=2)
+
+def backup_conflicts_for_summary(summary):
+    existing_projects = load_projects()
+    project_names = {str(item.get("name") or "") for item in existing_projects}
+    provider_ids = {str(item.get("id") or "") for item in load_api_providers()}
+    runninghub = backup_runninghub_provider()
+    app_ids = {str(item.get("appId") or item.get("id") or "") for item in runninghub.get("rh_apps") or [] if isinstance(item, dict)}
+    workflow_ids = {str(item.get("workflowId") or item.get("id") or "") for item in runninghub.get("rh_workflows") or [] if isinstance(item, dict)}
+    prompt_ids = {str(item.get("id") or "") for item in (load_prompt_libraries().get("libraries") or []) if isinstance(item, dict)}
+    history = backup_load_history()
+    return {
+        "projects": [item.get("id") for item in summary.get("projects") or [] if str(item.get("name") or "") in project_names],
+        "providers": [item.get("id") for item in summary.get("providers") or [] if str(item.get("id") or "") in provider_ids],
+        "runninghub_apps": [item.get("id") for item in (summary.get("runninghub") or {}).get("apps") or [] if str(item.get("id") or "") in app_ids],
+        "runninghub_workflows": [item.get("id") for item in (summary.get("runninghub") or {}).get("workflows") or [] if str(item.get("id") or "") in workflow_ids],
+        "prompt_libraries": [item.get("id") for item in summary.get("prompt_libraries") or [] if str(item.get("id") or "") in prompt_ids],
+        "already_imported": bool(summary.get("backup_id") and any(str(item.get("backup_id") or "") == str(summary.get("backup_id")) for item in history if isinstance(item, dict))),
+    }
+
+def build_backup_archive(payload):
+    requested_projects = set(backup_id_set(payload.project_ids, 1000))
+    requested_canvases = set(backup_id_set(payload.canvas_ids, 5000))
+    projects = {str(item.get("id")): item for item in load_projects() if isinstance(item, dict) and item.get("id")}
+    canvas_records = {str(item.get("id")): item for item in list_canvases() if item.get("id")}
+    canvas_payloads = []
+    for canvas_id in requested_canvases:
+        if canvas_id not in canvas_records:
+            continue
+        canvas = load_canvas(canvas_id)
+        project_id = str(canvas.get("project") or DEFAULT_PROJECT_ID)
+        requested_projects.add(project_id)
+        clean = backup_io.prepare_exported_canvas(canvas, include_logs=bool(payload.include_logs))
+        canvas_payloads.append((canvas_id, project_id, clean))
+    selected_projects = [projects[project_id] for project_id in requested_projects if project_id in projects]
+
+    selected_provider_ids = set(backup_id_set(payload.provider_ids, 500))
+    provider_configs = []
+    for provider in load_api_providers():
+        provider_id = str(provider.get("id") or "")
+        if provider_id == "runninghub" or provider_id not in selected_provider_ids:
+            continue
+        clean = backup_io.sanitize_portable_config(provider)
+        clean.pop("rh_apps", None)
+        clean.pop("rh_workflows", None)
+        provider_configs.append(clean)
+
+    runninghub_provider = backup_runninghub_provider()
+    selected_app_ids = set(backup_id_set(payload.runninghub_app_ids, 5000))
+    selected_workflow_ids = set(backup_id_set(payload.runninghub_workflow_ids, 5000))
+    runninghub_apps = [backup_io.sanitize_portable_config(item) for item in runninghub_provider.get("rh_apps") or []
+        if isinstance(item, dict) and str(item.get("appId") or item.get("id") or "") in selected_app_ids]
+    runninghub_workflows = [backup_io.sanitize_portable_config(item) for item in runninghub_provider.get("rh_workflows") or []
+        if isinstance(item, dict) and str(item.get("workflowId") or item.get("id") or "") in selected_workflow_ids]
+
+    selected_prompt_ids = set(backup_id_set(payload.prompt_library_ids, 500))
+    prompt_source = load_prompt_libraries()
+    prompt_libraries = [backup_io.sanitize_portable_config(item) for item in prompt_source.get("libraries") or []
+        if isinstance(item, dict) and str(item.get("id") or "") in selected_prompt_ids]
+
+    if not (selected_projects or canvas_payloads or provider_configs or runninghub_apps or runninghub_workflows or prompt_libraries):
+        raise ValueError("请至少选择一项备份内容")
+
+    timestamp = now_ms()
+    backup_id = uuid.uuid4().hex
+    project_entries = []
+    canvas_manifest_by_project = {}
+    for canvas_id, project_id, canvas in canvas_payloads:
+        entry = {
+            "id": canvas_id,
+            "title": canvas.get("title") or "未命名画布",
+            "kind": normalize_canvas_kind(canvas.get("kind")),
+            "file": f"canvases/{canvas_id}.json",
+        }
+        canvas_manifest_by_project.setdefault(project_id, []).append(entry)
+    for project in selected_projects:
+        project_id = str(project.get("id"))
+        project_entries.append({
+            "id": project_id,
+            "name": project.get("name") or "未命名项目",
+            "canvases": canvas_manifest_by_project.get(project_id, []),
+        })
+
+    manifest = {
+        "format": backup_io.BACKUP_FORMAT,
+        "version": backup_io.BACKUP_VERSION,
+        "backup_id": backup_id,
+        "created_at": timestamp,
+        "projects": project_entries,
+        "providers": [{"id": item.get("id"), "name": item.get("name") or item.get("id")} for item in provider_configs],
+        "runninghub": {
+            "apps": [{"id": item.get("appId") or item.get("id"), "title": item.get("title") or item.get("name") or "AI 应用"} for item in runninghub_apps],
+            "workflows": [{"id": item.get("workflowId") or item.get("id"), "title": item.get("title") or item.get("name") or "工作流"} for item in runninghub_workflows],
+        },
+        "prompt_libraries": [{"id": item.get("id"), "name": item.get("name") or "提示词库", "item_count": len(item.get("items") or [])} for item in prompt_libraries],
+        "resources": [],
+        "missing_resources": [],
+        "configs": {},
+    }
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    archive_path = tmp.name
+    tmp.close()
+    try:
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+            for canvas_id, _project_id, canvas in canvas_payloads:
+                archive.writestr(f"canvases/{canvas_id}.json", backup_json_bytes(canvas))
+            if payload.include_assets:
+                urls = []
+                seen_urls = set()
+                for _canvas_id, _project_id, canvas in canvas_payloads:
+                    for url in backup_io.collect_local_resource_urls(canvas):
+                        if url not in seen_urls:
+                            seen_urls.add(url)
+                            urls.append(url)
+                written_hashes = set()
+                for url in urls:
+                    path = output_file_from_url(url)
+                    if not path or not os.path.isfile(path):
+                        manifest["missing_resources"].append(url)
+                        continue
+                    digest = backup_file_sha256(path)
+                    ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lower()
+                    if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+                        ext = os.path.splitext(path)[1].lower() if re.fullmatch(r"\.[a-z0-9]{1,8}", os.path.splitext(path)[1].lower()) else ".bin"
+                    member = f"resources/{digest[:2]}/{digest}{ext}"
+                    if digest not in written_hashes:
+                        archive.write(path, member)
+                        written_hashes.add(digest)
+                    manifest["resources"].append({
+                        "url": url,
+                        "file": member,
+                        "sha256": digest,
+                        "size": os.path.getsize(path),
+                    })
+            if provider_configs:
+                manifest["configs"]["providers"] = "configs/providers.json"
+                archive.writestr("configs/providers.json", backup_json_bytes(provider_configs))
+            if runninghub_apps or runninghub_workflows:
+                manifest["configs"]["runninghub"] = "configs/runninghub.json"
+                archive.writestr("configs/runninghub.json", backup_json_bytes({"apps": runninghub_apps, "workflows": runninghub_workflows}))
+            if prompt_libraries:
+                manifest["configs"]["prompt_libraries"] = "configs/prompt-libraries.json"
+                archive.writestr("configs/prompt-libraries.json", backup_json_bytes({"active_library_id": prompt_source.get("active_library_id"), "libraries": prompt_libraries}))
+            archive.writestr("manifest.json", backup_json_bytes(manifest))
+        date = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+        return archive_path, f"Infinite-Canvas备份_{date}.zip"
+    except Exception:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+        raise
+
+async def backup_save_upload(upload):
+    suffix = ".zip" if str(upload.filename or "").lower().endswith(".zip") else ".backup"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    path = tmp.name
+    size = 0
+    try:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > BACKUP_UPLOAD_LIMIT:
+                raise ValueError("备份文件过大")
+            tmp.write(chunk)
+        tmp.close()
+        if size <= 0:
+            raise ValueError("备份文件为空")
+        return path
+    except Exception:
+        tmp.close()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+
+def inspect_backup_path(path):
+    with zipfile.ZipFile(path, "r") as archive:
+        manifest = backup_read_manifest(archive)
+    summary = backup_summary_from_manifest(manifest)
+    return {"backup": summary, "conflicts": backup_conflicts_for_summary(summary)}
+
+def backup_copy_resource(archive, item, created_paths):
+    member = str(item.get("file") or "")
+    if not backup_io.is_safe_archive_member(member):
+        raise ValueError(f"资源路径无效：{member}")
+    info = archive.getinfo(member)
+    expected = str(item.get("sha256") or "").lower()
+    ext = os.path.splitext(member)[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+        ext = ".bin"
+    target_dir = os.path.join(OUTPUT_INPUT_DIR, "backup_resources", (expected[:2] if expected else "xx"))
+    os.makedirs(target_dir, exist_ok=True)
+    final_name = f"{expected}{ext}" if expected else f"resource-{uuid.uuid4().hex}{ext}"
+    target = os.path.join(target_dir, final_name)
+    if expected and os.path.isfile(target) and backup_file_sha256(target) == expected:
+        rel = os.path.relpath(target, ASSETS_DIR).replace("\\", "/")
+        return f"/assets/{rel}"
+    temp_target = os.path.join(target_dir, f".{uuid.uuid4().hex}.tmp")
+    digest = hashlib.sha256()
+    with archive.open(info, "r") as source, open(temp_target, "wb") as output:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            output.write(chunk)
+    actual = digest.hexdigest()
+    if expected and actual != expected:
+        os.remove(temp_target)
+        raise ValueError(f"资源校验失败：{member}")
+    if not expected:
+        expected = actual
+        final_name = f"{expected}{ext}"
+        target = os.path.join(target_dir, final_name)
+    if os.path.isfile(target):
+        os.remove(temp_target)
+    else:
+        os.replace(temp_target, target)
+        created_paths.append(target)
+    rel = os.path.relpath(target, ASSETS_DIR).replace("\\", "/")
+    return f"/assets/{rel}"
+
+def backup_selected_ids(selection, key, available):
+    if key not in selection:
+        return set(available)
+    return set(backup_id_set(selection.get(key) or [], 10000))
+
+def import_backup_path(path, selection):
+    with BACKUP_IMPORT_LOCK:
+        with zipfile.ZipFile(path, "r") as archive:
+            manifest = backup_read_manifest(archive)
+            summary = backup_summary_from_manifest(manifest)
+            project_entries = {str(item.get("id")): item for item in manifest.get("projects") or [] if isinstance(item, dict) and item.get("id")}
+            all_canvas_entries = {}
+            for project in project_entries.values():
+                for item in project.get("canvases") or []:
+                    if isinstance(item, dict) and item.get("id"):
+                        all_canvas_entries[str(item.get("id"))] = {**item, "project_id": str(project.get("id"))}
+            selected_project_ids = backup_selected_ids(selection, "project_ids", project_entries.keys())
+            selected_canvas_ids = backup_selected_ids(selection, "canvas_ids", all_canvas_entries.keys())
+            selected_canvas_ids = {item for item in selected_canvas_ids if item in all_canvas_entries}
+            selected_project_ids.update(all_canvas_entries[item]["project_id"] for item in selected_canvas_ids)
+
+            canvas_sources = {}
+            referenced_urls = set()
+            for canvas_id in selected_canvas_ids:
+                member = str(all_canvas_entries[canvas_id].get("file") or "")
+                canvas = backup_archive_json(archive, member)
+                if not isinstance(canvas, dict):
+                    raise ValueError(f"画布数据无效：{canvas_id}")
+                canvas_sources[canvas_id] = canvas
+                referenced_urls.update(backup_io.collect_local_resource_urls(canvas))
+
+            created_resource_paths = []
+            created_canvas_paths = []
+            url_mapping = {}
+            original_projects = copy.deepcopy(load_projects())
+            original_providers = copy.deepcopy(load_api_providers())
+            original_prompts = copy.deepcopy(load_prompt_libraries())
+            original_workflows = copy.deepcopy(load_runninghub_workflow_store())
+            projects_changed = providers_changed = prompts_changed = workflows_changed = False
+            try:
+                if selection.get("include_assets", True):
+                    for item in manifest.get("resources") or []:
+                        if not isinstance(item, dict) or str(item.get("url") or "") not in referenced_urls:
+                            continue
+                        url_mapping[str(item.get("url"))] = backup_copy_resource(archive, item, created_resource_paths)
+
+                existing_projects = copy.deepcopy(original_projects)
+                existing_names = {str(item.get("name") or "") for item in existing_projects}
+                max_order = max([int(item.get("order") or 0) for item in existing_projects], default=0)
+                project_map = {}
+                project_mode = str(selection.get("project_conflict") or "copy")
+                for source_id in selected_project_ids:
+                    source = project_entries.get(source_id)
+                    if not source:
+                        continue
+                    source_name = str(source.get("name") or "未命名项目")[:60]
+                    same_name = next((item for item in existing_projects if str(item.get("name") or "") == source_name), None)
+                    if project_mode == "merge" and same_name:
+                        project_map[source_id] = str(same_name.get("id"))
+                        continue
+                    max_order += 1
+                    project_id = uuid.uuid4().hex
+                    project_name = backup_io.next_import_name(source_name, existing_names)
+                    existing_names.add(project_name)
+                    project = {"id": project_id, "name": project_name, "order": max_order, "created_at": now_ms(), "updated_at": now_ms()}
+                    existing_projects.append(project)
+                    project_map[source_id] = project_id
+                    projects_changed = True
+
+                target_titles = {}
+                for canvas in list_canvases():
+                    target_titles.setdefault(str(canvas.get("project") or DEFAULT_PROJECT_ID), set()).add(str(canvas.get("title") or ""))
+                imported_canvas_records = []
+                timestamp = now_ms()
+                for source_canvas_id in selected_canvas_ids:
+                    source_entry = all_canvas_entries[source_canvas_id]
+                    source_project_id = source_entry["project_id"]
+                    target_project_id = project_map.get(source_project_id)
+                    if not target_project_id:
+                        continue
+                    new_canvas_id = uuid.uuid4().hex
+                    canvas = backup_io.prepare_imported_canvas(
+                        canvas_sources[source_canvas_id],
+                        new_canvas_id=new_canvas_id,
+                        new_project_id=target_project_id,
+                        timestamp=timestamp,
+                        url_mapping=url_mapping,
+                    )
+                    titles = target_titles.setdefault(target_project_id, set())
+                    title = str(canvas.get("title") or "未命名画布")
+                    if title in titles:
+                        title = backup_io.next_import_name(title, titles)
+                    titles.add(title)
+                    canvas["title"] = title[:80]
+                    imported_canvas_records.append(canvas)
+
+                configs = manifest.get("configs") if isinstance(manifest.get("configs"), dict) else {}
+                providers = copy.deepcopy(original_providers)
+                selected_provider_ids = backup_selected_ids(selection, "provider_ids", [item.get("id") for item in summary.get("providers") or []])
+                provider_member = configs.get("providers")
+                if provider_member and selected_provider_ids:
+                    incoming = backup_archive_json(archive, provider_member, default=[])
+                    incoming = [item for item in incoming if isinstance(item, dict) and str(item.get("id") or "") in selected_provider_ids]
+                    primary_by_id = {str(item.get("id") or ""): bool(item.get("primary")) for item in providers}
+                    for item in incoming:
+                        item["primary"] = primary_by_id.get(str(item.get("id") or ""), False)
+                    providers, provider_stats = backup_io.merge_entries_by_id(
+                        providers,
+                        incoming,
+                        id_keys=("id",),
+                        overwrite=str(selection.get("provider_conflict") or "keep-local") == "backup",
+                    )
+                    providers_changed = providers_changed or bool(
+                        provider_stats.get("imported") or provider_stats.get("overwritten")
+                    )
+
+                rh_member = configs.get("runninghub")
+                workflow_store = copy.deepcopy(original_workflows)
+                if rh_member:
+                    rh_payload = backup_archive_json(archive, rh_member, default={})
+                    selected_app_ids = backup_selected_ids(selection, "runninghub_app_ids", [item.get("id") for item in (summary.get("runninghub") or {}).get("apps") or []])
+                    selected_workflow_ids = backup_selected_ids(selection, "runninghub_workflow_ids", [item.get("id") for item in (summary.get("runninghub") or {}).get("workflows") or []])
+                    incoming_apps = [item for item in rh_payload.get("apps") or [] if isinstance(item, dict) and str(item.get("appId") or item.get("id") or "") in selected_app_ids]
+                    incoming_workflows = [item for item in rh_payload.get("workflows") or [] if isinstance(item, dict) and str(item.get("workflowId") or item.get("id") or "") in selected_workflow_ids]
+                    rh_provider = next((item for item in providers if item.get("id") == "runninghub"), None)
+                    if rh_provider is None and (incoming_apps or incoming_workflows):
+                        rh_provider = default_runninghub_static_provider()
+                        providers.append(rh_provider)
+                    if rh_provider is not None:
+                        overwrite_rh = str(selection.get("runninghub_conflict") or "keep-local") == "backup"
+                        old_workflow_ids = {str(item.get("workflowId") or item.get("id") or "") for item in rh_provider.get("rh_workflows") or [] if isinstance(item, dict)}
+                        rh_provider["rh_apps"], _ = backup_io.merge_entries_by_id(rh_provider.get("rh_apps") or [], incoming_apps, id_keys=("appId", "id"), overwrite=overwrite_rh)
+                        rh_provider["rh_workflows"], _ = backup_io.merge_entries_by_id(rh_provider.get("rh_workflows") or [], incoming_workflows, id_keys=("workflowId", "id"), overwrite=overwrite_rh)
+                        for workflow in incoming_workflows:
+                            workflow_id = runninghub_workflow_store_key(workflow.get("workflowId") or workflow.get("id"))
+                            if not workflow_id or (workflow_id in old_workflow_ids and not overwrite_rh):
+                                continue
+                            workflow_store[workflow_id] = {
+                                "workflowId": workflow_id,
+                                "title": workflow.get("title") or workflow_id,
+                                "description": workflow.get("note") or workflow.get("description") or "",
+                                "fields": workflow.get("fields") or [],
+                                "workflowJson": workflow.get("workflowJson") if isinstance(workflow.get("workflowJson"), dict) else {},
+                                "optionalImageMode": workflow.get("optionalImageMode") or "prune-workflow",
+                                "raw": {},
+                                "updatedAt": now_ms(),
+                            }
+                            workflows_changed = True
+                        if incoming_apps or incoming_workflows:
+                            providers_changed = True
+
+                prompts = copy.deepcopy(original_prompts)
+                prompt_member = configs.get("prompt_libraries")
+                selected_prompt_ids = backup_selected_ids(selection, "prompt_library_ids", [item.get("id") for item in summary.get("prompt_libraries") or []])
+                if prompt_member and selected_prompt_ids:
+                    incoming_prompts = backup_archive_json(archive, prompt_member, default={})
+                    incoming_prompts = {
+                        "active_library_id": incoming_prompts.get("active_library_id"),
+                        "libraries": [item for item in incoming_prompts.get("libraries") or [] if isinstance(item, dict) and str(item.get("id") or "") in selected_prompt_ids],
+                    }
+                    prompts, prompt_stats = backup_io.merge_prompt_libraries(prompts, incoming_prompts)
+                    prompts_changed = bool(prompt_stats.get("imported") or prompt_stats.get("libraries_added"))
+
+                os.makedirs(CANVAS_DIR, exist_ok=True)
+                for canvas in imported_canvas_records:
+                    path_out = canvas_path(canvas["id"])
+                    with CANVAS_LOCK:
+                        with open(path_out, "x", encoding="utf-8") as handle:
+                            json.dump(canvas, handle, ensure_ascii=False, indent=2)
+                    created_canvas_paths.append(path_out)
+                if projects_changed:
+                    save_projects(existing_projects)
+                if providers_changed:
+                    save_api_providers([normalize_provider(item) for item in providers])
+                if prompts_changed:
+                    save_prompt_libraries(prompts)
+                if workflows_changed:
+                    save_runninghub_workflow_store(workflow_store)
+
+                try:
+                    history = backup_load_history()
+                    history.append({"backup_id": manifest.get("backup_id") or "", "imported_at": now_ms(), "project_count": len(project_map), "canvas_count": len(imported_canvas_records)})
+                    backup_save_history(history)
+                except Exception:
+                    pass
+                return {
+                    "ok": True,
+                    "projects": len(project_map),
+                    "canvases": len(imported_canvas_records),
+                    "resources": len(url_mapping),
+                    "providers_changed": providers_changed,
+                    "prompts_changed": prompts_changed,
+                    "runninghub_changed": workflows_changed,
+                }
+            except Exception:
+                for canvas_path_created in created_canvas_paths:
+                    try:
+                        os.remove(canvas_path_created)
+                    except OSError:
+                        pass
+                for resource_path in created_resource_paths:
+                    try:
+                        os.remove(resource_path)
+                    except OSError:
+                        pass
+                try:
+                    if projects_changed:
+                        save_projects(original_projects)
+                    if providers_changed:
+                        save_api_providers(original_providers)
+                    if prompts_changed:
+                        save_prompt_libraries(original_prompts)
+                    if workflows_changed:
+                        save_runninghub_workflow_store(original_workflows)
+                except Exception:
+                    pass
+                raise
+
+@app.get("/api/backups/options")
+async def backup_options():
+    return await asyncio.to_thread(backup_options_payload)
+
+@app.post("/api/backups/export")
+async def export_backup(payload: BackupExportRequest):
+    try:
+        archive_path, filename = await asyncio.to_thread(build_backup_archive, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"创建备份失败：{exc}") from exc
+    token = backup_register_download(archive_path, filename)
+    return {"ok": True, "download_url": f"/api/backups/download/{token}", "filename": filename}
+
+@app.get("/api/backups/download/{token}")
+async def download_backup(token: str):
+    clean_token = re.sub(r"[^a-f0-9]", "", str(token or "").lower())
+    with BACKUP_DOWNLOAD_LOCK:
+        item = BACKUP_DOWNLOADS.get(clean_token)
+    if not item or not os.path.isfile(str(item.get("path") or "")):
+        raise HTTPException(status_code=404, detail="备份下载已过期，请重新导出")
+    return FileResponse(
+        item["path"],
+        media_type="application/zip",
+        filename=item.get("filename") or "Infinite-Canvas备份.zip",
+        background=BackgroundTask(backup_finish_download, clean_token),
+    )
+
+@app.post("/api/backups/inspect")
+async def inspect_backup(file: UploadFile = File(...)):
+    path = ""
+    try:
+        path = await backup_save_upload(file)
+        return await asyncio.to_thread(inspect_backup_path, path)
+    except (ValueError, zipfile.BadZipFile) as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "备份文件无效") from exc
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+@app.post("/api/backups/import")
+async def import_backup(file: UploadFile = File(...), selection: str = Form("{}")):
+    path = ""
+    try:
+        if len(selection.encode("utf-8")) > 1024 * 1024:
+            raise ValueError("导入选项过大")
+        options = json.loads(selection or "{}")
+        if not isinstance(options, dict):
+            raise ValueError("导入选项无效")
+        path = await backup_save_upload(file)
+        return await asyncio.to_thread(import_backup_path, path, options)
+    except (ValueError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "导入备份失败") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"导入备份失败：{exc}") from exc
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 # --- 画布管理 ---
 
@@ -16150,42 +17183,40 @@ async def get_canvas_meta(canvas_id: str):
         "title": canvas.get("title", "未命名画布"),
         "icon": canvas.get("icon", "layers"),
         "kind": normalize_canvas_kind(canvas.get("kind")),
+        "task_runtime_id": CANVAS_TASK_RUNTIME_ID,
     }
 
 @app.post("/api/canvases/{canvas_id}/meta")
 async def update_canvas_meta(canvas_id: str, payload: CanvasMetaUpdate):
     """更新画布的轻量元数据（标题/图标/负责人/颜色/置顶）。
     刻意不走 save_canvas（它会刷新 updated_at），以免打标签/置顶把画布顶到列表最前。"""
-    canvas = load_canvas(canvas_id)
-    if payload.title is not None:
-        canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
-    if payload.icon is not None:
-        canvas["icon"] = (payload.icon or "layers")[:32]
-    if payload.owner is not None:
-        canvas["owner"] = str(payload.owner).strip()[:40]
-    if payload.color is not None:
-        canvas["color"] = normalize_canvas_color(payload.color)
-    if payload.pinned is not None:
-        canvas["pinned"] = bool(payload.pinned)
-    if payload.project is not None:
-        canvas["project"] = str(payload.project).strip() or DEFAULT_PROJECT_ID
-    if payload.board_x is not None:
-        canvas["board_x"] = float(payload.board_x)
-    if payload.board_y is not None:
-        canvas["board_y"] = float(payload.board_y)
-    with CANVAS_LOCK:
-        with open(canvas_path(canvas["id"]), 'w', encoding='utf-8') as f:
-            json.dump(canvas, f, ensure_ascii=False, indent=2)
+    def apply_meta(canvas):
+        if payload.title is not None:
+            canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
+        if payload.icon is not None:
+            canvas["icon"] = (payload.icon or "layers")[:32]
+        if payload.owner is not None:
+            canvas["owner"] = str(payload.owner).strip()[:40]
+        if payload.color is not None:
+            canvas["color"] = normalize_canvas_color(payload.color)
+        if payload.pinned is not None:
+            canvas["pinned"] = bool(payload.pinned)
+        if payload.project is not None:
+            canvas["project"] = str(payload.project).strip() or DEFAULT_PROJECT_ID
+        if payload.board_x is not None:
+            canvas["board_x"] = float(payload.board_x)
+        if payload.board_y is not None:
+            canvas["board_y"] = float(payload.board_y)
+    canvas = mutate_canvas_latest(canvas_id, apply_meta, update_timestamp=False)
     return {"canvas": canvas_record(canvas)}
 
 @app.get("/api/canvases/{canvas_id}")
 async def get_canvas(canvas_id: str):
-    return {"canvas": load_canvas(canvas_id)}
+    return {"canvas": load_canvas(canvas_id), "task_runtime_id": CANVAS_TASK_RUNTIME_ID}
 
 @app.post("/api/canvases/{canvas_id}/touch")
 async def touch_canvas(canvas_id: str):
-    canvas = load_canvas(canvas_id)
-    save_canvas(canvas)
+    canvas = mutate_canvas_latest(canvas_id, lambda _canvas: None)
     return {"canvas": canvas_record(canvas), "updated_at": canvas.get("updated_at", 0)}
 
 @app.get("/api/canvas-assets")
@@ -16600,6 +17631,19 @@ async def add_prompt_library_item(payload: PromptLibraryItemRequest):
     data = save_prompt_libraries(data)
     return {"library": public_prompt_libraries(data), "item": item}
 
+@app.post("/api/prompt-libraries/items/reorder")
+async def reorder_prompt_library_items(payload: PromptLibraryReorderRequest):
+    data = load_prompt_libraries()
+    library = find_prompt_library(data, payload.library_id)
+    if not library:
+        raise HTTPException(status_code=404, detail="提示词库不存在")
+    try:
+        library["items"] = reorder_prompt_library_records(library.get("items") or [], payload.ordered_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    data = save_prompt_libraries(data)
+    return {"library": public_prompt_libraries(data)}
+
 @app.patch("/api/prompt-libraries/items/{item_id}")
 async def update_prompt_library_item(item_id: str, payload: PromptLibraryItemRequest):
     data = load_prompt_libraries()
@@ -16674,6 +17718,19 @@ async def add_prompt_library_category(payload: PromptLibraryCategoryRequest):
     library.setdefault("categories", []).append(category)
     data = save_prompt_libraries(data)
     return {"library": public_prompt_libraries(data), "category": category}
+
+@app.post("/api/prompt-libraries/categories/reorder")
+async def reorder_prompt_library_categories(payload: PromptLibraryReorderRequest):
+    data = load_prompt_libraries()
+    library = find_prompt_library(data, payload.library_id)
+    if not library:
+        raise HTTPException(status_code=404, detail="提示词库不存在")
+    try:
+        library["categories"] = reorder_prompt_library_records(library.get("categories") or [], payload.ordered_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    data = save_prompt_libraries(data)
+    return {"library": public_prompt_libraries(data)}
 
 @app.patch("/api/prompt-libraries/categories/{category_id}")
 async def rename_prompt_library_category(category_id: str, payload: PromptLibraryCategoryRequest):
@@ -17286,26 +18343,26 @@ async def batch_crop_asset_library_items(payload: AssetLibraryBatchCropRequest):
 
 @app.put("/api/canvases/{canvas_id}")
 async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
-    canvas = load_canvas(canvas_id)
-    current_updated_at = int(canvas.get("updated_at") or 0)
-    if payload.base_updated_at and current_updated_at and int(payload.base_updated_at) < current_updated_at:
-        raise HTTPException(status_code=409, detail={
-            "message": "画布已被其他页面更新，已拒绝旧版本覆盖。",
-            "canvas": canvas,
-            "updated_at": current_updated_at,
-        })
-    canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
-    canvas["icon"] = (payload.icon or canvas.get("icon") or "layers")[:32]
-    canvas["kind"] = normalize_canvas_kind(canvas.get("kind"))
-    canvas["nodes"] = payload.nodes
-    canvas["connections"] = payload.connections
-    if canvas["kind"] == "smart":
-        canvas["viewport"] = payload.viewport
-    else:
-        canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
-    canvas["logs"] = payload.logs[-500:]
-    canvas["settings"] = payload.settings or {}
-    save_canvas(canvas)
+    def apply_payload(canvas):
+        current_updated_at = int(canvas.get("updated_at") or 0)
+        if payload.base_updated_at and current_updated_at and int(payload.base_updated_at) < current_updated_at:
+            raise HTTPException(status_code=409, detail={
+                "message": "画布已被其他页面更新，已拒绝旧版本覆盖。",
+                "canvas": canvas,
+                "updated_at": current_updated_at,
+            })
+        canvas["title"] = (payload.title or canvas.get("title") or "未命名画布")[:80]
+        canvas["icon"] = (payload.icon or canvas.get("icon") or "layers")[:32]
+        canvas["kind"] = normalize_canvas_kind(canvas.get("kind"))
+        canvas["nodes"] = payload.nodes
+        canvas["connections"] = payload.connections
+        if canvas["kind"] == "smart":
+            canvas["viewport"] = payload.viewport
+        else:
+            canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
+        canvas["logs"] = payload.logs[-500:]
+        canvas["settings"] = payload.settings or {}
+    canvas = mutate_canvas_latest(canvas_id, apply_payload)
     await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or now_ms()), payload.client_id)
     return {"canvas": canvas}
 
