@@ -1,5 +1,5 @@
 (function(){
-    const VERSION = '2026.08.12-prompt-order.1';
+    const VERSION = '2026.08.14-prompt-library.2';
     const scripts = [
         '/static/js/i18n-core.js',
         '/static/js/i18n/common.js',

@@ -16,6 +16,7 @@
         {id:'alt-copy', keys:['Alt'], i18n:'smart.shortcutAltCopy', label:'按住并拖动复制节点', profiles:ALL_PROFILES},
         {id:'alt-shift-copy', keys:['Alt', 'Shift'], i18n:'smart.shortcutAltShiftCopy', label:'复制节点并保留输入连线', profiles:ALL_PROFILES},
         {id:'assets', keys:['A'], i18n:'smart.shortcutAssets', label:'打开/关闭资源库', profiles:ALL_PROFILES},
+        {id:'prompts', keys:['T'], i18n:'smart.shortcutPrompts', label:'为选中的节点打开提示词库', profiles:ALL_PROFILES},
         {id:'overview', keys:['Z'], i18n:'smart.shortcutOverview', label:'缩小画布视图', profiles:ALL_PROFILES},
         {id:'create-menu', keys:['双击'], i18n:'smart.shortcutCreateMenu', label:'打开快捷菜单', profiles:['smart']},
         {id:'pan', keys:['空白处'], i18n:'smart.shortcutPan', label:'拖动画布', profiles:ALL_PROFILES},

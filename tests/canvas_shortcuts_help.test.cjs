@@ -42,7 +42,7 @@ test('classic shortcut profile contains real classic actions and omits smart-onl
 
     assert.deepEqual(ids, [
         'box-select', 'group', 'undo', 'redo-shift', 'redo-y', 'copy', 'paste',
-        'alt-copy', 'alt-shift-copy', 'assets', 'overview', 'pan', 'zoom', 'delete',
+        'alt-copy', 'alt-shift-copy', 'assets', 'prompts', 'overview', 'pan', 'zoom', 'delete',
     ]);
     assert.ok(!ids.includes('ungroup'));
     assert.ok(!ids.includes('create-menu'));
@@ -52,7 +52,7 @@ test('smart shortcut profile preserves every existing smart shortcut row', () =>
     const {shortcutItems} = loadHelper();
     const ids = shortcutItems('smart').map(item => item.id);
 
-    assert.equal(ids.length, 16);
+    assert.equal(ids.length, 17);
     assert.ok(ids.includes('ungroup'));
     assert.ok(ids.includes('assets'));
     assert.ok(ids.includes('create-menu'));
@@ -62,8 +62,9 @@ test('shortcut markup renders translated rows and the actual key combinations', 
     const {shortcutItemsHtml} = loadHelper();
     const html = shortcutItemsHtml('classic');
 
-    assert.equal((html.match(/class="shortcut-item"/g) || []).length, 14);
+    assert.equal((html.match(/class="shortcut-item"/g) || []).length, 15);
     assert.match(html, /data-shortcut-id="assets"[^>]*><span class="shortcut-keys"><kbd>A<\/kbd>/);
+    assert.match(html, /data-shortcut-id="prompts"[^>]*><span class="shortcut-keys"><kbd>T<\/kbd>/);
     assert.match(html, /<kbd>Ctrl<\/kbd><kbd>Shift<\/kbd><kbd>Z<\/kbd>/);
     assert.match(html, /data-i18n="smart\.shortcutAltShiftCopy"/);
     assert.doesNotMatch(html, /smart\.shortcutUngroup/);

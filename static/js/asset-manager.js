@@ -28,6 +28,9 @@ const savedLocalCaptionSettings = readLocalCaptionSettings();
 let activeTab = 'assets';
 let assetLibrary = {libraries:[], categories:[]};
 let promptLibrary = {libraries:[]};
+let promptDragState = null;
+let promptDropTarget = null;
+let promptDropSuppressClick = false;
 let apiProviders = [];
 let avatarRegisterProvider = '';
 let avatarBusyId = '';
@@ -59,6 +62,8 @@ let managedSelectionPointerGuard = null;
 let assetEditMode = false;
 let promptEditMode = false;
 let promptCreateMode = false;
+let promptDraftThumbnailFile = null;
+let promptDraftThumbnailUrl = '';
 let pendingDeleteAssetId = '';
 let pendingDeletePromptId = '';
 let pendingBatchDelete = '';
@@ -99,7 +104,7 @@ let localUploadClipboard = null;
 let assetClassifyBusy = false;
 let localClassifyBusy = false;
 let lightboxPanState = null;
-let canvasAssetsData = {categories:[], canvases:[], items:[]};
+let canvasAssetsData = {categories:[], canvases:[], items:[], orphanItems:[]};
 let activeCanvasAssetCategory = 'smart';
 let activeCanvasAssetCanvasId = '';
 let selectedCanvasAssetId = '';
@@ -381,7 +386,7 @@ function renderStorageSettingsModal(){
         <div class="storage-file-head">
             <div class="storage-tabs">${tabs}</div>
             <div class="storage-file-actions">
-                <button class="asset-btn" type="button" data-storage-select-all ${storageSettingsState.items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>全选</span></button>
+                <button class="asset-btn" type="button" data-storage-select-all ${storageSettingsState.items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>${selectionToggleLabel(storageSettingsState.items, storageSettingsState.selected)}</span></button>
                 <button class="asset-btn danger" type="button" data-storage-delete ${selectedCount ? '' : 'disabled'}><i data-lucide="trash-2"></i><span>删除 ${selectedCount || ''}</span></button>
             </div>
         </div>
@@ -438,9 +443,10 @@ function formatFileSize(bytes=0){
     return `${(size / Math.pow(1024, idx)).toFixed(idx ? 1 : 0)} ${units[idx]}`;
 }
 function assetLibraries(){
-    return Array.isArray(assetLibrary.libraries) && assetLibrary.libraries.length
+    const libraries = Array.isArray(assetLibrary.libraries) && assetLibrary.libraries.length
         ? assetLibrary.libraries
-        : [{id:'default', name:'默认资产库', categories:assetLibrary.categories || []}];
+        : [{id:'default', name:'角色素材库', categories:assetLibrary.categories || []}];
+    return libraries.map(library => library.id === 'default' ? {...library, name:'角色素材库'} : library);
 }
 function activeAssetLibrary(){
     const libs = assetLibraries();
@@ -469,7 +475,7 @@ function activeAssetCategory(){
 function assetViewTitle(){
     const entry = activeAssetClassEntry();
     if(entry) return entry.tag || '智能分类';
-    return activeAssetCategory()?.name || '图片资产';
+    return activeAssetCategory()?.name || '角色库';
 }
 function assetViewSubtitle(items){
     const libName = activeAssetLibrary()?.name || '资产库';
@@ -947,7 +953,7 @@ function canvasAssetCategories(){
             {id:'smart', name:'智能画布', count:(canvasAssetsData.items || []).filter(item => item.canvas_kind === 'smart').length, canvas_count:(canvasAssetsData.canvases || []).filter(item => item.kind === 'smart').length},
             {id:'classic', name:'普通画布', count:(canvasAssetsData.items || []).filter(item => item.canvas_kind !== 'smart').length, canvas_count:(canvasAssetsData.canvases || []).filter(item => item.kind !== 'smart').length}
         ];
-    return cats;
+    return [...cats, {id:'orphans', name:'孤立素材', count:(canvasAssetsData.orphanItems || []).length, canvas_count:0}];
 }
 function activeCanvasAssetCategoryInfo(){
     return canvasAssetCategories().find(cat => cat.id === activeCanvasAssetCategory) || canvasAssetCategories()[0] || {id:'smart', name:'智能画布', count:0, canvas_count:0};
@@ -971,6 +977,7 @@ function canvasAssetCountForCanvas(canvasId){
     return uniqueCanvasAssets(canvasAssetsData.items || []).filter(item => item.canvas_id === canvasId).length;
 }
 function canvasAssetsForCategory(categoryId=activeCanvasAssetCategory){
+    if(categoryId === 'orphans') return [];
     let list = Array.isArray(canvasAssetsData.canvases) ? canvasAssetsData.canvases.slice() : [];
     list = list.filter(canvas => (canvas.kind || 'classic') === categoryId);
     return list.sort((a, b) => String(a.title || '').localeCompare(String(b.title || ''), 'zh-Hans-CN', {numeric:true, sensitivity:'base'}));
@@ -985,9 +992,11 @@ function activeCanvasAssetCanvas(){
     return (canvasAssetsData.canvases || []).find(canvas => canvas.id === activeCanvasAssetCanvasId) || null;
 }
 function canvasAssetViewTitle(){
+    if(activeCanvasAssetCategory === 'orphans') return '孤立素材';
     return activeCanvasAssetCanvas()?.title || activeCanvasAssetCategoryInfo().name || '画布资产';
 }
 function canvasAssetViewSubtitle(items){
+    if(activeCanvasAssetCategory === 'orphans') return `${items.length} 个未被画布引用的本地素材`;
     const canvas = activeCanvasAssetCanvas();
     if(canvas) return `${canvasKindLabel(canvas.kind)} / ${items.length} 个资产 / ${escapeHtml(canvasAssetSortLabel())}`;
     const activeCat = activeCanvasAssetCategoryInfo();
@@ -1008,6 +1017,14 @@ function canvasAssetSortLabel(){
     return map[canvasAssetSort] || map.canvas_asc;
 }
 function currentCanvasAssetItems(){
+    if(activeCanvasAssetCategory === 'orphans'){
+        const q = String(canvasAssetQuery || '').trim().toLowerCase();
+        let list = (canvasAssetsData.orphanItems || []).slice();
+        if(q) list = list.filter(item => [item.name, item.url, item.kind].join(' ').toLowerCase().includes(q));
+        if(canvasAssetSort === 'name_asc') list.sort((a,b) => String(a.name||'').localeCompare(String(b.name||''), 'zh-Hans-CN', {numeric:true}));
+        else list.sort((a,b) => Number(b.created_at||0) - Number(a.created_at||0));
+        return list;
+    }
     const q = String(canvasAssetQuery || '').trim().toLowerCase();
     let list = uniqueCanvasAssets(canvasAssetsData.items || []).filter(item => {
         if((item.canvas_kind || 'classic') !== activeCanvasAssetCategory) return false;
@@ -1080,6 +1097,86 @@ function currentPromptItems(){
         return [item.name, item.scene, item.positive, item.negative, item.category].join(' ').toLowerCase().includes(query);
     });
 }
+function promptItemCategory(item){
+    return String(item?.category || 'custom');
+}
+function promptReorderEnabled(){
+    const lib = activePromptLibrary();
+    return Boolean(lib && !lib.readonly && !promptQuery.trim());
+}
+function promptMoveEnabled(){
+    const lib = activePromptLibrary();
+    return Boolean(lib && !lib.readonly);
+}
+function promptCategoryReorderEnabled(libId=''){
+    const lib = promptLibraries().find(entry => entry.id === String(libId)) || activePromptLibrary();
+    return Boolean(lib && !lib.readonly && (lib.categories || []).length > 1);
+}
+function promptFullOrderForCategory(lib, categoryId, categoryIds){
+    let index = 0;
+    return (lib?.items || []).map(item => {
+        if(promptItemCategory(item) === String(categoryId)) return categoryIds[index++];
+        return String(item.id);
+    });
+}
+function clearPromptDropState(){
+    promptDropTarget = null;
+    clearPromptDropMarks();
+}
+function clearPromptDropMarks(){
+    root.querySelectorAll('.prompt-row.is-dragging,.prompt-row.is-order-before,.prompt-row.is-order-after,.prompt-list.is-order-end,.tree-row.is-dragging,.tree-row.is-order-before,.tree-row.is-order-after,.tree-row.prompt-drop-target').forEach(el => {
+        el.classList.remove('is-dragging','is-order-before','is-order-after','is-order-end','prompt-drop-target');
+    });
+}
+async function reorderPromptCategories(movedId, targetId, after=false, libraryId=''){
+    const lib = promptLibraries().find(entry => entry.id === String(libraryId)) || activePromptLibrary();
+    if(!lib || lib.readonly || !movedId || !targetId || movedId === targetId) return;
+    const ids = (lib.categories || []).map(category => String(category.id)).filter(Boolean);
+    const movedIndex = ids.indexOf(String(movedId));
+    const targetIndex = ids.indexOf(String(targetId));
+    if(movedIndex < 0 || targetIndex < 0) return;
+    ids.splice(movedIndex, 1);
+    const nextTargetIndex = ids.indexOf(String(targetId));
+    ids.splice(nextTargetIndex + (after ? 1 : 0), 0, String(movedId));
+    const data = await apiJson('/api/prompt-libraries/categories/reorder', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({library_id:lib.id, ordered_ids:ids})
+    });
+    promptLibrary = data.library || promptLibrary;
+}
+function promptDragItemFromEvent(event){
+    const row = event.target?.closest?.('[data-prompt-row]');
+    if(!row || !promptMoveEnabled()) return null;
+    const item = findPromptItem(row.dataset.promptRow || '');
+    return item ? {item, row} : null;
+}
+async function reorderPromptCategory(categoryId, orderedCategoryIds){
+    const lib = activePromptLibrary();
+    if(!lib || !promptReorderEnabled() || !orderedCategoryIds?.length) return;
+    const orderedIds = String(categoryId) === 'all'
+        ? orderedCategoryIds.map(id => String(id))
+        : promptFullOrderForCategory(lib, categoryId, orderedCategoryIds);
+    const data = await apiJson('/api/prompt-libraries/items/reorder', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({library_id:lib.id, ordered_ids:orderedIds})
+    });
+    promptLibrary = data.library || promptLibrary;
+}
+async function movePromptToCategory(item, targetCategory){
+    const lib = activePromptLibrary();
+    if(!lib || !item || !targetCategory || targetCategory === promptItemCategory(item) || !promptMoveEnabled()) return;
+    const data = await apiJson(`/api/prompt-libraries/items/${encodeURIComponent(item.id)}`, {
+        method:'PATCH', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({library_id:lib.id, name:item.name, positive:item.positive, negative:item.negative, scene:item.scene, category:targetCategory})
+    });
+    promptLibrary = data.library || promptLibrary;
+    activePromptCategory = targetCategory;
+    const movedLib = activePromptLibrary();
+    const targetIds = (movedLib?.items || []).filter(entry => promptItemCategory(entry) === String(targetCategory) && String(entry.id) !== String(item.id)).map(entry => String(entry.id));
+    targetIds.push(String(item.id));
+    await reorderPromptCategory(targetCategory, targetIds);
+    selectedPromptId = item.id;
+}
 // 认证支持的平台键（与后端 AVATAR_SUPPORTED_PLATFORMS 保持一致；新增平台时同步）
 const AVATAR_SUPPORTED_PLATFORMS = ['apimart', 'volcengine'];
 const AVATAR_PLATFORM_LABELS = {apimart:'APIMart', volcengine:'火山引擎'};
@@ -1138,7 +1235,7 @@ function findPromptItem(id){
     return null;
 }
 function findCanvasAssetItem(id){
-    return (canvasAssetsData.items || []).find(item => item.id === id) || null;
+    return [...(canvasAssetsData.items || []), ...(canvasAssetsData.orphanItems || [])].find(item => item.id === id) || null;
 }
 function selectedAsset(){
     const items = currentAssetItems();
@@ -1164,6 +1261,17 @@ function toggleSelectionSet(set, id){
     }
     set.add(id);
     return true;
+}
+function selectionIsComplete(items, set){
+    return Array.isArray(items) && items.length > 0 && items.every(item => set.has(item.id));
+}
+function toggleSelectionAll(items, set){
+    const list = Array.isArray(items) ? items : [];
+    if(selectionIsComplete(list, set)) list.forEach(item => set.delete(item.id));
+    else list.forEach(item => set.add(item.id));
+}
+function selectionToggleLabel(items, set){
+    return selectionIsComplete(items, set) ? '取消选择' : '全部选择';
 }
 function managedSelectionTarget(target){
     if(activeTab === 'assets' && assetManageMode){
@@ -1294,11 +1402,15 @@ function normalizeCanvasAssetState(){
 async function refreshCanvasAssets(){
     try {
         setStatus('正在刷新画布资产...');
-        const data = await apiJson('/api/canvas-assets');
+        const [data, orphanData] = await Promise.all([
+            apiJson('/api/canvas-assets'),
+            apiJson('/api/canvas-assets/orphans').catch(() => ({items:[]}))
+        ]);
         canvasAssetsData = {
             categories:Array.isArray(data.categories) ? data.categories : [],
             canvases:Array.isArray(data.canvases) ? data.canvases : [],
-            items:Array.isArray(data.items) ? data.items : []
+            items:Array.isArray(data.items) ? data.items : [],
+            orphanItems:Array.isArray(orphanData.items) ? orphanData.items : []
         };
         normalizeCanvasAssetState();
         render();
@@ -1309,11 +1421,12 @@ async function refreshCanvasAssets(){
 }
 async function loadAll(){
     setStatus('加载中...');
-    const [assetData, promptData, providerData, canvasAssetData] = await Promise.all([
+    const [assetData, promptData, providerData, canvasAssetData, orphanAssetData] = await Promise.all([
         apiJson('/api/asset-library'),
         apiJson('/api/prompt-libraries'),
         apiJson('/api/providers').catch(() => ({providers:[]})),
         apiJson('/api/canvas-assets').catch(() => ({categories:[], canvases:[], items:[]})),
+        apiJson('/api/canvas-assets/orphans').catch(() => ({items:[]})),
         loadSharedFolders(),
         loadLocalAssets()
     ]);
@@ -1323,9 +1436,10 @@ async function loadAll(){
     canvasAssetsData = {
         categories:Array.isArray(canvasAssetData.categories) ? canvasAssetData.categories : [],
         canvases:Array.isArray(canvasAssetData.canvases) ? canvasAssetData.canvases : [],
-        items:Array.isArray(canvasAssetData.items) ? canvasAssetData.items : []
+        items:Array.isArray(canvasAssetData.items) ? canvasAssetData.items : [],
+        orphanItems:Array.isArray(orphanAssetData.items) ? orphanAssetData.items : []
     };
-    // 刷新时默认回到「默认资产库」
+    // 刷新时默认回到「角色素材库」
     const libs = assetLibraries();
     activeAssetLibraryId = (libs.find(lib => lib.id === 'default') || libs[0])?.id || '';
     activeWorkflowLibraryId = (libs.find(lib => lib.id === 'default') || libs[0])?.id || '';
@@ -1393,7 +1507,8 @@ function renderCanvasAssetsManager(){
     normalizeCanvasAssetState();
     const items = currentCanvasAssetItems();
     const groups = groupCanvasAssetItems(items);
-    const total = uniqueCanvasAssets(canvasAssetsData.items || []).length;
+    const total = uniqueCanvasAssets(canvasAssetsData.items || []).length + (canvasAssetsData.orphanItems || []).length;
+    const isOrphans = activeCanvasAssetCategory === 'orphans';
     const detail = selectedCanvasAsset();
     root.innerHTML = `
         <aside class="asset-panel asset-nav">
@@ -1425,10 +1540,10 @@ function renderCanvasAssetsManager(){
                 </div>
             </div>
             <div class="manage-tools">
+                ${isOrphans ? `<button class="asset-btn danger" type="button" data-canvas-orphan-delete-selected ${selectedCanvasAssetIds.size ? '' : 'disabled'}><i data-lucide="trash-2"></i><span>删除所选孤立素材</span></button>` : ''}
                 <span>已选择 ${selectedCanvasAssetIds.size} 个画布资产，支持拖拽框选或逐个勾选。</span>
                 <div class="asset-tools">
-                    <button class="asset-btn" type="button" data-canvas-asset-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>全选</span></button>
-                    <button class="asset-btn" type="button" data-canvas-asset-clear-selection ${selectedCanvasAssetIds.size ? '' : 'disabled'}><i data-lucide="square"></i><span>清空</span></button>
+                    <button class="asset-btn" type="button" data-canvas-asset-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>${selectionToggleLabel(items, selectedCanvasAssetIds)}</span></button>
                     <button class="asset-btn primary" type="button" data-canvas-asset-download-selected ${selectedCanvasAssetIds.size ? '' : 'disabled'}><i data-lucide="download"></i><span>下载所选</span></button>
                 </div>
             </div>
@@ -1445,6 +1560,16 @@ function renderCanvasAssetsManager(){
     `;
 }
 function renderCanvasAssetTreeBranch(cat){
+    if(cat.id === 'orphans'){
+        const active = cat.id === activeCanvasAssetCategory && !activeCanvasAssetCanvasId;
+        return `<div class="tree-branch orphan-branch">
+            <button class="tree-row tree-parent ${active ? 'active' : ''}" type="button" data-canvas-asset-cat="orphans">
+                <span class="tree-row-icon"><i data-lucide="trash-2"></i></span>
+                <span class="tree-row-name">${escapeHtml(cat.name || '孤立素材')}</span>
+                <span class="tree-row-count">${Number(cat.count || 0)}</span>
+            </button>
+        </div>`;
+    }
     const canvases = canvasAssetsForCategory(cat.id);
     const activeParent = cat.id === activeCanvasAssetCategory && !activeCanvasAssetCanvasId;
     const containsActive = cat.id === activeCanvasAssetCategory && !!activeCanvasAssetCanvasId;
@@ -1484,12 +1609,13 @@ function renderCanvasAssetGroup(group){
     </section>`;
 }
 function renderCanvasAssetCard(item){
+    const orphan = !item.canvas_id;
     return `<article class="asset-card canvas-asset-card ${item.id === selectedCanvasAssetId ? 'active' : ''}" data-canvas-asset-card="${escapeAttr(item.id)}">
         <input class="asset-card-check" type="checkbox" data-canvas-asset-check="${escapeAttr(item.id)}" ${selectedCanvasAssetIds.has(item.id) ? 'checked' : ''}>
         <div class="asset-thumb canvas-asset-thumb">${assetThumb(item)}${renderCanvasAssetKindBadge(item)}</div>
         <div class="asset-card-body">
             <div class="asset-card-name" title="${escapeAttr(item.name || '')}">${escapeHtml(item.name || 'canvas asset')}</div>
-            <div class="asset-card-meta">${escapeHtml(canvasAssetKindLabel(item))} · ${escapeHtml(item.canvas_title || '未命名画布')}</div>
+            <div class="asset-card-meta">${escapeHtml(canvasAssetKindLabel(item))} · ${escapeHtml(orphan ? '未被画布引用' : (item.canvas_title || '未命名画布'))}</div>
         </div>
     </article>`;
 }
@@ -1502,6 +1628,7 @@ function renderCanvasAssetDetail(item){
     if(!item) return `<div class="panel-head"><div class="panel-title"><strong>画布资产详情</strong><span>选择一个画布资产查看详情</span></div></div><div class="detail-scroll"><div class="detail-empty"><i data-lucide="layout-dashboard"></i><span>暂无画布资产</span></div></div>`;
     const kind = assetKind(item);
     const canPreview = ['image','video'].includes(kind);
+    const orphan = !item.canvas_id;
     return `
         <div class="panel-head">
             <div class="panel-title"><strong>画布资产详情</strong><span>${escapeHtml(canvasAssetKindLabel(item))}</span></div>
@@ -1509,6 +1636,7 @@ function renderCanvasAssetDetail(item){
                 ${canPreview ? `<button class="asset-icon-btn" type="button" data-canvas-asset-preview="${escapeAttr(item.id)}" title="${kind === 'video' ? '预览视频' : '放大预览'}"><i data-lucide="${kind === 'video' ? 'play' : 'maximize-2'}"></i></button>` : ''}
                 <button class="asset-icon-btn" type="button" data-canvas-asset-open="${escapeAttr(item.id)}" title="打开链接"><i data-lucide="external-link"></i></button>
                 <button class="asset-icon-btn" type="button" data-canvas-asset-copy="${escapeAttr(item.id)}" title="复制链接"><i data-lucide="copy"></i></button>
+                ${orphan ? `<button class="asset-icon-btn danger" type="button" data-canvas-orphan-delete-one="${escapeAttr(item.id)}" title="删除本地文件"><i data-lucide="trash-2"></i></button>` : ''}
                 <button class="asset-btn primary" type="button" data-canvas-asset-download="${escapeAttr(item.id)}"><i data-lucide="download"></i><span>下载</span></button>
             </div>
         </div>
@@ -1522,8 +1650,8 @@ function renderCanvasAssetDetail(item){
                 <div class="detail-name">${escapeHtml(item.name || '画布资产')}</div>
                 <div class="detail-meta-grid">
                     <div class="detail-meta"><span>类型</span><strong>${escapeHtml(canvasAssetKindLabel(item))}</strong></div>
-                    <div class="detail-meta"><span>画布分类</span><strong>${escapeHtml(canvasKindLabel(item.canvas_kind))}</strong></div>
-                    <div class="detail-meta"><span>来源画布</span><strong title="${escapeAttr(item.canvas_title || '')}">${escapeHtml(item.canvas_title || '未命名画布')}</strong></div>
+                    <div class="detail-meta"><span>画布分类</span><strong>${escapeHtml(orphan ? '孤立素材' : canvasKindLabel(item.canvas_kind))}</strong></div>
+                    <div class="detail-meta"><span>来源画布</span><strong title="${escapeAttr(item.canvas_title || '')}">${escapeHtml(orphan ? '未被任何画布引用' : (item.canvas_title || '未命名画布'))}</strong></div>
                     <div class="detail-meta"><span>更新时间</span><strong>${escapeHtml(formatDate(item.canvas_updated_at || item.created_at))}</strong></div>
                     <div class="detail-meta"><span>来源节点</span><strong title="${escapeAttr(item.node_title || item.node_type || '')}">${escapeHtml(item.node_title || item.node_type || '节点')}</strong></div>
                     <div class="detail-meta"><span>节点类型</span><strong>${escapeHtml(item.node_type || '-')}</strong></div>
@@ -1717,8 +1845,7 @@ function renderLocalManager(){
                     <span class="manage-group-title">管理</span>
                     <span class="manage-summary">已选 ${selectedLocalUploadIds.size} 个，其中 ${imageCount} 张图片</span>
                     <div class="asset-tools local-manage-actions">
-                        <button class="asset-btn" type="button" data-localup-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>全选</span></button>
-                        <button class="asset-btn" type="button" data-localup-clear ${selectedLocalUploadIds.size ? '' : 'disabled'}><i data-lucide="square"></i><span>清空</span></button>
+                        <button class="asset-btn" type="button" data-localup-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>${selectionToggleLabel(items, selectedLocalUploadIds)}</span></button>
                         <button class="asset-btn" type="button" data-localup-download-selected ${selectedLocalUploadIds.size ? '' : 'disabled'}><i data-lucide="download"></i><span>下载</span></button>
                         <button class="asset-btn" type="button" data-localup-canvas-selected ${selectedLocalUploadIds.size ? '' : 'disabled'}><i data-lucide="clipboard-paste"></i><span>复制到画布</span></button>
                         <button class="asset-btn" type="button" data-localup-cut-selected ${selectedLocalUploadIds.size ? '' : 'disabled'}><i data-lucide="scissors"></i><span>剪切/移动</span></button>
@@ -1856,9 +1983,9 @@ function renderLocalClipboardBar(){
     const modeLabel = localClipboard.mode === 'cut' ? '剪切' : '复制';
     const target = activeAssetCategory();
     return `<div class="asset-clipboard-bar">
-        <div class="asset-clipboard-info"><i data-lucide="clipboard"></i><span>${escapeHtml(modeLabel)}了 ${localClipboard.items.length} 个本地素材，目标：${escapeHtml(activeAssetLibrary()?.name || '图片资产')} / ${escapeHtml(target?.name || '未选择分组')}</span></div>
+        <div class="asset-clipboard-info"><i data-lucide="clipboard"></i><span>${escapeHtml(modeLabel)}了 ${localClipboard.items.length} 个本地素材，目标：${escapeHtml(activeAssetLibrary()?.name || '角色库')} / ${escapeHtml(target?.name || '未选择分组')}</span></div>
         <div class="asset-tools">
-            <button class="asset-btn primary" type="button" data-local-import-clipboard ${target ? '' : 'disabled'}><i data-lucide="clipboard-paste"></i><span>导入到图片资产</span></button>
+            <button class="asset-btn primary" type="button" data-local-import-clipboard ${target ? '' : 'disabled'}><i data-lucide="clipboard-paste"></i><span>导入到角色库</span></button>
             <button class="asset-icon-btn" type="button" data-local-clear-clipboard title="清空本地剪贴板"><i data-lucide="x"></i></button>
         </div>
     </div>`;
@@ -1930,8 +2057,7 @@ function renderAssetManager(){
                     <span class="manage-group-title">管理</span>
                     <span class="manage-summary">已选 ${selectedAssetIds.size} 个，其中 ${imageCount} 张图片</span>
                     <div class="asset-tools">
-                        <button class="asset-btn" type="button" data-asset-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>全选</span></button>
-                        <button class="asset-btn" type="button" data-asset-clear-selection ${selectedAssetIds.size ? '' : 'disabled'}><i data-lucide="square"></i><span>清空</span></button>
+                        <button class="asset-btn" type="button" data-asset-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>${selectionToggleLabel(items, selectedAssetIds)}</span></button>
                         <button class="asset-btn" type="button" data-asset-cut-selected ${selectedAssetIds.size ? '' : 'disabled'}><i data-lucide="scissors"></i><span>剪切</span></button>
                         <button class="asset-btn" type="button" data-asset-copy-selected ${selectedAssetIds.size ? '' : 'disabled'}><i data-lucide="copy"></i><span>复制</span></button>
                         <button class="asset-btn" type="button" data-asset-download-selected ${selectedAssetIds.size ? '' : 'disabled'}><i data-lucide="download"></i><span>下载所选</span></button>
@@ -2009,8 +2135,7 @@ function renderWorkflowManager(){
             <div class="manage-tools">
                 <span>已选择 ${selectedWorkflowIds.size} 个工作流。</span>
                 <div class="asset-tools">
-                    <button class="asset-btn" type="button" data-workflow-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>全选</span></button>
-                    <button class="asset-btn" type="button" data-workflow-clear-selection ${selectedWorkflowIds.size ? '' : 'disabled'}><i data-lucide="square"></i><span>清空</span></button>
+                    <button class="asset-btn" type="button" data-workflow-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>${selectionToggleLabel(items, selectedWorkflowIds)}</span></button>
                     <button class="asset-btn" type="button" data-workflow-export-selected ${selectedWorkflowIds.size ? '' : 'disabled'}><i data-lucide="download"></i><span>导出所选</span></button>
                     <button class="asset-btn danger" type="button" data-workflow-delete-selected ${selectedWorkflowIds.size ? '' : 'disabled'}><i data-lucide="trash-2"></i><span>删除所选</span></button>
                 </div>
@@ -2362,8 +2487,7 @@ function renderPromptManager(){
             <div class="manage-tools">
                 <span>已选择 ${selectedPromptIds.size} 条提示词，支持拖拽框选或逐个勾选。</span>
                 <div class="asset-tools">
-                    <button class="asset-btn" type="button" data-prompt-select-all ${items.length && !readonly ? '' : 'disabled'}><i data-lucide="check-square"></i><span>全选</span></button>
-                    <button class="asset-btn" type="button" data-prompt-clear-selection ${selectedPromptIds.size ? '' : 'disabled'}><i data-lucide="square"></i><span>清空</span></button>
+                    <button class="asset-btn" type="button" data-prompt-select-all ${items.length && !readonly ? '' : 'disabled'}><i data-lucide="check-square"></i><span>${selectionToggleLabel(items, selectedPromptIds)}</span></button>
                     <button class="asset-btn danger ${pendingBatchDelete === 'prompt' ? 'detail-confirm' : ''}" type="button" data-prompt-delete-selected ${readonly || !selectedPromptIds.size ? 'disabled' : ''}><i data-lucide="trash-2"></i><span>${pendingBatchDelete === 'prompt' ? '确认删除' : '删除所选'}</span></button>
                 </div>
             </div>
@@ -2399,7 +2523,8 @@ function renderPromptTreeBranch(lib){
             </button>
             ${cats.map(cat => {
                 const active = isActiveLib && cat.id === activePromptCategory && promptTreeFocus === 'category';
-                return `<button class="tree-row tree-child ${active ? 'active' : ''}" type="button" data-prompt-cat="${escapeAttr(cat.id)}" data-prompt-cat-lib="${libId}">
+                const categoryDraggable = promptCategoryReorderEnabled(lib.id);
+                return `<button class="tree-row tree-child ${active ? 'active' : ''}" type="button" data-prompt-cat="${escapeAttr(cat.id)}" data-prompt-cat-lib="${libId}" data-prompt-drop-category="${escapeAttr(cat.id)}" data-prompt-category-order-id="${escapeAttr(cat.id)}" draggable="${categoryDraggable ? 'true' : 'false'}" ${(!readonly && isActiveLib) ? 'title="拖动提示词到此处即可移动分类；拖动分类可调整顺序"' : ''}>
                 <span class="tree-elbow"></span>
                 <span class="tree-row-icon"><i data-lucide="tag"></i></span>
                 <span class="tree-row-name">${escapeHtml(cat.name || promptCategoryLabel(cat.id))}</span>
@@ -2443,9 +2568,41 @@ function renderPromptTreeInlineEdit(kind){
         <button type="button" data-prompt-tree-edit-cancel><i data-lucide="x"></i><span>取消</span></button>
     </div>`;
 }
+function clearPromptDraftThumbnail(){
+    if(promptDraftThumbnailUrl && window.URL?.revokeObjectURL) window.URL.revokeObjectURL(promptDraftThumbnailUrl);
+    promptDraftThumbnailFile = null;
+    promptDraftThumbnailUrl = '';
+}
+function stagePromptDraftThumbnail(file){
+    clearPromptDraftThumbnail();
+    if(file && window.URL?.createObjectURL){
+        promptDraftThumbnailFile = file;
+        promptDraftThumbnailUrl = window.URL.createObjectURL(file);
+    }
+    render();
+}
+function promptDraftThumbnailItem(){
+    return {
+        id:'',
+        name:'新模板',
+        category:activePromptCategory === 'all' ? 'custom' : activePromptCategory,
+        thumbnail:promptDraftThumbnailUrl
+    };
+}
+function preserveAssetPromptDraft(){
+    const fields = ['promptEditName','promptEditScene','promptEditPositive','promptEditNegative'];
+    const snapshot = fields.map(id => ({id, value:document.getElementById(id)?.value})).filter(entry => entry.value !== undefined);
+    return () => snapshot.forEach(({id, value}) => {
+        const input = document.getElementById(id);
+        if(input) input.value = value;
+    });
+}
 function renderPromptRow(item, readonly){
-    return `<article class="prompt-row ${item.id === selectedPromptId ? 'active' : ''}" data-prompt-row="${escapeAttr(item.id)}">
+    const draggable = promptMoveEnabled() && !readonly;
+    return `<article class="prompt-row has-thumbnail ${draggable ? 'sortable' : ''} ${item.id === selectedPromptId ? 'active' : ''}" data-prompt-row="${escapeAttr(item.id)}" draggable="${draggable ? 'true' : 'false'}" ${draggable ? 'title="拖动卡片可调整上下位置，或移动到左侧分类"' : ''}>
+        ${draggable ? `<span class="prompt-row-grip" data-prompt-item-drag="${escapeAttr(item.id)}" draggable="true" role="button" aria-label="拖动提示词调整位置" title="拖动调整上下位置，或拖到左侧分类"><i data-lucide="grip-vertical"></i></span>` : ''}
         <input class="prompt-row-check" type="checkbox" data-prompt-check="${escapeAttr(item.id)}" ${selectedPromptIds.has(item.id) ? 'checked' : ''} ${readonly ? 'disabled' : ''}>
+        ${window.PromptTemplateThumbnails?.card(item) || ''}
         <div class="prompt-row-main">
             <div class="prompt-row-title"><strong>${escapeHtml(item.name || '提示词')}</strong><span class="prompt-tag">${escapeHtml(promptCategoryLabel(item.category || 'custom'))}</span></div>
             <div class="prompt-row-scene">${escapeHtml(item.scene || '未填写用途说明')}</div>
@@ -2464,9 +2621,9 @@ function renderPromptDetail(item, readonly){
                 </div>
             </div>
             <div class="detail-scroll">
+                ${window.PromptTemplateThumbnails?.editor(promptDraftThumbnailItem(), {layout:'canvas', purposeInputId:'promptEditScene', purposeEditable:true}) || ''}
                 <div class="inline-edit-form">
                     <label class="inline-edit-field"><span>名称</span><input id="promptEditName" type="text" value="" placeholder="提示词名称"></label>
-                    <label class="inline-edit-field"><span>用途说明</span><textarea id="promptEditScene" placeholder="用途说明"></textarea></label>
                     <label class="inline-edit-field"><span>正向提示词</span><textarea id="promptEditPositive" placeholder="正向提示词"></textarea></label>
                     <label class="inline-edit-field"><span>负向提示词</span><textarea id="promptEditNegative" placeholder="负向提示词"></textarea></label>
                 </div>
@@ -2484,9 +2641,9 @@ function renderPromptDetail(item, readonly){
                 </div>
             </div>
             <div class="detail-scroll">
+                ${window.PromptTemplateThumbnails?.editor(item, {layout:'canvas', purpose:item.scene || '', purposeEditable:true, purposeInputId:'promptEditScene'}) || ''}
                 <div class="inline-edit-form">
                     <label class="inline-edit-field"><span>名称</span><input id="promptEditName" type="text" value="${escapeAttr(item.name || '')}" placeholder="提示词名称"></label>
-                    <label class="inline-edit-field"><span>用途说明</span><textarea id="promptEditScene" placeholder="用途说明">${escapeHtml(item.scene || '')}</textarea></label>
                     <label class="inline-edit-field"><span>正向提示词</span><textarea id="promptEditPositive" placeholder="正向提示词">${escapeHtml(item.positive || '')}</textarea></label>
                     <label class="inline-edit-field"><span>负向提示词</span><textarea id="promptEditNegative" placeholder="负向提示词">${escapeHtml(item.negative || '')}</textarea></label>
                 </div>
@@ -2507,6 +2664,7 @@ function renderPromptDetail(item, readonly){
                 <div class="prompt-detail-title">${escapeHtml(item.name || '提示词')}</div>
                 <div class="prompt-detail-scene">${escapeHtml(item.scene || '未填写用途说明')}</div>
             </div>
+            ${window.PromptTemplateThumbnails?.editor(item, {layout:'canvas', purpose:item.scene || '', disabled:readonly}) || ''}
             <section class="prompt-block">
                 <div class="prompt-block-head"><span>正向提示词</span><span>${String(item.positive || '').length} 字符</span></div>
                 <textarea class="prompt-block-body" readonly spellcheck="false">${escapeHtml(item.positive || '未填写')}</textarea>
@@ -3184,7 +3342,7 @@ async function handleClick(event){
         return;
     }
     if(target.closest?.('[data-storage-select-all]')){
-        storageSettingsState.items.forEach(item => storageSettingsState.selected.add(item.id));
+        toggleSelectionAll(storageSettingsState.items, storageSettingsState.selected);
         renderStorageSettingsModal();
         return;
     }
@@ -3340,8 +3498,7 @@ async function handleClick(event){
         render();
         return;
     }
-    if(target.closest?.('[data-localup-select-all]')){ localUploadItems().forEach(item => selectedLocalUploadIds.add(item.id)); render(); return; }
-    if(target.closest?.('[data-localup-clear]')){ selectedLocalUploadIds.clear(); render(); return; }
+    if(target.closest?.('[data-localup-select-all]')){ toggleSelectionAll(localUploadItems(), selectedLocalUploadIds); render(); return; }
     if(target.closest?.('[data-localup-download-selected]')){ await downloadSelectedLocalUploads(); return; }
     if(target.closest?.('[data-localup-canvas-selected]')){ copySelectedLocalUploadsToCanvas(); return; }
     if(target.closest?.('[data-localup-cut-selected]')){ setLocalUploadClipboard(); return; }
@@ -3417,9 +3574,43 @@ async function handleClick(event){
         return;
     }
     if(target.closest?.('[data-canvas-asset-refresh]')){ await refreshCanvasAssets(); return; }
-    if(target.closest?.('[data-canvas-asset-select-all]')){ currentCanvasAssetItems().forEach(item => selectedCanvasAssetIds.add(item.id)); render(); return; }
-    if(target.closest?.('[data-canvas-asset-clear-selection]')){ selectedCanvasAssetIds.clear(); render(); return; }
+    if(target.closest?.('[data-canvas-asset-select-all]')){ toggleSelectionAll(currentCanvasAssetItems(), selectedCanvasAssetIds); render(); return; }
     if(target.closest?.('[data-canvas-asset-download-selected]')){ await downloadCanvasAssetItems([...selectedCanvasAssetIds]); return; }
+    if(target.closest?.('[data-canvas-orphan-delete-selected]')){
+        const selected = [...selectedCanvasAssetIds]
+            .map(id => findCanvasAssetItem(id))
+            .filter(item => item && !item.canvas_id);
+        if(!selected.length) return;
+        if(!confirm(`确定删除选中的 ${selected.length} 个孤立素材？文件将从本地磁盘删除。`)) return;
+        try {
+            await apiJson('/api/canvas-assets/orphans/delete', {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({urls:selected.map(item => item.url)})
+            });
+            selectedCanvasAssetIds.clear();
+            selectedCanvasAssetId = '';
+            await refreshCanvasAssets();
+        } catch(err){ setStatus(err.message || '删除孤立素材失败'); }
+        return;
+    }
+    const orphanDeleteOne = target.closest?.('[data-canvas-orphan-delete-one]');
+    if(orphanDeleteOne){
+        const item = findCanvasAssetItem(orphanDeleteOne.dataset.canvasOrphanDeleteOne || '');
+        if(!item || item.canvas_id) return;
+        if(!confirm(`确定删除“${item.name || '此素材'}”？文件将从本地磁盘删除。`)) return;
+        try {
+            await apiJson('/api/canvas-assets/orphans/delete', {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({urls:[item.url]})
+            });
+            selectedCanvasAssetIds.delete(item.id);
+            selectedCanvasAssetId = '';
+            await refreshCanvasAssets();
+        } catch(err){ setStatus(err.message || '删除孤立素材失败'); }
+        return;
+    }
     const canvasAssetDownload = target.closest?.('[data-canvas-asset-download]');
     if(canvasAssetDownload){ await downloadCanvasAssetItems([canvasAssetDownload.dataset.canvasAssetDownload || '']); return; }
     const canvasAssetOpen = target.closest?.('[data-canvas-asset-open]');
@@ -3461,8 +3652,7 @@ async function handleClick(event){
         render();
         return;
     }
-    if(target.closest?.('[data-local-select-all]')){ localItemsForFolder().forEach(item => selectedLocalIds.add(item.id)); pendingBatchDelete = ''; render(); return; }
-    if(target.closest?.('[data-local-clear-selection]')){ selectedLocalIds.clear(); pendingBatchDelete = ''; render(); return; }
+    if(target.closest?.('[data-local-select-all]')){ toggleSelectionAll(localItemsForFolder(), selectedLocalIds); pendingBatchDelete = ''; render(); return; }
     if(target.closest?.('[data-local-copy-selected]')){ setLocalClipboard('copy'); return; }
     if(target.closest?.('[data-local-import-clipboard]')){ await pasteLocalClipboardToAssets(); return; }
     if(target.closest?.('[data-local-clear-clipboard]')){ localClipboard = null; render(); return; }
@@ -3505,8 +3695,7 @@ async function handleClick(event){
         render();
         return;
     }
-    if(target.closest?.('[data-workflow-select-all]')){ currentWorkflowItems().forEach(item => selectedWorkflowIds.add(item.id)); render(); return; }
-    if(target.closest?.('[data-workflow-clear-selection]')){ selectedWorkflowIds.clear(); render(); return; }
+    if(target.closest?.('[data-workflow-select-all]')){ toggleSelectionAll(currentWorkflowItems(), selectedWorkflowIds); render(); return; }
     if(target.closest?.('[data-workflow-export-selected]')){ await exportWorkflowItems([...selectedWorkflowIds]); return; }
     if(target.closest?.('[data-workflow-delete-selected]')){ await deleteSelectedWorkflows(); return; }
     if(target.closest?.('[data-workflow-upload]')){
@@ -3572,8 +3761,7 @@ async function handleClick(event){
         render();
         return;
     }
-    if(target.closest?.('[data-asset-select-all]')){ currentAssetItems().forEach(item => selectedAssetIds.add(item.id)); pendingBatchDelete = ''; render(); return; }
-    if(target.closest?.('[data-asset-clear-selection]')){ selectedAssetIds.clear(); pendingBatchDelete = ''; render(); return; }
+    if(target.closest?.('[data-asset-select-all]')){ toggleSelectionAll(currentAssetItems(), selectedAssetIds); pendingBatchDelete = ''; render(); return; }
     if(target.closest?.('[data-asset-cut-selected]')){ setAssetClipboard('cut'); return; }
     if(target.closest?.('[data-asset-copy-selected]')){ setAssetClipboard('copy'); return; }
     if(target.closest?.('[data-asset-paste-clipboard]')){ await pasteAssetClipboard(); return; }
@@ -3706,7 +3894,7 @@ async function handleClick(event){
     const promptEditSave = target.closest?.('[data-prompt-edit-save]');
     if(promptEditSave){ await savePromptEdit(promptEditSave.dataset.promptEditSave || ''); return; }
     if(target.closest?.('[data-prompt-create-save]')){ await savePromptCreate(); return; }
-    if(target.closest?.('[data-prompt-edit-cancel]')){ promptEditMode = false; promptCreateMode = false; render(); return; }
+    if(target.closest?.('[data-prompt-edit-cancel]')){ clearPromptDraftThumbnail(); promptEditMode = false; promptCreateMode = false; render(); return; }
     const promptEditStart = target.closest?.('[data-prompt-edit-start]');
     if(promptEditStart){ selectedPromptId = promptEditStart.dataset.promptEditStart || selectedPromptId; promptEditMode = true; promptCreateMode = false; pendingDeletePromptId = ''; render(); return; }
     if(target.closest?.('[data-prompt-manage]')){
@@ -3716,8 +3904,7 @@ async function handleClick(event){
         render();
         return;
     }
-    if(target.closest?.('[data-prompt-select-all]')){ currentPromptItems().forEach(item => selectedPromptIds.add(item.id)); pendingBatchDelete = ''; render(); return; }
-    if(target.closest?.('[data-prompt-clear-selection]')){ selectedPromptIds.clear(); pendingBatchDelete = ''; render(); return; }
+    if(target.closest?.('[data-prompt-select-all]')){ toggleSelectionAll(currentPromptItems(), selectedPromptIds); pendingBatchDelete = ''; render(); return; }
     const promptEdit = target.closest?.('[data-prompt-edit]');
     if(promptEdit){ await editPromptItem(promptEdit.dataset.promptEdit || ''); return; }
     const promptDelete = target.closest?.('[data-prompt-delete]');
@@ -3729,7 +3916,7 @@ async function handleClick(event){
         const catRow = target.closest('[data-prompt-cat]');
         if(libId){ activePromptLibraryId = libId; activePromptCategory = 'all'; }
         if(catRow){ activePromptLibraryId = catRow.dataset.promptCatLib || activePromptLibraryId; activePromptCategory = catRow.dataset.promptCat || activePromptCategory; }
-        promptCreateMode = true; promptEditMode = false; pendingDeletePromptId = ''; render(); return;
+        clearPromptDraftThumbnail(); promptCreateMode = true; promptEditMode = false; pendingDeletePromptId = ''; render(); return;
     }
     if(target.closest?.('[data-prompt-lib-new]')){ promptTreeFocus = 'library'; promptTreeEdit = {kind:'library-new', placement:'head', value:'新提示词库', label:'提示词库名称'}; render(); focusTreeEditInput('promptTreeEditInput'); return; }
     if(target.closest?.('[data-prompt-cat-new]')){
@@ -3763,9 +3950,9 @@ async function handleClick(event){
         await deletePromptLibrary(); return;
     }
     const promptLib = target.closest?.('[data-prompt-lib]');
-    if(promptLib){ activePromptLibraryId = promptLib.dataset.promptLib || ''; activePromptCategory = 'all'; promptTreeFocus = 'library'; selectedPromptId = ''; promptCreateMode = false; promptEditMode = false; selectedPromptIds.clear(); render(); return; }
+    if(promptLib){ clearPromptDraftThumbnail(); activePromptLibraryId = promptLib.dataset.promptLib || ''; activePromptCategory = 'all'; promptTreeFocus = 'library'; selectedPromptId = ''; promptCreateMode = false; promptEditMode = false; selectedPromptIds.clear(); render(); return; }
     const promptCat = target.closest?.('[data-prompt-cat]');
-    if(promptCat){ activePromptLibraryId = promptCat.dataset.promptCatLib || activePromptLibraryId; activePromptCategory = promptCat.dataset.promptCat || 'all'; promptTreeFocus = 'category'; selectedPromptId = ''; promptCreateMode = false; promptEditMode = false; selectedPromptIds.clear(); render(); return; }
+    if(promptCat){ clearPromptDraftThumbnail(); activePromptLibraryId = promptCat.dataset.promptCatLib || activePromptLibraryId; activePromptCategory = promptCat.dataset.promptCat || 'all'; promptTreeFocus = 'category'; selectedPromptId = ''; promptCreateMode = false; promptEditMode = false; selectedPromptIds.clear(); render(); return; }
     const promptRow = target.closest?.('[data-prompt-row]');
     if(promptRow){
         const id = promptRow.dataset.promptRow || '';
@@ -3775,6 +3962,7 @@ async function handleClick(event){
         } else {
             selectedPromptId = id;
         }
+        clearPromptDraftThumbnail();
         promptEditMode = false;
         promptCreateMode = false;
         pendingDeletePromptId = '';
@@ -3900,7 +4088,7 @@ function beginMarqueeSelection(event){
     const selector = marqueeTargetSelector();
     if(!selector) return;
     if(event.button !== 0) return;
-    if(event.target.closest?.('button,input,textarea,select,.side-upload-card,.upload-grid-card,.asset-search-wrap')) return;
+    if(event.target.closest?.('button,input,textarea,select,[data-prompt-item-drag],[data-prompt-row][draggable="true"],.side-upload-card,.upload-grid-card,.asset-search-wrap')) return;
     const area = event.target.closest?.('.content-scroll');
     if(!area) return;
     event.preventDefault();
@@ -4326,12 +4514,12 @@ function setLocalClipboard(mode, ids=null){
     selectedLocalIds.clear();
     pendingBatchDelete = '';
     render();
-    setStatus(`复制了 ${items.length} 个共享素材，导入后会拷贝到图片资产分组（共享文件夹原文件保留）`);
+    setStatus(`复制了 ${items.length} 个共享素材，导入后会拷贝到角色库分组（共享文件夹原文件保留）`);
 }
 async function pasteLocalClipboardToAssets(){
     if(!localClipboard?.items?.length) return;
     if(!activeAssetCategory()){
-        setStatus('请先在图片资产中创建或选择分组');
+        setStatus('请先在角色库中创建或选择分组');
         return;
     }
     const clip = localClipboard;
@@ -4363,7 +4551,7 @@ async function pasteLocalClipboardToAssets(){
     selectedLocalIds.clear();
     selectedLocalId = '';
     render();
-    setStatus(`已导入 ${imported} 个素材到图片资产`);
+    setStatus(`已导入 ${imported} 个素材到角色库`);
 }
 async function moveSelectedAssets(){
     if(!selectedAssetIds.size || !assetMoveTarget) return;
@@ -4513,6 +4701,15 @@ async function savePromptCreate(){
     const data = await apiJson('/api/prompt-libraries/items', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({library_id:lib.id, name, positive, negative, category, scene})});
     promptLibrary = data.library || promptLibrary;
     selectedPromptId = data.item?.id || selectedPromptId;
+    if(promptDraftThumbnailFile && data.item?.id){
+        try {
+            const thumbnailData = await window.PromptTemplateThumbnails?.upload(data.item?.id, promptDraftThumbnailFile);
+            promptLibrary = thumbnailData?.library || promptLibrary;
+        } catch(error){
+            setStatus(`提示词已新增，但缩略图上传失败：${error?.message || error}`);
+        }
+    }
+    clearPromptDraftThumbnail();
     promptCreateMode = false;
     render();
     setStatus('提示词已新增');
@@ -4580,6 +4777,7 @@ async function deleteSelectedPrompts(){
 }
 root.addEventListener('pointerdown', event => {
     if(event.button !== 0) return;
+    if(event.target.closest?.('[data-prompt-row][draggable="true"]')) return;
     const target = managedSelectionTarget(event.target);
     if(!target) return;
     event.preventDefault();
@@ -4589,6 +4787,7 @@ root.addEventListener('pointerdown', event => {
     render();
 }, true);
 root.addEventListener('click', event => {
+    if(promptDropSuppressClick){ promptDropSuppressClick = false; return; }
     handleClick(event).catch(err => setStatus(err.message || '操作失败'));
 });
 document.addEventListener('click', event => {
@@ -4597,6 +4796,21 @@ document.addEventListener('click', event => {
         return;
     }
     if(event.target.closest?.('.asset-lightbox') && !event.target.closest?.('.asset-lightbox-image,.asset-lightbox-video')) closeDetailPreview();
+});
+window.PromptTemplateThumbnails?.mount({
+    root,
+    isActive:() => activeTab === 'prompts',
+    getItemId:() => promptCreateMode ? '' : (selectedPrompt()?.id || ''),
+    preserveDraft:preserveAssetPromptDraft,
+    onPendingFile:stagePromptDraftThumbnail,
+    onPendingRemove:() => stagePromptDraftThumbnail(null),
+    onLibrary:library => {
+        promptLibrary = library || promptLibrary;
+        normalizePromptState();
+        render();
+    },
+    onError:message => setStatus(message || '缩略图操作失败'),
+    onSuccess:message => setStatus(message || '缩略图已保存')
 });
 document.addEventListener('keydown', event => {
     if(event.key === 'Escape') closeDetailPreview();
@@ -4718,14 +4932,130 @@ document.addEventListener('change', event => {
     }
 });
 root.addEventListener('dragover', event => {
+    const promptDrag = promptDragItemFromEvent(event);
+    const promptCategory = event.target.closest?.('[data-prompt-drop-category]');
+    const promptList = event.target.closest?.('.prompt-list');
+    if(promptDragState?.categoryDrag && promptCategory && promptCategory.dataset.promptCatLib === promptDragState.libraryId){
+        const targetId = promptCategory.dataset.promptCategoryOrderId || '';
+        if(targetId && targetId !== promptDragState.categoryId){
+            event.preventDefault();
+            clearPromptDropState();
+            const rect = promptCategory.getBoundingClientRect();
+            const after = event.clientY > rect.top + rect.height / 2;
+            promptCategory.classList.add(after ? 'is-order-after' : 'is-order-before');
+            promptDropTarget = {type:'category-order', id:targetId, after};
+        }
+        return;
+    }
+    if(promptDragState?.categoryDrag) return;
+    if(promptDragState && promptReorderEnabled() && promptList && !promptDrag){
+        const rows = [...promptList.querySelectorAll('[data-prompt-row]')];
+        const lastRow = rows.at(-1);
+        if(lastRow && event.clientY >= lastRow.getBoundingClientRect().bottom){
+            event.preventDefault();
+            clearPromptDropState();
+            promptList.classList.add('is-order-end');
+            promptDropTarget = {type:'list-end'};
+            return;
+        }
+    }
+    if(promptDragState && promptMoveEnabled() && (promptDrag || promptCategory)){
+        event.preventDefault();
+        clearPromptDropState();
+        if(promptDrag){
+            const activeCategory = String(activePromptCategory);
+            const sameVisibleList = activeCategory === 'all' || promptItemCategory(promptDrag.item) === activeCategory;
+            if(promptReorderEnabled() && sameVisibleList && promptDrag.item.id !== promptDragState.item.id){
+                const rect = promptDrag.row.getBoundingClientRect();
+                const before = event.clientY < rect.top + rect.height / 2;
+                promptDrag.row.classList.add(before ? 'is-order-before' : 'is-order-after');
+                promptDropTarget = {type:'row', id:promptDrag.item.id, before};
+            }
+        } else if(promptCategory.dataset.promptCatLib === activePromptLibraryId && promptCategory.dataset.promptDropCategory !== 'all'){
+            promptCategory.classList.add('prompt-drop-target');
+            promptDropTarget = {type:'category', category:promptCategory.dataset.promptDropCategory};
+        }
+        return;
+    }
     const drop = event.target.closest?.('#assetDrop, #localUploadDrop, #workflowDrop');
     if(!drop) return;
     event.preventDefault();
     drop.classList.add('drag-over');
 });
 root.addEventListener('dragleave', event => {
+    if(promptDragState && (event.target.closest?.('[data-prompt-row]') || event.target.closest?.('[data-prompt-drop-category]'))){ clearPromptDropMarks(); return; }
     event.target.closest?.('#assetDrop, #localUploadDrop, #workflowDrop')?.classList.remove('drag-over');
 });
+root.addEventListener('dragstart', event => {
+    const category = event.target.closest?.('[data-prompt-category-order-id][draggable="true"]');
+    if(category && promptCategoryReorderEnabled(category.dataset.promptCatLib || '')){
+        promptDragState = {categoryId:category.dataset.promptCategoryOrderId, libraryId:category.dataset.promptCatLib, categoryDrag:true};
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('application/x-infinite-prompt-category-order', promptDragState.categoryId);
+        category.classList.add('is-dragging');
+        return;
+    }
+    const row = event.target.closest?.('[data-prompt-row][draggable="true"]');
+    if(!row || !promptMoveEnabled()) return;
+    const item = findPromptItem(row.dataset.promptRow || '');
+    if(!item) return;
+    promptDragState = {item, category:promptItemCategory(item)};
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', item.id);
+    row.classList.add('is-dragging');
+});
+root.addEventListener('drop', async event => {
+    if(!promptDragState || (!promptDragState.categoryDrag && !promptMoveEnabled())) return;
+    const state = promptDragState;
+    const target = promptDropTarget;
+    event.preventDefault();
+    promptDropSuppressClick = true;
+    promptDragState = null;
+    clearPromptDropState();
+    try {
+        if(state.categoryDrag){
+            if(target?.type === 'category-order' && target.id !== state.categoryId){
+                await reorderPromptCategories(state.categoryId, target.id, target.after, state.libraryId);
+                render();
+                setStatus('提示词分类顺序已保存');
+            }
+            return;
+        }
+        if(target?.type === 'category'){
+            await movePromptToCategory(state.item, target.category);
+            render();
+            setStatus('提示词已移动到目标分类');
+            return;
+        }
+        const activeCategory = String(activePromptCategory);
+        const withinActiveList = activeCategory === 'all' || state.category === activeCategory;
+        if(target?.type === 'row' && promptReorderEnabled() && withinActiveList){
+            const lib = activePromptLibrary();
+            const ids = (lib?.items || [])
+                .filter(item => activeCategory === 'all' || promptItemCategory(item) === activeCategory)
+                .map(item => String(item.id))
+                .filter(id => id !== state.item.id);
+            const index = ids.indexOf(String(target.id));
+            ids.splice(Math.max(0, index + (target.before ? 0 : 1)), 0, String(state.item.id));
+            await reorderPromptCategory(activeCategory, ids);
+            render();
+            setStatus('提示词顺序已保存');
+            return;
+        }
+        if(target?.type === 'list-end' && promptReorderEnabled() && withinActiveList){
+            const lib = activePromptLibrary();
+            const ids = (lib?.items || [])
+                .filter(item => activeCategory === 'all' || promptItemCategory(item) === activeCategory)
+                .map(item => String(item.id))
+                .filter(id => id !== state.item.id);
+            ids.push(String(state.item.id));
+            await reorderPromptCategory(activeCategory, ids);
+            render();
+            setStatus('提示词已移动到列表末尾');
+        }
+    } catch(err){ setStatus(err.message || '提示词排序失败'); }
+});
+root.addEventListener('dragend', () => { promptDragState = null; clearPromptDropState(); });
 root.addEventListener('drop', event => {
     const drop = event.target.closest?.('#assetDrop, #localUploadDrop, #workflowDrop');
     if(!drop) return;

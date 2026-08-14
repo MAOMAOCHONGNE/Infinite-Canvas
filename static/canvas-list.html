@@ -20,8 +20,8 @@
     <script src="/static/vendor/js/lucide.js?v=2026.08.12-custom.2.1785863219"></script>
     <script src="/static/js/theme.js?v=2026.08.12-custom.2.1785863206"></script>
     <script src="/static/js/touch-mouse.js?v=2026.08.12-custom.2.1785863206"></script>
-    <script src="/static/js/i18n.js?v=2026.08.12-custom.2.1786473783"></script>
-    <link rel="stylesheet" href="/static/css/canvas-list.css?v=2026.08.12-custom.2.1786472023">
+    <script src="/static/js/i18n.js?v=2026.08.12-custom.2.1786671034"></script>
+    <link rel="stylesheet" href="/static/css/canvas-list.css?v=2026.08.12-custom.2.1786659114">
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.12-custom.2.1785863189">
 </head>
 <body>
@@ -112,8 +112,23 @@
             </footer>
         </div>
     </div>
+    <div id="coverModal" class="cover-modal-overlay" aria-hidden="true">
+        <div class="cover-modal" role="dialog" aria-modal="true" aria-labelledby="coverModalTitle">
+            <header class="cover-modal-head">
+                <div><h2 id="coverModalTitle">设置画布封面</h2><p>自动选择画布图片，或固定使用你选择的图片。</p></div>
+                <button id="coverModalClose" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <div id="coverModalBody" class="cover-modal-body"></div>
+            <footer class="cover-modal-foot">
+                <button id="coverAutoBtn" class="cover-secondary-btn" type="button"><i data-lucide="sparkles"></i><span>使用自动封面</span></button>
+                <button id="coverUploadBtn" class="cover-primary-btn" type="button"><i data-lucide="upload"></i><span>上传自定义封面</span></button>
+            </footer>
+        </div>
+    </div>
+    <input id="coverFileInput" type="file" accept="image/*" hidden>
     <input id="backupFileInput" type="file" accept=".zip,application/zip" hidden>
     <script src="/static/js/backup-manager.js?v=2026.08.12-custom.2.1786471994"></script>
-    <script src="/static/js/canvas-list.js?v=2026.08.12-custom.2.1785863195"></script>
+    <script src="/static/js/canvas-list.js?v=2026.08.12-custom.2.1786659114"></script>
+    <script src="/static/js/global-prompt-library.js?v=2026.08.12-custom.2.1786676777"></script>
 </body>
 </html>

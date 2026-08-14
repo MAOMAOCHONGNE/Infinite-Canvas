@@ -90,6 +90,7 @@ const promptTemplatePanel = document.getElementById('promptTemplatePanel');
 const promptTemplateClose = document.getElementById('promptTemplateClose');
 const promptTemplateSearch = document.getElementById('promptTemplateSearch');
 const promptTemplateLibrarySelect = document.getElementById('promptTemplateLibrarySelect');
+const promptTemplateTarget = document.getElementById('promptTemplateTarget');
 const promptTemplateCats = document.getElementById('promptTemplateCats');
 const promptTemplateBody = document.getElementById('promptTemplateBody');
 const composerTemplateBtn = document.getElementById('composerTemplateBtn');
@@ -2216,6 +2217,7 @@ function imageLayout(images, scale=1, node=null){
         return {cols:1, rows:1, ...smartGroupLayoutSize(node), thumb:96, single:true};
     }
     if(node?.type === 'smart-prompt') return {cols:1, rows:1, ...promptNodeLayoutSize(node), thumb:96, single:true};
+    if(node?.type === 'smart-note') return {cols:1, rows:1, width:Math.round(Number(node.w) || 360), height:Math.round(Number(node.h) || 260), thumb:96, single:true};
     if(node?.type === 'smart-minimax') return {cols:1, rows:1, ...smartMinimaxLayoutSize(node), thumb:96, single:true};
     if(node?.type === 'smart-loop'){
         const explicitW = Number(node.w);
@@ -5117,6 +5119,7 @@ function renderPromptTemplatePanel(options={}){
         : (selected ? currentPromptPreset(selected.sourceId) : null);
     const target = promptTemplatePanel.dataset.target || 'node';
     const node = nodes.find(n => n.id === promptTemplatePanel.dataset.nodeId);
+    const canWriteTemplate = canWritePromptTemplateTarget();
     // 系统库 readonly=false，其条目也可编辑/删除（经后端持久化），因此只看 readonly。
     const canEditCurrentLibrary = !activeLibrary.readonly;
     const editMode = Boolean(promptTemplateEditing && selectedPreset);
@@ -5126,20 +5129,22 @@ function renderPromptTemplatePanel(options={}){
                 <button type="button" data-template-save-current><i data-lucide="bookmark-plus"></i><span>${escapeHtml(tr('smart.tplSaveCurrent'))}</span></button>
                 <button type="button" data-template-new><i data-lucide="file-plus-2"></i><span>${escapeHtml(tr('smart.tplNewTemplate'))}</span></button>
             </div>
-            ${items.length ? items.map(item => `<button type="button" class="prompt-template-card ${item.id === selected?.id ? 'active' : ''}" data-template-id="${escapeHtml(item.id)}" data-template-item-order-id="${escapeHtml(item.id)}">
+            ${items.length ? items.map(item => `<button type="button" class="prompt-template-card has-thumbnail ${item.id === selected?.id ? 'active' : ''}" data-template-id="${escapeHtml(item.id)}" data-template-item-order-id="${escapeHtml(item.id)}">
                 ${canReorderItems && reorderableItemIds.has(item.id) ? `<span class="prompt-template-drag-handle prompt-template-card-drag" draggable="true" data-template-item-drag="${escapeHtml(item.id)}" title="${escapeAttr(tr('smart.tplDragSort'))}"><i data-lucide="grip-vertical"></i></span>` : ''}
-                <span class="prompt-template-card-top">
-                    <span class="prompt-template-name">${escapeHtml(promptTemplateName(item))}</span>
-                    <span class="prompt-template-source">${escapeHtml(item.builtin ? tr('smart.tplBuiltin') : tr('smart.tplMine'))}</span>
+                ${window.PromptTemplateThumbnails?.card(item) || ''}
+                <span class="prompt-template-card-copy">
+                    <span class="prompt-template-card-top">
+                        <span class="prompt-template-name" title="${escapeAttr(promptTemplateName(item))}">${escapeHtml(promptTemplateName(item))}</span>
+                    </span>
+                    <span class="prompt-template-scene">${escapeHtml(promptTemplateScene(item) || item.positive || '')}</span>
                 </span>
-                <span class="prompt-template-scene">${escapeHtml(promptTemplateScene(item) || item.positive || '')}</span>
                 <span class="prompt-template-tag">${escapeHtml(promptTemplateCategoryLabel(item.category || 'mine'))}</span>
             </button>`).join('') : `<div class="prompt-template-list-empty">${escapeHtml(tr('smart.tplNoMatches'))}</div>`}
         </div>
         <div class="prompt-template-detail">
             ${selected ? `
                 <div class="prompt-template-detail-head">
-                    <div>
+                    <div class="prompt-template-detail-titleline">
                         <strong>${escapeHtml(promptTemplateName(selected) || '')}</strong>
                         <span>${escapeHtml(promptTemplateCategoryLabel(selected.category || ''))} · ${escapeHtml(selected.builtin ? tr('smart.tplBuiltinTemplate') : tr('smart.tplMineTemplate'))}</span>
                     </div>
@@ -5150,6 +5155,7 @@ function renderPromptTemplatePanel(options={}){
                         </div>
                     `}
                 </div>
+            ${selected.remote ? (window.PromptTemplateThumbnails?.editor(selected, {disabled:!canEditCurrentLibrary, layout:'canvas', purpose:promptTemplateScene(selected), purposeEditable:editMode}) || '') : ''}
             ${editMode ? `
                 <div class="prompt-template-edit-fields">
                     <label>${escapeHtml(tr('smart.tplName'))}</label>
@@ -5168,7 +5174,7 @@ function renderPromptTemplatePanel(options={}){
                     <p>${escapeHtml(selected?.positive || '')}</p>
                 </div>
                 ${selected?.negative ? `<div class="prompt-template-section">
-                    <label>${escapeHtml(tr('smart.tplNegative'))}</label>
+                    <div class="prompt-template-section-head"><label>${escapeHtml(tr('smart.tplNegative'))}</label><button type="button" class="prompt-template-section-copy" data-template-copy="negative" title="${escapeAttr(tr('smart.tplCopyNegative'))}" aria-label="${escapeAttr(tr('smart.tplCopyNegative'))}"><i data-lucide="copy"></i></button></div>
                     <p>${escapeHtml(selected.negative)}</p>
                 </div>` : ''}
                 ${Object.keys(selected?.params || {}).length ? `<div class="prompt-template-section">
@@ -5183,8 +5189,8 @@ function renderPromptTemplatePanel(options={}){
                     <button type="button" class="danger" data-template-delete><i data-lucide="trash-2"></i><span>${escapeHtml(tr('common.delete'))}</span></button>
                     <button type="button" class="primary" data-template-edit-save><i data-lucide="save"></i><span>${escapeHtml(tr('common.save'))}</span></button>
                 ` : `
-                    <button type="button" data-template-apply="positive"><i data-lucide="corner-down-left"></i><span>${escapeHtml(tr('smart.tplApplyPositive'))}</span></button>
-                    <button type="button" class="primary" data-template-apply="full"><i data-lucide="wand-sparkles"></i><span>${escapeHtml(tr('smart.tplApplyFull'))}</span></button>
+                    <button type="button" data-template-copy="positive"><i data-lucide="copy"></i><span>${escapeHtml(tr('smart.tplCopyPrompt'))}</span></button>
+                    <button type="button" class="primary" data-template-write ${canWriteTemplate ? '' : 'disabled'}><i data-lucide="corner-down-left"></i><span>${escapeHtml(tr('smart.tplWriteNode'))}</span></button>
                 `}
             </div>
             ` : `<div class="prompt-template-empty">${escapeHtml(tr('smart.tplPickOrCreate'))}</div>`}
@@ -5197,6 +5203,12 @@ function renderPromptTemplatePanel(options={}){
 function activePromptTemplateNodeId(){
     return promptTemplatePanel?.classList?.contains('open') && promptTemplatePanel.dataset.target !== 'composer' ? (promptTemplatePanel.dataset.nodeId || '') : '';
 }
+function canWritePromptTemplateTarget(){
+    const target = promptTemplatePanel?.dataset?.target || 'browse';
+    if(target === 'composer') return true;
+    if(target !== 'node') return false;
+    return nodes.some(node => node.id === promptTemplatePanel?.dataset?.nodeId && node.type === 'smart-prompt');
+}
 function syncComposerTemplateButton(){
     if(!composerTemplateBtn || !promptTemplatePanel) return;
     const active = promptTemplatePanel.classList.contains('open') && promptTemplatePanel.dataset.target === 'composer';
@@ -5205,9 +5217,21 @@ function syncComposerTemplateButton(){
 }
 async function openPromptTemplatePanel(nodeId='', templateId='', options={}){
     if(!promptTemplatePanel) return;
-    const target = options.target === 'composer' ? 'composer' : 'node';
+    let target = options.target === 'composer' ? 'composer' : (options.target === 'browse' ? 'browse' : 'node');
+    const targetNode = target === 'node' ? nodes.find(node => node.id === nodeId && node.type === 'smart-prompt') : null;
+    if(target === 'node' && !targetNode) target = 'browse';
+    promptTemplatePanel.dataset.lastCardId = '';
+    promptTemplatePanel.dataset.lastCardAt = '0';
     promptTemplatePanel.dataset.target = target;
     promptTemplatePanel.dataset.nodeId = nodeId || '';
+    if(promptTemplateTarget){
+        const targetText = target === 'browse'
+            ? tr('smart.promptTemplateBrowse')
+            : trf('smart.promptTemplateTarget', {target:target === 'composer' ? tr('smart.promptTemplateTargetComposer') : tr('smart.promptTemplateTargetNode')});
+        promptTemplateTarget.textContent = targetText;
+        promptTemplateTarget.title = targetText;
+        promptTemplateTarget.classList.toggle('is-browse', target === 'browse');
+    }
     if(promptTemplatePanel.parentElement !== shell) shell.appendChild(promptTemplatePanel);
     if(templateId) promptTemplateSelectedId = templateId;
     promptTemplatePanel.classList.add('open');
@@ -5228,12 +5252,57 @@ async function openPromptTemplatePanel(nodeId='', templateId='', options={}){
 }
 function closePromptTemplatePanel(){
     promptTemplatePanel?.classList.remove('open');
+    if(promptTemplateTarget){
+        const browseText = tr('smart.promptTemplateBrowse');
+        promptTemplateTarget.textContent = browseText;
+        promptTemplateTarget.title = browseText;
+        promptTemplateTarget.classList.add('is-browse');
+    }
     syncComposerTemplateButton();
     render();
 }
+function smartSelectedPromptTemplateTarget(){
+    const ids = selectedIds.length ? [...new Set(selectedIds)] : (selectedId ? [selectedId] : []);
+    if(ids.length !== 1) return null;
+    const node = nodes.find(item => item.id === ids[0]);
+    return node?.type === 'smart-prompt' ? node : null;
+}
+function openPromptTemplateForSmartSelection(){
+    const node = smartSelectedPromptTemplateTarget();
+    openPromptTemplatePanel(node?.id || '', node?.promptPresetId ? `mine:${node.promptPresetId}` : '', {target:node ? 'node' : 'browse'});
+    return true;
+}
+window.PromptTemplateThumbnails?.mount({
+    root:promptTemplatePanel,
+    isActive:() => Boolean(promptTemplatePanel?.classList.contains('open')),
+    getItemId:() => promptTemplateItems().find(item => item.id === promptTemplateSelectedId)?.sourceId || '',
+    onLibrary:library => {
+        promptLibraries = library?.libraries || promptLibraries;
+        const system = promptLibraries.find(lib => lib.id === 'system') || promptLibraries[0];
+        builtinPromptTemplates = Array.isArray(system?.items) ? system.items.filter(item => item?.id && item?.positive) : builtinPromptTemplates;
+        renderPromptLibrarySelect();
+        renderPromptTemplatePanel();
+    },
+    onError:message => toast(message || '缩略图操作失败'),
+    onSuccess:message => toast(message || '缩略图已保存')
+});
+async function copySelectedPromptTemplate(part='positive'){
+    const template = promptTemplateItems().find(item => item.id === promptTemplateSelectedId);
+    const text = String((part === 'negative' ? template?.negative : template?.positive) || '').trim();
+    if(!text) return false;
+    const copied = await copyTextToClipboard(text);
+    toast(copied
+        ? tr(part === 'negative' ? 'smart.tplCopiedNegative' : 'smart.tplCopiedPositive')
+        : (window.StudioI18n?.lang?.() === 'en' ? 'Copy failed' : '复制失败'));
+    return copied;
+}
 function applyPromptTemplateToNode(mode='positive'){
     const template = promptTemplateItems().find(item => item.id === promptTemplateSelectedId);
-    if(!template) return;
+    if(!template) return false;
+    if(!canWritePromptTemplateTarget()){
+        toast(tr('smart.promptTemplateWriteTargetMissing'));
+        return false;
+    }
     if(promptTemplatePanel?.dataset.target === 'composer'){
         const text = promptTemplateText(template, mode);
         setPromptText(text);
@@ -5242,7 +5311,7 @@ function applyPromptTemplateToNode(mode='positive'){
         renderInputThumbsRow(selectedNode());
         closePromptTemplatePanel();
         scheduleSave();
-        return;
+        return true;
     }
     const node = nodes.find(n => n.id === promptTemplatePanel?.dataset.nodeId);
     if(!node) return;
@@ -5309,13 +5378,14 @@ async function savePromptTemplateEdit(){
     const name = promptTemplatePanel.querySelector('[data-template-edit-name]')?.value?.trim() || '';
     const text = promptTemplatePanel.querySelector('[data-template-edit-text]')?.value?.trim() || '';
     const category = promptTemplatePanel.querySelector('[data-template-edit-category]')?.value || 'mine';
+    const scene = promptTemplatePanel.querySelector('[data-template-edit-scene]')?.value?.trim() ?? String(item.scene || '').trim();
     if(!name || !text){ toast(tr('smart.tplRequired')); return; }
     if(item.remote){
         try {
             const data = await fetch(`/api/prompt-libraries/items/${encodeURIComponent(item.id)}`, {
                 method:'PATCH',
                 headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({library_id:item.libraryId || activePromptLibrary().id, name, category, positive:text, scene:item.scene || '', negative:item.negative || ''})
+                body:JSON.stringify({library_id:item.libraryId || activePromptLibrary().id, name, category, positive:text, scene, negative:item.negative || ''})
             }).then(async r => {
                 if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '保存失败');
                 return r.json();
@@ -5507,7 +5577,8 @@ function workflowAssetCategories(){
     return assetCategories('workflow');
 }
 function assetLibraries(){
-    return Array.isArray(assetLibrary.libraries) && assetLibrary.libraries.length ? assetLibrary.libraries : [{id:'default', name:'默认资产库', categories:assetLibrary.categories || []}];
+    const libraries = Array.isArray(assetLibrary.libraries) && assetLibrary.libraries.length ? assetLibrary.libraries : [{id:'default', name:'角色素材库', categories:assetLibrary.categories || []}];
+    return libraries.map(library => library.id === 'default' ? {...library, name:'角色素材库'} : library);
 }
 function localAssetFolderCategories(){
     const result = [];
@@ -6578,6 +6649,15 @@ function createPromptNode(x, y, options={}){
     scheduleSave();
     return node;
 }
+function createNoteNode(x, y, options={}){
+    if(!options.skipUndo) pushUndo();
+    const node = {id:uid('note'), type:'smart-note', x, y, w:360, h:260, title:'便签', text:'新建便签', fontSize:36, textColor:'#ffffff', backgroundColor:'#a86e25', created_at:Date.now()};
+    nodes.push(node);
+    if(options.select !== false) selectedId = node.id;
+    render();
+    scheduleSave();
+    return node;
+}
 function createLoopNode(x, y, options={}){
     if(!options.skipUndo) pushUndo();
     const node = {id:uid('loop'), type:'smart-loop', x, y, w:340, h:168, title:'Loop', count:1, mode:'serial', showPrompt:false, imageInput:false, loopStart:1, imageBatchSize:1, variablePrompt:'', created_at:Date.now()};
@@ -6640,6 +6720,8 @@ function cloneSmartNode(node, dx=0, dy=0){
     copy.id = uid(
         node.type === 'smart-prompt'
             ? 'prompt'
+            : node.type === 'smart-note'
+            ? 'note'
             : node.type === 'smart-loop'
             ? 'loop'
             : node.type === 'smart-group'
@@ -6921,7 +7003,10 @@ function moveNodeElementsDuringDrag(){
     scheduleInteractionLayerRefresh();
 }
 function updateNodeElementDuringResize(node){
-    if(!node) return;
+    if(!node){
+        toast(tr('smart.promptTemplateWriteTargetMissing'));
+        return false;
+    }
     const el = world.querySelector(`.image-node[data-id="${CSS.escape(node.id)}"],.canvas-frame-node[data-id="${CSS.escape(node.id)}"]`);
     if(!el){
         render();
@@ -7719,7 +7804,7 @@ function promptNodeBodyHtml(node){
     return `<div class="prompt-node-card">
         <textarea class="prompt-node-text prompt-node-control" ${readonly} placeholder="${escapeHtml(noResultForInput ? tr('smart.promptLlmNoResultForInput') : tr('smart.promptPlaceholderNode'))}">${escapeHtml(llmResultText)}</textarea>
         <div class="prompt-node-tools">
-            <button class="prompt-node-pill prompt-node-control prompt-preset-edit ${templateActive ? 'active' : ''}" type="button"><i data-lucide="library"></i><span>模板库</span></button>
+            <button class="prompt-node-pill prompt-node-control prompt-preset-edit ${templateActive ? 'active' : ''}" type="button"><i data-lucide="library"></i><span>提示词</span></button>
             <button class="prompt-node-pill prompt-node-control prompt-split-toggle ${node.promptSplitEnabled ? 'active' : ''}" type="button"><i data-lucide="split"></i><span>分隔符</span></button>
             <button class="prompt-node-pill prompt-llm-toggle ${node.llmEnabled ? 'active' : ''}" type="button"><i data-lucide="sparkles"></i><span>LLM</span></button>
         </div>
@@ -8557,6 +8642,7 @@ function nodeBodyHtml(node, layout){
     if(node.type === 'smart-minimax') return smartMinimaxBodyHtml(node);
     if(node.type === 'smart-group') return smartGroupBodyHtml(node);
     if(node.type === 'smart-prompt') return promptNodeBodyHtml(node);
+    if(node.type === 'smart-note') return smartNoteBodyHtml(node);
     if(node.type === 'smart-loop') return smartLoopBodyHtml(node);
     const imgs = (node.images || []).map(imageForDisplay);
     if(node.jimengPending && node.jimengPending.submitId && imgs.length === 0){
@@ -8856,6 +8942,19 @@ function smartFrameHtml(rawNode){
         <div class="canvas-frame-resize" data-frame-resize="1" title="${escapeHtml(tr('canvas.resize'))}"></div>
     </div>`;
 }
+function smartNoteBodyHtml(node){
+    const fontSize = [20,24,28,32,36,42,48,56,64].includes(Number(node.fontSize)) ? Number(node.fontSize) : 36;
+    const textColor = /^#[0-9a-f]{6}$/i.test(String(node.textColor || '')) ? node.textColor : '#ffffff';
+    const backgroundColor = /^#[0-9a-f]{6}$/i.test(String(node.backgroundColor || '')) ? node.backgroundColor : '#a86e25';
+    return `<div class="smart-note-card" style="--note-bg:${escapeAttr(backgroundColor)};--note-text:${escapeAttr(textColor)}">
+        <div class="smart-note-toolbar">
+            <label title="字号"><i data-lucide="type"></i><select data-note-font-size>${[20,24,28,32,36,42,48,56,64].map(size => `<option value="${size}" ${size === fontSize ? 'selected' : ''}>${size}</option>`).join('')}</select></label>
+            <label title="文字颜色"><i data-lucide="palette"></i><input type="color" value="${escapeAttr(textColor)}" data-note-text-color></label>
+            <label title="便签颜色"><i data-lucide="paintbrush"></i><input type="color" value="${escapeAttr(backgroundColor)}" data-note-background-color></label>
+        </div>
+        <textarea class="note-text smart-note-text" data-note-text placeholder="写下备注…" style="font-size:${fontSize}px;color:${escapeAttr(textColor)}">${escapeHtml(node.text || '')}</textarea>
+    </div>`;
+}
 function bindSmartFrameEvents(){
     world.querySelectorAll('.canvas-frame-node').forEach(el => {
         const id = el.dataset.id;
@@ -8958,10 +9057,11 @@ function render(){
         .sort((a, b) => (isSmartGroupNode(a) ? 0 : 1) - (isSmartGroupNode(b) ? 0 : 1))
         .map(node => {
         const imgs = node.images || [];
-        const title = node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : node.type === 'smart-minimax' ? 'MiniMax H3' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
+        const title = node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-note' ? '便签' : node.type === 'smart-loop' ? 'Loop' : node.type === 'smart-minimax' ? 'MiniMax H3' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
         const scale = nodeScale(node);
         const layout = imageLayout(imgs, scale, node);
         const isPrompt = node.type === 'smart-prompt';
+        const isNote = node.type === 'smart-note';
         const isLoop = node.type === 'smart-loop';
         const isMinimax = node.type === 'smart-minimax';
         const isSmartGroup = node.type === 'smart-group';
@@ -8976,7 +9076,7 @@ function render(){
         const body = nodeBodyHtml(node, layout);
         const deleteBtn = (isGroup || isMinimax) ? '' : `<button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button>`;
         const hint = isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isMinimax ? 'Timeline editing' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
-        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isMinimax ? 'minimax-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
+        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isNote ? 'note-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isMinimax ? 'minimax-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
 
             <div class="node-head"><div class="node-title">${title}</div><div class="node-actions">${deleteBtn}</div></div>
             ${!isEmpty && !isGroup && !isMinimax ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
@@ -8985,9 +9085,8 @@ function render(){
             <div class="node-body">${body}</div>
             ${isCompactMember && (isPrompt || isLoop) ? '<div class="smart-group-member-grab" title="拖动移出分组"></div>' : ''}
             <div class="node-hint">${hint}</div>
-            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop || isMinimax || isSmartGroup ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
-            <div class="node-port port-in" data-port="in" title="input"></div>
-            <div class="node-port port-out" data-port="out" title="output"></div>
+            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isNote || isLoop || isMinimax || isSmartGroup ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
+            ${isNote ? '' : '<div class="node-port port-in" data-port="in" title="input"></div><div class="node-port port-out" data-port="out" title="output"></div>'}
         </div>`;
         return {node, html};
     });
@@ -10129,6 +10228,22 @@ function handlePortDrop(drag, e){
     commitPendingUndo();
     render();
     scheduleSave();
+    return true;
+}
+function bindSmartNoteControls(el, node){
+    el.querySelectorAll('.smart-note-card textarea, .smart-note-card select, .smart-note-card input, .smart-note-card label').forEach(control => {
+        control.addEventListener('mousedown', e => e.stopPropagation());
+        control.addEventListener('click', e => e.stopPropagation());
+    });
+    const card = el.querySelector('.smart-note-card');
+    const textEl = el.querySelector('[data-note-text]');
+    const fontEl = el.querySelector('[data-note-font-size]');
+    const textColorEl = el.querySelector('[data-note-text-color]');
+    const backgroundEl = el.querySelector('[data-note-background-color]');
+    if(textEl) textEl.oninput = e => { node.text = e.target.value; scheduleSave(); };
+    if(fontEl) fontEl.onchange = e => { node.fontSize = Number(e.target.value) || 36; if(textEl) textEl.style.fontSize = `${node.fontSize}px`; scheduleSave(); };
+    if(textColorEl) textColorEl.oninput = e => { node.textColor = e.target.value; if(textEl) textEl.style.color = node.textColor; card?.style.setProperty('--note-text', node.textColor); scheduleSave(); };
+    if(backgroundEl) backgroundEl.oninput = e => { node.backgroundColor = e.target.value; card?.style.setProperty('--note-bg', node.backgroundColor); scheduleSave(); };
 }
 function pickMediaForSmartNode(nodeId){
     const input = document.createElement('input');
@@ -10151,6 +10266,7 @@ function bindNodeEvents(){
         const id = el.dataset.id;
         const nodeForControls = nodes.find(n => n.id === id);
         if(nodeForControls?.type === 'smart-prompt') bindPromptNodeControls(el, nodeForControls);
+        if(nodeForControls?.type === 'smart-note') bindSmartNoteControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-loop') bindLoopNodeControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-minimax') bindMinimaxNodeControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-group') {
@@ -18107,6 +18223,7 @@ function createNodeFromMenu(type){
     if(type === 'group') return createSmartGroupNode(p.x - 170, p.y - 110);
     let created = null;
     if(type === 'prompt') created = createPromptNode(p.x - 158, p.y - 97);
+    else if(type === 'note') created = createNoteNode(p.x - 180, p.y - 130);
     else if(type === 'loop') created = createLoopNode(p.x - 135, p.y - 95);
     else if(type === 'minimax') created = createMinimaxNode(p.x - 520, p.y - 320);
     else created = createImageNodeAt(p);
@@ -18790,6 +18907,12 @@ window.addEventListener('keydown', e => {
             toggleAssetLibrary();
             return;
         }
+        if(key === 't'){
+            if(e.repeat || promptTemplatePanel?.classList.contains('open')) return;
+            e.preventDefault();
+            openPromptTemplateForSmartSelection();
+            return;
+        }
     }
     if((e.ctrlKey || e.metaKey) && key === 'c' && !isEditableTarget(e.target)){
         const selectionText = window.getSelection?.().toString() || '';
@@ -18808,6 +18931,14 @@ window.addEventListener('keydown', e => {
     }
     if(e.key === 'Escape' && imageEditModal.classList.contains('open')){
         closeImageEditor();
+        return;
+    }
+    if(e.key === 'Enter' && promptTemplatePanel?.classList.contains('open') && !isEditableTarget(e.target)){
+        if(e.target?.closest?.('button, a, [role="button"]')) return;
+        if(promptTemplateSelectedId && canWritePromptTemplateTarget()){
+            e.preventDefault();
+            applyPromptTemplateToNode('positive');
+        }
         return;
     }
     const historyAction = window.CanvasHistory.historyShortcutAction(e);
@@ -18998,6 +19129,9 @@ promptTemplatePanel?.addEventListener('mousedown', e => e.stopPropagation());
 promptTemplatePanel?.addEventListener('wheel', e => e.stopPropagation(), {passive:false});
 promptTemplatePanel?.addEventListener('click', e => {
     e.stopPropagation();
+    const copy = e.target.closest('[data-template-copy]');
+    if(copy){ copySelectedPromptTemplate(copy.dataset.templateCopy || 'positive'); return; }
+    if(e.target.closest('[data-template-write]')){ applyPromptTemplateToNode('positive'); return; }
     const apply = e.target.closest('[data-template-apply]');
     if(apply){ applyPromptTemplateToNode(apply.dataset.templateApply || 'positive'); return; }
     if(e.target.closest('[data-template-save-current]')){ saveCurrentPromptAsTemplate(); return; }
@@ -19035,9 +19169,28 @@ promptTemplatePanel?.addEventListener('click', e => {
     if(card){
         promptTemplateSelectedId = card.dataset.templateId || '';
         promptTemplateEditing = false;
+        const now = Date.now();
+        const repeated = promptTemplatePanel?.dataset.lastCardId === promptTemplateSelectedId
+            && now - Number(promptTemplatePanel?.dataset.lastCardAt || 0) <= 650;
+        if(promptTemplatePanel){
+            promptTemplatePanel.dataset.lastCardId = promptTemplateSelectedId;
+            promptTemplatePanel.dataset.lastCardAt = String(now);
+        }
+        if(repeated && canWritePromptTemplateTarget()){
+            applyPromptTemplateToNode('positive');
+            return;
+        }
         renderPromptTemplatePanel();
         return;
     }
+});
+promptTemplatePanel?.addEventListener('keydown', e => {
+    if(e.key !== 'Enter' || promptTemplateEditing || isEditableTarget(e.target)) return;
+    if(e.target.closest('[data-template-copy],[data-template-write],[data-template-apply],button:not([data-template-id])')) return;
+    if(!promptTemplateSelectedId || !canWritePromptTemplateTarget()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    applyPromptTemplateToNode('positive');
 });
 if(promptPresetClose) promptPresetClose.onclick = closePromptPresetPanel;
 if(promptTemplateClose) promptTemplateClose.onclick = closePromptTemplatePanel;

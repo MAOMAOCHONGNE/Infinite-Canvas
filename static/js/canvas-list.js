@@ -63,6 +63,12 @@ const boardResetViewBtn = document.getElementById('boardResetView');
 const pasteCanvasBtn = document.getElementById('pasteCanvasBtn');
 const emptyCreateCanvasBtn = document.getElementById('emptyCreateCanvasBtn');
 const statusEl = document.getElementById('boardStatus');
+const coverModal = document.getElementById('coverModal');
+const coverModalBody = document.getElementById('coverModalBody');
+const coverModalClose = document.getElementById('coverModalClose');
+const coverAutoBtn = document.getElementById('coverAutoBtn');
+const coverUploadBtn = document.getElementById('coverUploadBtn');
+const coverFileInput = document.getElementById('coverFileInput');
 
 /* ===== State ===== */
 let projects = [];
@@ -72,6 +78,7 @@ let currentProjectId = rememberedProjectId();
 let pendingDeleteProjectId = null;
 let statusTimer = null;
 let clipboardCanvasId = null;   // 剪切的画布（切到别的项目后粘贴）
+let coverCanvasId = null;
 
 // board viewport (mirrors smart-canvas math)
 const viewport = { x: 0, y: 0, scale: 1 };
@@ -107,7 +114,7 @@ function boardCenterWorld(){
     };
 }
 function resetView(){
-    const cards = Array.from(boardWorld.querySelectorAll('.ws-card'));
+    const cards = Array.from(boardWorld.querySelectorAll('.ws-card, .ws-create-card'));
     if(!cards.length){
         viewport.x = 0; viewport.y = 0; viewport.scale = 1; applyViewport();
         return;
@@ -360,7 +367,7 @@ function updateBoardHeader(){
 
 function autoLayoutNulls(items){
     // grid layout for cards with null board position; persist each once.
-    const X0 = 40, Y0 = 40, XSTRIDE = 276, YSTRIDE = 176, COLS = 4;
+    const X0 = 40, Y0 = 40, XSTRIDE = 276, YSTRIDE = 258, COLS = 4;
     const positioned = items.filter(c => c.board_x != null && c.board_y != null);
     const nulls = items.filter(c => c.board_x == null || c.board_y == null);
     // start index after existing positioned grid slots to reduce overlap
@@ -374,13 +381,32 @@ function autoLayoutNulls(items){
     });
 }
 
+function syncBoardEmptyState(){
+    const isEmpty = canvasesInProject(currentProjectId).length === 0;
+    boardEmptyHint.classList.toggle('hidden', !isEmpty || !!createCardEl);
+}
+
+function canvasCoverPreviewUrl(url, width = 480, forceLocal = null){
+    const text = String(url || '').trim();
+    if(!text) return '';
+    if(forceLocal === true || text.startsWith('/assets/') || text.startsWith('/output/') || text.startsWith('/api/storage-files/')){
+        return `/api/media-preview?url=${encodeURIComponent(text)}&w=${Math.max(64, Number(width) || 480)}`;
+    }
+    return text;
+}
+
 function renderBoard(){
+    if(createCardEl){
+        createCardEl.remove();
+        createCardEl = null;
+        createCardWorldPt = null;
+    }
     updateBoardHeader();
     const items = canvasesInProject(currentProjectId);
     autoLayoutNulls(items);
     boardWorld.innerHTML = '';
     items.forEach(c => boardWorld.appendChild(buildCard(c)));
-    boardEmptyHint.classList.toggle('hidden', items.length > 0);
+    syncBoardEmptyState();
     updatePasteBtn();
     refreshIcons();
 }
@@ -394,17 +420,20 @@ function buildCard(c){
     card.dataset.canvasId = c.id;
     card.style.left = (c.board_x || 0) + 'px';
     card.style.top = (c.board_y || 0) + 'px';
-    // 卡片布局：顶部=类型标签+更多按钮；中部=标题；底部=节点数·时间。已移除图标。
+    const coverUrl = canvasCoverPreviewUrl(c.cover, 480, c.cover_is_local);
     card.innerHTML = `
-        <div class="ws-card-top">
+        <div class="ws-card-cover${coverUrl ? '' : ' empty'}">
+            ${coverUrl ? `<img src="${escapeAttr(coverUrl)}" alt="" draggable="false">` : `<div class="ws-card-cover-placeholder">${renderCanvasIcon(isSmart ? 'sparkles' : 'layers', 28)}</div>`}
             <span class="ws-card-kind ${isSmart ? 'smart' : 'classic'}">${isSmart ? compactLabel('智能画布','智能','Smart') : compactLabel('普通画布','普通','Classic')}</span>
             <button class="ws-card-menu" type="button" title="${L('更多','More')}" aria-label="${L('更多','More')}"><i data-lucide="more-horizontal" class="w-4 h-4"></i></button>
         </div>
-        <div class="ws-card-title">${escapeHtml(c.title)}</div>
-        <div class="ws-card-meta">
-            <span class="ws-card-nodes">${(c.node_count != null ? c.node_count : 0)} ${L('节点','nodes')}</span>
-            <span class="ws-card-meta-dot"></span>
-            <span class="ws-card-time">${formatCanvasTime(c.updated_at || c.created_at)}</span>
+        <div class="ws-card-body">
+            <div class="ws-card-title">${escapeHtml(c.title)}</div>
+            <div class="ws-card-meta">
+                <span class="ws-card-nodes">${(c.node_count != null ? c.node_count : 0)} ${L('节点','nodes')}</span>
+                <span class="ws-card-meta-dot"></span>
+                <span class="ws-card-time">${formatCanvasTime(c.updated_at || c.created_at)}</span>
+            </div>
         </div>
         <div class="ws-card-delete-confirm">
             <div class="ws-card-delete-title">${L('移入回收站？','Move to trash?')}</div>
@@ -413,6 +442,16 @@ function buildCard(c){
                 <button class="ws-card-delete-no" type="button">${L('取消','Cancel')}</button>
             </div>
         </div>`;
+    const coverImage = card.querySelector('.ws-card-cover img');
+    if(coverImage){
+        coverImage.ondragstart = event => event.preventDefault();
+        coverImage.onerror = () => {
+            const cover = coverImage.closest('.ws-card-cover');
+            cover.classList.add('empty');
+            coverImage.replaceWith(Object.assign(document.createElement('div'), { className:'ws-card-cover-placeholder', innerHTML:renderCanvasIcon(isSmart ? 'sparkles' : 'layers', 28) }));
+            refreshIcons();
+        };
+    }
     attachCardDrag(card, c);
     const menuBtn = card.querySelector('.ws-card-menu');
     menuBtn.onmousedown = e => e.stopPropagation();
@@ -474,17 +513,54 @@ function openCanvas(c){
 /* ===== Card create flow ===== */
 let createCardEl = null;
 let createKind = 'classic';
-function closeCreateCard(){ createCardEl?.remove(); createCardEl = null; }
+let createCardWorldPt = null;
+function closeCreateCard(){
+    createCardEl?.remove();
+    createCardEl = null;
+    createCardWorldPt = null;
+    syncBoardEmptyState();
+}
+function attachCreateCardDrag(el){
+    const handle = el.querySelector('.ws-create-head');
+    handle?.addEventListener('mousedown', e => {
+        if(e.button !== 0 || e.target.closest('button,input')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const start = screenToWorld(e.clientX, e.clientY);
+        const origin = { x:createCardWorldPt?.x || 0, y:createCardWorldPt?.y || 0 };
+        let moved = false;
+        const onMove = ev => {
+            const current = screenToWorld(ev.clientX, ev.clientY);
+            const dx = current.x - start.x, dy = current.y - start.y;
+            if(!moved && Math.hypot(dx * viewport.scale, dy * viewport.scale) > 4){
+                moved = true;
+                el.classList.add('dragging');
+            }
+            if(!moved) return;
+            createCardWorldPt = { x:origin.x + dx, y:origin.y + dy };
+            el.style.left = `${createCardWorldPt.x}px`;
+            el.style.top = `${createCardWorldPt.y}px`;
+        };
+        const onUp = () => {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            el.classList.remove('dragging');
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    });
+}
 function openCreateCard(worldPt){
     closeCreateCard();
     closeCardMenu();
     createKind = 'classic';
+    createCardWorldPt = { x:Number(worldPt.x) || 0, y:Number(worldPt.y) || 0 };
     const el = document.createElement('div');
     el.className = 'ws-create-card';
-    el.style.left = worldPt.x + 'px';
-    el.style.top = worldPt.y + 'px';
+    el.style.left = createCardWorldPt.x + 'px';
+    el.style.top = createCardWorldPt.y + 'px';
     el.innerHTML = `
-        <div class="ws-create-title">${L('新建画布','New canvas')}</div>
+        <div class="ws-create-head"><div class="ws-create-title">${L('新建画布','New canvas')}</div><i data-lucide="grip-horizontal"></i></div>
         <input class="ws-create-input" type="text" maxlength="80" placeholder="${L('画布名称（可留空）','Canvas name (optional)')}">
         <div class="ws-create-toggle">
             <button class="ws-create-toggle-btn active" type="button" data-kind="classic">${L('普通画布','Classic')}</button>
@@ -496,6 +572,8 @@ function openCreateCard(worldPt){
         </div>`;
     boardWorld.appendChild(el);
     createCardEl = el;
+    syncBoardEmptyState();
+    attachCreateCardDrag(el);
     el.addEventListener('mousedown', e => e.stopPropagation());
     const input = el.querySelector('.ws-create-input');
     input.focus();
@@ -505,7 +583,7 @@ function openCreateCard(worldPt){
             el.querySelectorAll('.ws-create-toggle-btn').forEach(b => b.classList.toggle('active', b === btn));
         };
     });
-    const confirm = () => createCanvasOnBoard(input.value.trim(), createKind, worldPt);
+    const confirm = () => createCanvasOnBoard(input.value.trim(), createKind, { ...createCardWorldPt });
     el.querySelector('.ws-create-confirm').onclick = confirm;
     el.querySelector('.ws-create-cancel').onclick = closeCreateCard;
     input.onkeydown = e => {
@@ -557,6 +635,7 @@ function openCardMenu(canvasId, anchorBtn){
     pop.className = 'ws-card-pop';
     pop.innerHTML = `
         <button class="ws-pop-item" data-act="rename"><i data-lucide="pencil" class="w-4 h-4"></i><span>${L('重命名','Rename')}</span></button>
+        <button class="ws-pop-item" data-act="cover"><i data-lucide="image" class="w-4 h-4"></i><span>${L('设置封面','Set cover')}</span></button>
         <button class="ws-pop-item" data-act="export"><i data-lucide="download" class="w-4 h-4"></i><span>${L('导出画布','Export canvas')}</span></button>
         <button class="ws-pop-item" data-act="export-assets"><i data-lucide="archive" class="w-4 h-4"></i><span>${L('导出画布 + 资源','Export with assets')}</span></button>
         <button class="ws-pop-item" data-act="cut"><i data-lucide="scissors" class="w-4 h-4"></i><span>${L('剪切到其他项目','Cut to project')}</span></button>
@@ -571,6 +650,7 @@ function openCardMenu(canvasId, anchorBtn){
     pop.style.left = Math.round(Math.max(12, left)) + 'px';
     pop.style.top = Math.round(Math.max(12, top)) + 'px';
     pop.querySelector('[data-act="rename"]').onclick = () => { closeCardMenu(); startCardRename(canvasId); };
+    pop.querySelector('[data-act="cover"]').onclick = () => { closeCardMenu(); openCoverModal(canvasId); };
     pop.querySelector('[data-act="export"]').onclick = () => { closeCardMenu(); exportCanvas(canvasId); };
     pop.querySelector('[data-act="export-assets"]').onclick = () => { closeCardMenu(); exportCanvasWithResources(canvasId); };
     pop.querySelector('[data-act="cut"]').onclick = () => { closeCardMenu(); cutCanvas(canvasId); };
@@ -585,6 +665,91 @@ function showCardDeleteConfirm(canvasId){
         if(el !== card) el.classList.remove('confirming-delete');
     });
     card.classList.add('confirming-delete');
+}
+
+/* ===== Canvas cover picker ===== */
+function closeCoverModal(){
+    coverCanvasId = null;
+    coverModal?.classList.remove('open');
+    coverModal?.setAttribute('aria-hidden', 'true');
+    if(coverModalBody) coverModalBody.innerHTML = '';
+    if(coverFileInput) coverFileInput.value = '';
+}
+
+function updateCanvasFromResponse(id, data){
+    if(!data?.canvas) return;
+    const idx = canvases.findIndex(item => item.id === id);
+    if(idx >= 0) canvases[idx] = { ...canvases[idx], ...data.canvas };
+    renderBoard();
+}
+
+async function openCoverModal(canvasId){
+    coverCanvasId = canvasId;
+    coverModal?.classList.add('open');
+    coverModal?.setAttribute('aria-hidden', 'false');
+    coverModalBody.innerHTML = `<div class="cover-loading"><i data-lucide="loader-circle"></i><span>${L('正在读取画布图片…','Loading canvas images…')}</span></div>`;
+    refreshIcons();
+    try {
+        const res = await fetch(`/api/canvases/${encodeURIComponent(canvasId)}/cover-options`);
+        if(!res.ok) throw new Error('cover options failed');
+        const data = await res.json();
+        if(coverCanvasId !== canvasId) return;
+        const items = Array.isArray(data.items) ? data.items : [];
+        coverModalBody.innerHTML = items.length ? `
+            <div class="cover-mode-note"><i data-lucide="info"></i><span>${data.mode === 'custom' ? L('当前使用固定封面。点击下面任意图片即可替换。','A fixed cover is in use. Choose another image below to replace it.') : L('当前使用自动封面；有新生成结果时会自动更新。','Automatic cover is active and follows new generated results.')}</span></div>
+            <div class="cover-grid">${items.map((item, index) => `
+                <button class="cover-option${item.url === data.cover ? ' current' : ''}" type="button" data-cover-index="${index}" title="${escapeAttr(item.name || '')}">
+                    <img src="${escapeAttr(canvasCoverPreviewUrl(item.url, 320))}" alt="">
+                    <span>${escapeHtml(item.name || L('画布图片','Canvas image'))}</span>
+                    ${item.url === data.cover ? `<i data-lucide="check-circle-2"></i>` : ''}
+                </button>`).join('')}</div>`
+            : `<div class="cover-empty"><i data-lucide="image-off"></i><strong>${L('画布中还没有图片','No images in this canvas yet')}</strong><span>${L('你仍然可以上传一张自定义封面。','You can still upload a custom cover.')}</span></div>`;
+        coverModalBody.querySelectorAll('[data-cover-index]').forEach(button => {
+            button.onclick = async () => {
+                const item = items[Number(button.dataset.coverIndex)];
+                if(!item?.url) return;
+                button.disabled = true;
+                await setCanvasCover(canvasId, { cover_mode:'custom', cover_url:item.url });
+                closeCoverModal();
+            };
+        });
+        refreshIcons();
+    } catch(e){
+        console.error(e);
+        coverModalBody.innerHTML = `<div class="cover-empty"><i data-lucide="circle-alert"></i><strong>${L('无法读取画布图片','Could not load canvas images')}</strong></div>`;
+        refreshIcons();
+    }
+}
+
+async function setCanvasCover(id, patch){
+    try {
+        const res = await fetch(`/api/canvases/${encodeURIComponent(id)}/meta`, {
+            method:'POST',
+            headers:{ 'Content-Type':'application/json' },
+            body:JSON.stringify(patch)
+        });
+        if(!res.ok) throw new Error('cover save failed');
+        updateCanvasFromResponse(id, await res.json());
+        setStatus(L('封面已更新','Cover updated'));
+    } catch(e){ console.error(e); setStatus(L('封面保存失败','Could not save cover')); }
+}
+
+async function uploadCanvasCover(id, file){
+    if(!id || !file) return;
+    const form = new FormData();
+    form.append('file', file);
+    try {
+        setStatus(L('正在上传封面…','Uploading cover…'));
+        const res = await fetch(`/api/canvases/${encodeURIComponent(id)}/cover-upload`, { method:'POST', body:form });
+        if(!res.ok){
+            let detail = '';
+            try { detail = (await res.json()).detail || ''; } catch(_e){}
+            throw new Error(detail || 'cover upload failed');
+        }
+        updateCanvasFromResponse(id, await res.json());
+        closeCoverModal();
+        setStatus(L('封面已更新','Cover updated'));
+    } catch(e){ console.error(e); setStatus(String(e?.message || L('封面上传失败','Cover upload failed'))); }
 }
 
 /* ===== Export canvas (download the full canvas JSON) ===== */
@@ -1012,6 +1177,19 @@ trashEntryBtn.addEventListener('click', () => {
     else openTrashView();
 });
 trashCloseBtn.addEventListener('click', closeTrashView);
+coverModalClose?.addEventListener('click', closeCoverModal);
+coverModal?.addEventListener('mousedown', e => { if(e.target === coverModal) closeCoverModal(); });
+coverUploadBtn?.addEventListener('click', () => coverFileInput?.click());
+coverFileInput?.addEventListener('change', () => {
+    const file = coverFileInput.files?.[0];
+    if(file && coverCanvasId) uploadCanvasCover(coverCanvasId, file);
+});
+coverAutoBtn?.addEventListener('click', async () => {
+    const id = coverCanvasId;
+    if(!id) return;
+    await setCanvasCover(id, { cover_mode:'auto', cover_url:'' });
+    closeCoverModal();
+});
 
 // close card menu when clicking outside
 document.addEventListener('mousedown', e => {
@@ -1027,6 +1205,7 @@ document.addEventListener('keydown', e => {
     if(e.key !== 'Escape') return;
     closeCardMenu();
     closeCreateCard();
+    closeCoverModal();
     boardWorld.querySelectorAll('.ws-card.confirming-delete').forEach(el => el.classList.remove('confirming-delete'));
     if(trashPanel.classList.contains('active')) closeTrashView();
 });

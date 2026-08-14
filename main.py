@@ -237,6 +237,8 @@ OUTPUT_INPUT_DIR = os.path.join(ASSETS_DIR, "input")
 OUTPUT_OUTPUT_DIR = os.path.join(ASSETS_DIR, "output")
 ASSET_LIBRARY_DIR = os.path.join(ASSETS_DIR, "library")
 LOCAL_UPLOAD_DIR = os.path.join(ASSETS_DIR, "uploads")
+CANVAS_COVER_DIR = os.path.join(ASSETS_DIR, "canvas-covers")
+PROMPT_THUMBNAIL_DIR = os.path.join(ASSETS_DIR, "prompt-thumbnails")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 API_ENV_FILE = os.path.join(BASE_DIR, "API", ".env")
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -253,6 +255,7 @@ SHARED_FOLDERS_FILE = os.path.join(DATA_DIR, "shared_folders.json")
 GLOBAL_CONFIG_FILE = os.path.join(BASE_DIR, "global_config.json")
 CANVAS_TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 LOCAL_IMAGE_IMPORT_MAX_BYTES = int(os.getenv("LOCAL_IMAGE_IMPORT_MAX_BYTES", str(50 * 1024 * 1024)))
+PROMPT_THUMBNAIL_MAX_BYTES = 20 * 1024 * 1024
 LOCAL_IMAGE_IMPORT_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 RUNNINGHUB_THUMBNAIL_EXTS = (".jpg",)
 STORAGE_SETTINGS_FILE = os.path.join(DATA_DIR, "storage_settings.json")
@@ -1568,12 +1571,14 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
 os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_OUTPUT_DIR, exist_ok=True)
+os.makedirs(CANVAS_COVER_DIR, exist_ok=True)
 os.makedirs(ASSET_LIBRARY_DIR, exist_ok=True)
 os.makedirs(LOCAL_UPLOAD_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
 os.makedirs(CANVAS_DIR, exist_ok=True)
+os.makedirs(PROMPT_THUMBNAIL_DIR, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
@@ -2949,6 +2954,7 @@ class CanvasLLMTaskRequest(CanvasLLMRequest):
     mode: str = "node"
     client_id: str = ""
     input_key: str = Field(default="", max_length=160)
+    display_message: str = Field(default="", max_length=LLM_MESSAGE_MAX_LENGTH)
 
 class ConversationCreateRequest(BaseModel):
     title: str = "新对话"
@@ -2970,6 +2976,8 @@ class CanvasMetaUpdate(BaseModel):
     project: Optional[str] = None
     board_x: Optional[float] = None
     board_y: Optional[float] = None
+    cover_mode: Optional[str] = None
+    cover_url: Optional[str] = None
 
 class ProjectCreateRequest(BaseModel):
     name: str = "新项目"
@@ -2996,6 +3004,9 @@ class CanvasAssetDownloadRequest(BaseModel):
     urls: List[str] = []
     items: List[Dict[str, Any]] = []
     filename: str = "canvas-output-images.zip"
+
+class CanvasAssetDeleteRequest(BaseModel):
+    urls: List[str] = []
 
 class CanvasWorkflowExportRequest(BaseModel):
     nodes: List[Dict[str, Any]] = []
@@ -3685,6 +3696,9 @@ def normalize_canvas_color(value):
     return color if color in CANVAS_COLORS else ""
 
 def canvas_record(data):
+    cover_mode = normalize_canvas_cover_mode(data.get("cover_mode"))
+    cover_url = str(data.get("cover_url") or "").strip()
+    resolved_cover = resolve_canvas_cover(data)
     return {
         "id": data.get("id"),
         "title": data.get("title", "未命名画布"),
@@ -3700,6 +3714,10 @@ def canvas_record(data):
         "updated_at": data.get("updated_at", 0),
         "deleted_at": data.get("deleted_at", 0),
         "node_count": len(data.get("nodes", [])),
+        "cover_mode": cover_mode,
+        "cover_url": cover_url,
+        "cover": resolved_cover,
+        "cover_is_local": bool(output_file_from_url(resolved_cover)) if resolved_cover else False,
     }
 
 def cleanup_expired_canvas_trash():
@@ -3714,6 +3732,7 @@ def cleanup_expired_canvas_trash():
                     data = json.load(f)
                 deleted_at = int(data.get("deleted_at") or 0)
                 if deleted_at and deleted_at < cutoff:
+                    remove_canvas_uploaded_cover(data)
                     os.remove(path)
             except Exception:
                 continue
@@ -3761,7 +3780,7 @@ def canvas_asset_url_value(value):
 
 def canvas_asset_downloadable_url(url):
     text = str(url or "").strip()
-    return text if text.startswith(("/output/", "/assets/", "http://", "https://")) else ""
+    return text if text.startswith(("/output/", "/assets/", "/api/storage-files/", "http://", "https://")) else ""
 
 def canvas_asset_kind(value, url=""):
     explicit = ""
@@ -3853,6 +3872,87 @@ def extract_canvas_assets(canvas):
             items.append(item)
     return items
 
+def normalize_canvas_cover_mode(value):
+    return "custom" if str(value or "").strip().lower() == "custom" else "auto"
+
+def canvas_cover_candidates(canvas):
+    """Return image candidates in automatic-cover priority order without mutating the canvas."""
+    nodes = canvas.get("nodes") if isinstance(canvas.get("nodes"), list) else []
+    candidates = []
+    seen = set()
+    sequence = 0
+    for node_index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type") or "").strip().lower()
+        node_created_at = int(node.get("created_at") or node.get("updated_at") or 0)
+        for field_path, raw, url in iter_canvas_asset_values(node):
+            if url in seen or canvas_asset_kind(raw, url) != "image":
+                continue
+            seen.add(url)
+            sequence += 1
+            path_text = str(field_path or "").lower()
+            if node_type in {"output", "smart-output"}:
+                priority = 40
+            elif "generatedoutputs" in path_text or "outputs" in path_text:
+                priority = 30
+            elif node_type in {"smart-image", "image"}:
+                priority = 20
+            else:
+                priority = 10
+            candidates.append({
+                "url": url,
+                "name": canvas_asset_name(raw, url, f"cover-{sequence}"),
+                "node_id": str(node.get("id") or f"node_{node_index}"),
+                "node_title": canvas_node_title(node),
+                "node_type": node_type,
+                "priority": priority,
+                "created_at": node_created_at,
+                "_node_index": node_index,
+                "_sequence": sequence,
+            })
+    candidates.sort(
+        key=lambda item: (
+            int(item.get("priority") or 0),
+            int(item.get("created_at") or 0),
+            int(item.get("_node_index") or 0),
+            int(item.get("_sequence") or 0),
+        ),
+        reverse=True,
+    )
+    for item in candidates:
+        item.pop("_node_index", None)
+        item.pop("_sequence", None)
+    return candidates
+
+def resolve_canvas_cover(canvas):
+    if normalize_canvas_cover_mode(canvas.get("cover_mode")) == "custom":
+        custom = canvas_asset_downloadable_url(canvas.get("cover_url"))
+        if custom:
+            return custom
+    candidates = canvas_cover_candidates(canvas)
+    return str(candidates[0].get("url") or "") if candidates else ""
+
+def canvas_uploaded_cover_path(url):
+    text = urllib.parse.unquote(str(url or "").split("?", 1)[0]).replace("\\", "/")
+    prefix = "/assets/canvas-covers/"
+    if not text.startswith(prefix):
+        return ""
+    candidate = os.path.abspath(os.path.join(CANVAS_COVER_DIR, text[len(prefix):]))
+    root = os.path.abspath(CANVAS_COVER_DIR)
+    try:
+        return candidate if os.path.commonpath([root, candidate]) == root else ""
+    except ValueError:
+        return ""
+
+def remove_canvas_uploaded_cover(canvas):
+    path = canvas_uploaded_cover_path((canvas or {}).get("cover_url"))
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
 def canvas_assets_index():
     canvases = []
     items = []
@@ -3867,8 +3967,8 @@ def canvas_assets_index():
                 canvas = json.load(f)
         except Exception:
             continue
-        if canvas.get("deleted_at"):
-            continue
+        # 回收站中的画布仍然保留着原始引用；在彻底清理画布记录前，
+        # 也要保护这些素材，避免用户恢复画布时出现断图。
         record = canvas_record(canvas)
         canvas_items = extract_canvas_assets(canvas)
         record["asset_count"] = len(canvas_items)
@@ -3887,6 +3987,69 @@ def canvas_assets_index():
         {"id": "classic", "name": "普通画布", "count": item_counts.get("classic", 0), "canvas_count": canvas_counts.get("classic", 0)},
     ]
     return {"categories": categories, "canvases": canvases, "items": items}
+
+def canvas_orphan_assets_index():
+    """列出本地媒体中未被任何画布（含回收站）引用的文件；只读，不自动删除。"""
+    referenced = set()
+    for filename in os.listdir(CANVAS_DIR):
+        if not filename.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(CANVAS_DIR, filename), "r", encoding="utf-8") as handle:
+                canvas = json.load(handle)
+        except Exception:
+            continue
+        # 回收站中的画布仍然保留着原始引用；在彻底清理画布记录前，
+        # 也要保护这些素材，避免用户恢复画布时出现断图。
+        for _field, _raw, url in iter_canvas_asset_values(canvas.get("nodes") or []):
+            if url:
+                path = output_file_from_url(url)
+                if path:
+                    referenced.add(os.path.abspath(path))
+    roots = [
+        ("generated", OUTPUT_OUTPUT_DIR),
+        ("output", OUTPUT_DIR),
+        ("input", OUTPUT_INPUT_DIR),
+    ]
+    items = []
+    seen = set()
+    for kind, root in roots:
+        if not os.path.isdir(root):
+            continue
+        for current, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in files:
+                if name.startswith("."):
+                    continue
+                path = os.path.abspath(os.path.join(current, name))
+                if path in referenced or path in seen:
+                    continue
+                media_kind = asset_library_media_kind(path)
+                if media_kind not in {"image", "video", "audio"}:
+                    continue
+                seen.add(path)
+                rel = os.path.relpath(path, root).replace("\\", "/")
+                if kind == "output":
+                    url = f"/output/{rel}"
+                elif kind == "generated":
+                    url = f"/assets/output/{rel}"
+                else:
+                    url = f"/assets/input/{rel}"
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                items.append({
+                    "id": hashlib.sha1(path.encode("utf-8")).hexdigest()[:24],
+                    "url": url,
+                    "path": path,
+                    "name": name,
+                    "kind": media_kind,
+                    "size": stat.st_size,
+                    "created_at": int(stat.st_mtime * 1000),
+                })
+    items.sort(key=lambda item: int(item.get("created_at") or 0), reverse=True)
+    return items
 
 def display_title(text):
     title = re.sub(r"\s+", " ", text or "").strip()
@@ -5462,7 +5625,7 @@ def codex_chat_prompt(payload, history_messages=None):
         parts.append(f"系统要求：\n{system_prompt}")
     for item in (history_messages or [])[-MAX_HISTORY_MESSAGES:]:
         role = str(item.get("role") or "").strip()
-        content = item.get("content")
+        content = item.get("requestContent") or item.get("request_content") or item.get("content")
         if role in {"user", "assistant"} and content:
             label = "用户" if role == "user" else "助手"
             parts.append(f"{label}：\n{content}")
@@ -5478,6 +5641,8 @@ async def codex_chat_text(payload, history_messages=None):
         image_values = []
         if hasattr(payload, "images"):
             image_values.extend([{"url": item} for item in (getattr(payload, "images", None) or []) if item])
+        for history_item in (history_messages or [])[-MAX_HISTORY_MESSAGES:]:
+            image_values.extend([{"url": item} for item in canvas_llm_message_image_values(history_item)])
         if hasattr(payload, "reference_images"):
             image_values.extend([ref.dict() for ref in (getattr(payload, "reference_images", None) or []) if getattr(ref, "url", "")])
         image_paths, temp_paths = await codex_reference_paths(image_values)
@@ -5748,7 +5913,7 @@ def gemini_cli_chat_prompt(payload, history_messages=None):
         parts.append(f"系统要求：\n{system_prompt}")
     for item in (history_messages or [])[-MAX_HISTORY_MESSAGES:]:
         role = str(item.get("role") or "").strip()
-        content = item.get("content")
+        content = item.get("requestContent") or item.get("request_content") or item.get("content")
         if role in {"user", "assistant"} and content:
             label = "用户" if role == "user" else "助手"
             parts.append(f"{label}：\n{content}")
@@ -5757,6 +5922,8 @@ def gemini_cli_chat_prompt(payload, history_messages=None):
     image_values = []
     if hasattr(payload, "images"):
         image_values.extend([{"url": item} for item in (getattr(payload, "images", None) or []) if item])
+    for history_item in (history_messages or [])[-MAX_HISTORY_MESSAGES:]:
+        image_values.extend([{"url": item} for item in canvas_llm_message_image_values(history_item)])
     if hasattr(payload, "reference_images"):
         image_values.extend([ref.dict() for ref in (getattr(payload, "reference_images", None) or []) if getattr(ref, "url", "")])
     refs = []
@@ -7302,7 +7469,7 @@ def default_asset_library():
     ]
     return {
         "active_library_id": "default",
-        "libraries": [{"id": "default", "name": "默认资产库", "type": "asset", "categories": categories}],
+        "libraries": [{"id": "default", "name": "角色素材库", "type": "asset", "categories": categories}],
         "categories": categories,
         "updated_at": now_ms(),
     }
@@ -7315,13 +7482,15 @@ def normalize_asset_library(lib):
     if not libraries:
         libraries = [{
             "id": "default",
-            "name": "默认资产库",
+            "name": "角色素材库",
             "type": "asset",
             "categories": legacy_categories or default_asset_library()["categories"],
         }]
     for library in libraries:
         library["id"] = re.sub(r"[^A-Za-z0-9_-]+", "_", str(library.get("id") or f"lib_{uuid.uuid4().hex[:8]}"))[:40]
         library["name"] = sanitize_asset_name(library.get("name") or "资产库", "资产库")
+        if library.get("id") == "default" and library.get("name") == "默认资产库":
+            library["name"] = "角色素材库"
         cats = library.get("categories") if isinstance(library.get("categories"), list) else []
         if library.get("id") == "default" and not any(c.get("type") == "workflow" for c in cats):
             cats.append({"id": "workflows", "name": "工作流", "type": "workflow", "items": []})
@@ -7959,6 +8128,7 @@ def normalize_prompt_library_item(item):
         "scene": str(item.get("scene") or "").strip()[:500],
         "positive": positive,
         "negative": str(item.get("negative") or "").strip(),
+        "thumbnail": str(item.get("thumbnail") or "").strip()[:1000],
         "params": item.get("params") if isinstance(item.get("params"), dict) else {},
         "created_at": int(item.get("created_at") or now_ms()),
         "updated_at": int(item.get("updated_at") or item.get("created_at") or now_ms()),
@@ -8118,6 +8288,68 @@ def find_prompt_library(data, library_id=""):
     libraries = data.get("libraries") if isinstance(data.get("libraries"), list) else []
     library_id = str(library_id or data.get("active_library_id") or "").strip()
     return next((item for item in libraries if item.get("id") == library_id), None) or (libraries[0] if libraries else None)
+
+def find_prompt_library_item(data, item_id, library_id=""):
+    clean_item_id = str(item_id or "").strip()
+    clean_library_id = str(library_id or "").strip()
+    for library in (data.get("libraries") if isinstance(data, dict) else []) or []:
+        if clean_library_id and str(library.get("id") or "") != clean_library_id:
+            continue
+        for item in library.get("items") or []:
+            if isinstance(item, dict) and str(item.get("id") or "") == clean_item_id:
+                return library, item
+    return None, None
+
+def prompt_thumbnail_path(value):
+    text = str(value or "").strip()
+    prefix = "/assets/prompt-thumbnails/"
+    if not text.startswith(prefix):
+        return ""
+    name = urllib.parse.unquote(text[len(prefix):]).replace("\\", "/")
+    if "/" in name or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        return ""
+    root = os.path.abspath(PROMPT_THUMBNAIL_DIR)
+    target = os.path.abspath(os.path.join(root, name))
+    try:
+        if os.path.commonpath([root, target]) != root:
+            return ""
+    except ValueError:
+        return ""
+    return target
+
+def remove_prompt_thumbnail(value):
+    path = prompt_thumbnail_path(value)
+    if not path:
+        return False
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+            return True
+    except OSError:
+        pass
+    return False
+
+def save_prompt_thumbnail_bytes(content, item_id=""):
+    if not content:
+        raise ValueError("缩略图文件为空")
+    if len(content) > PROMPT_THUMBNAIL_MAX_BYTES:
+        raise ValueError("缩略图不能超过 20MB")
+    try:
+        with Image.open(BytesIO(content)) as source:
+            source = ImageOps.exif_transpose(source)
+            source.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            if source.mode in ("RGBA", "LA") or (source.mode == "P" and "transparency" in source.info):
+                image = source.convert("RGBA")
+            else:
+                image = source.convert("RGB")
+            safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(item_id or "template"))[:40] or "template"
+            filename = f"{safe_id}_{uuid.uuid4().hex[:12]}.webp"
+            os.makedirs(PROMPT_THUMBNAIL_DIR, exist_ok=True)
+            target = os.path.join(PROMPT_THUMBNAIL_DIR, filename)
+            image.save(target, "WEBP", quality=84, method=6)
+    except (OSError, ValueError) as exc:
+        raise ValueError("无法识别这张图片") from exc
+    return f"/assets/prompt-thumbnails/{filename}"
 
 def sanitize_asset_name(name, fallback="asset"):
     name = re.sub(r'[\\/:*?"<>|]+', "_", str(name or fallback)).strip()
@@ -16054,6 +16286,39 @@ async def canvas_video(payload: CanvasVideoRequest):
 
 # --- Canvas LLM ---
 
+def canvas_llm_message_image_values(item, limit: int = 8):
+    values = []
+    for image in (item.get("images") if isinstance(item, dict) else []) or []:
+        value = image.get("url") if isinstance(image, dict) else image
+        value = str(value or "").strip()
+        if not value or value in values:
+            continue
+        values.append(value)
+        if len(values) >= max(1, int(limit or 8)):
+            break
+    return values
+
+def canvas_llm_history_message(item):
+    if not isinstance(item, dict):
+        return None
+    role = str(item.get("role") or "").strip()
+    if role not in {"user", "assistant"}:
+        return None
+    content = item.get("requestContent") or item.get("request_content") or item.get("content")
+    if not content:
+        return None
+    if role != "user":
+        return {"role": role, "content": content}
+    image_values = canvas_llm_message_image_values(item)
+    if not image_values:
+        return {"role": role, "content": content}
+    content_parts = [{"type": "text", "text": str(content)}]
+    for image in image_values:
+        ref_url = media_reference_to_url(image, max_image_size=1024)
+        if ref_url:
+            content_parts.append({"type": "image_url", "image_url": {"url": ref_url}})
+    return {"role": role, "content": content_parts if len(content_parts) > 1 else str(content)}
+
 async def execute_canvas_llm(payload: CanvasLLMRequest):
     _provider = get_api_provider(payload.provider)
     if is_codex_provider(_provider):
@@ -16073,10 +16338,9 @@ async def execute_canvas_llm(payload: CanvasLLMRequest):
     system_prompt = (payload.system_prompt or "").strip()
     upstream_messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     for item in payload.messages[-MAX_HISTORY_MESSAGES:]:
-        role = item.get("role")
-        content = item.get("content")
-        if role in {"user", "assistant"} and content:
-            upstream_messages.append({"role": role, "content": content})
+        history_message = canvas_llm_history_message(item)
+        if history_message:
+            upstream_messages.append(history_message)
     # 构造用户消息：有图片/视频时用 OpenAI/Gemini 多模态格式
     image_inputs = [img for img in (payload.images or []) if is_image_reference_value(img)]
     video_inputs = [video for video in (payload.videos or []) if is_video_reference_value(video)]
@@ -16195,6 +16459,8 @@ def update_canvas_llm_task_node(
     model: str = "",
     runtime_id: str = "",
     input_key: str = "",
+    display_message: str = "",
+    message_images=None,
 ):
     """Persist only the target LLM node so background completion cannot overwrite other edits."""
     normalized_mode = str(mode or "node").strip().lower()
@@ -16245,9 +16511,18 @@ def update_canvas_llm_task_node(
                         node["llmMsModel"] = model
             if normalized_mode == "chat" and status == "queued" and current_task_id != task_id:
                 messages = node.get("messages") if isinstance(node.get("messages"), list) else []
-                messages.append({"role": "user", "content": message})
+                shown_message = str(display_message or message or "")
+                request_message = str(message or "")
+                user_message = {"role": "user", "content": shown_message}
+                if request_message and request_message != shown_message:
+                    user_message["requestContent"] = request_message
+                image_values = canvas_llm_message_image_values({"images": message_images or []})
+                if image_values:
+                    user_message["images"] = image_values
+                messages.append(user_message)
                 node["messages"] = messages
                 node["chatInput"] = ""
+                node["chatInputMentions"] = []
         elif status == "succeeded":
             if normalized_mode == "smart-prompt":
                 node["text"] = result_text
@@ -16363,6 +16638,8 @@ async def create_canvas_llm_task(payload: CanvasLLMTaskRequest):
         model=payload.model or payload.ms_model,
         runtime_id=CANVAS_TASK_RUNTIME_ID,
         input_key=payload.input_key,
+        display_message=payload.display_message,
+        message_images=payload.images,
     )
     with CANVAS_TASK_LOCK:
         prune_canvas_llm_task_records_locked()
@@ -16668,6 +16945,20 @@ def build_backup_archive(payload):
     prompt_source = load_prompt_libraries()
     prompt_libraries = [backup_io.sanitize_portable_config(item) for item in prompt_source.get("libraries") or []
         if isinstance(item, dict) and str(item.get("id") or "") in selected_prompt_ids]
+    prompt_thumbnail_exports = []
+    for library in prompt_libraries:
+        for item in library.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            source_url = str(item.get("thumbnail") or "")
+            source_path = prompt_thumbnail_path(source_url)
+            if not source_path or not os.path.isfile(source_path):
+                item["thumbnail"] = ""
+                continue
+            digest = backup_file_sha256(source_path)
+            member = f"prompt-thumbnails/{digest}.webp"
+            item["thumbnail"] = f"backup://{member}"
+            prompt_thumbnail_exports.append((source_path, member, digest))
 
     if not (selected_projects or canvas_payloads or provider_configs or runninghub_apps or runninghub_workflows or prompt_libraries):
         raise ValueError("请至少选择一项备份内容")
@@ -16752,6 +17043,12 @@ def build_backup_archive(payload):
                 archive.writestr("configs/runninghub.json", backup_json_bytes({"apps": runninghub_apps, "workflows": runninghub_workflows}))
             if prompt_libraries:
                 manifest["configs"]["prompt_libraries"] = "configs/prompt-libraries.json"
+                written_prompt_thumbnails = set()
+                for source_path, member, digest in prompt_thumbnail_exports:
+                    if digest in written_prompt_thumbnails:
+                        continue
+                    archive.write(source_path, member)
+                    written_prompt_thumbnails.add(digest)
                 archive.writestr("configs/prompt-libraries.json", backup_json_bytes({"active_library_id": prompt_source.get("active_library_id"), "libraries": prompt_libraries}))
             archive.writestr("manifest.json", backup_json_bytes(manifest))
         date = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -16836,6 +17133,44 @@ def backup_copy_resource(archive, item, created_paths):
     rel = os.path.relpath(target, ASSETS_DIR).replace("\\", "/")
     return f"/assets/{rel}"
 
+def backup_restore_prompt_thumbnails(archive, prompt_payload, created_paths):
+    payload = copy.deepcopy(prompt_payload if isinstance(prompt_payload, dict) else {})
+    restored = {}
+    for library in payload.get("libraries") or []:
+        if not isinstance(library, dict):
+            continue
+        for item in library.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("thumbnail") or "")
+            if not source.startswith("backup://prompt-thumbnails/"):
+                if source and not prompt_thumbnail_path(source):
+                    item["thumbnail"] = ""
+                continue
+            member = source[len("backup://"):]
+            if member in restored:
+                item["thumbnail"] = restored[member]
+                continue
+            if not backup_io.is_safe_archive_member(member) or member not in archive.namelist():
+                item["thumbnail"] = ""
+                continue
+            member_info = archive.getinfo(member)
+            if member_info.file_size > PROMPT_THUMBNAIL_MAX_BYTES:
+                item["thumbnail"] = ""
+                continue
+            content = archive.read(member_info)
+            try:
+                url = save_prompt_thumbnail_bytes(content, item.get("id") or "imported")
+            except ValueError:
+                item["thumbnail"] = ""
+                continue
+            target = prompt_thumbnail_path(url)
+            if target:
+                created_paths.append(target)
+            restored[member] = url
+            item["thumbnail"] = url
+    return payload
+
 def backup_selected_ids(selection, key, available):
     if key not in selection:
         return set(available)
@@ -16868,6 +17203,7 @@ def import_backup_path(path, selection):
                 referenced_urls.update(backup_io.collect_local_resource_urls(canvas))
 
             created_resource_paths = []
+            created_prompt_thumbnail_paths = []
             created_canvas_paths = []
             url_mapping = {}
             original_projects = copy.deepcopy(load_projects())
@@ -16996,8 +17332,25 @@ def import_backup_path(path, selection):
                         "active_library_id": incoming_prompts.get("active_library_id"),
                         "libraries": [item for item in incoming_prompts.get("libraries") or [] if isinstance(item, dict) and str(item.get("id") or "") in selected_prompt_ids],
                     }
+                    incoming_prompts = backup_restore_prompt_thumbnails(archive, incoming_prompts, created_prompt_thumbnail_paths)
+                    created_resource_paths.extend(created_prompt_thumbnail_paths)
                     prompts, prompt_stats = backup_io.merge_prompt_libraries(prompts, incoming_prompts)
                     prompts_changed = bool(prompt_stats.get("imported") or prompt_stats.get("libraries_added"))
+                    used_prompt_thumbnail_paths = {
+                        prompt_thumbnail_path(item.get("thumbnail"))
+                        for library in prompts.get("libraries") or []
+                        for item in (library.get("items") or [] if isinstance(library, dict) else [])
+                        if isinstance(item, dict) and item.get("thumbnail")
+                    }
+                    for created_path in list(created_prompt_thumbnail_paths):
+                        if created_path in used_prompt_thumbnail_paths:
+                            continue
+                        try:
+                            os.remove(created_path)
+                        except OSError:
+                            pass
+                        if created_path in created_resource_paths:
+                            created_resource_paths.remove(created_path)
 
                 os.makedirs(CANVAS_DIR, exist_ok=True)
                 for canvas in imported_canvas_records:
@@ -17218,7 +17571,68 @@ async def update_canvas_meta(canvas_id: str, payload: CanvasMetaUpdate):
             canvas["board_x"] = float(payload.board_x)
         if payload.board_y is not None:
             canvas["board_y"] = float(payload.board_y)
+        if payload.cover_mode is not None:
+            canvas["cover_mode"] = normalize_canvas_cover_mode(payload.cover_mode)
+        if payload.cover_url is not None:
+            requested_cover = canvas_asset_downloadable_url(payload.cover_url)
+            if payload.cover_url and not requested_cover:
+                raise HTTPException(status_code=400, detail="封面地址无效")
+            old_cover = str(canvas.get("cover_url") or "")
+            canvas["cover_url"] = requested_cover
+            if old_cover != requested_cover:
+                old_path = canvas_uploaded_cover_path(old_cover)
+                if old_path and os.path.isfile(old_path):
+                    try:
+                        os.remove(old_path)
+                    except OSError:
+                        pass
     canvas = mutate_canvas_latest(canvas_id, apply_meta, update_timestamp=False)
+    return {"canvas": canvas_record(canvas)}
+
+@app.get("/api/canvases/{canvas_id}/cover-options")
+async def canvas_cover_options(canvas_id: str):
+    canvas = load_canvas(canvas_id)
+    return {
+        "mode": normalize_canvas_cover_mode(canvas.get("cover_mode")),
+        "cover_url": str(canvas.get("cover_url") or ""),
+        "cover": resolve_canvas_cover(canvas),
+        "items": canvas_cover_candidates(canvas),
+    }
+
+@app.post("/api/canvases/{canvas_id}/cover-upload")
+async def upload_canvas_cover(canvas_id: str, file: UploadFile = File(...)):
+    load_canvas(canvas_id)
+    content_type = str(file.content_type or "").split(";", 1)[0].lower()
+    kind, ext = _local_upload_kind_ext(file.filename or "", content_type)
+    if kind != "image":
+        raise HTTPException(status_code=400, detail="请选择图片文件")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="图片内容为空")
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="封面图片不能超过 20MB")
+    try:
+        with Image.open(BytesIO(content)) as image:
+            image.verify()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="无法识别这张图片") from exc
+    os.makedirs(CANVAS_COVER_DIR, exist_ok=True)
+    filename = f"cover_{canvas_id}_{uuid.uuid4().hex[:12]}{ext or '.png'}"
+    path = os.path.join(CANVAS_COVER_DIR, filename)
+    with open(path, "wb") as handle:
+        handle.write(content)
+    url = f"/assets/canvas-covers/{filename}"
+    previous = load_canvas(canvas_id)
+    old_path = canvas_uploaded_cover_path(previous.get("cover_url"))
+    def apply_cover(canvas):
+        canvas["cover_mode"] = "custom"
+        canvas["cover_url"] = url
+    canvas = mutate_canvas_latest(canvas_id, apply_cover, update_timestamp=False)
+    if old_path and old_path != path and os.path.isfile(old_path):
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
     return {"canvas": canvas_record(canvas)}
 
 @app.get("/api/canvases/{canvas_id}")
@@ -17235,6 +17649,29 @@ async def list_canvas_assets():
     # canvas_assets_index 会同步遍历并解析所有画布 JSON，放进线程池避免阻塞事件循环
     # （否则画布多时一次请求就会卡住整个 asyncio loop，连 WebSocket 一起掉线）。
     return await asyncio.to_thread(canvas_assets_index)
+
+@app.get("/api/canvas-assets/orphans")
+async def list_orphan_canvas_assets():
+    return {"items": await asyncio.to_thread(canvas_orphan_assets_index)}
+
+@app.post("/api/canvas-assets/orphans/delete")
+async def delete_orphan_canvas_assets(payload: CanvasAssetDeleteRequest):
+    allowed = {str(item.get("url") or ""): item for item in canvas_orphan_assets_index()}
+    deleted = []
+    skipped = []
+    for raw_url in (payload.urls or [])[:1000]:
+        url = str(raw_url or "").strip()
+        item = allowed.get(url)
+        path = output_file_from_url(url)
+        if not item or not path or os.path.abspath(path) != os.path.abspath(str(item.get("path") or "")):
+            skipped.append(url)
+            continue
+        try:
+            os.remove(path)
+            deleted.append(url)
+        except OSError:
+            skipped.append(url)
+    return {"deleted": deleted, "skipped": skipped}
 
 @app.get("/api/smart-canvas/prompt-templates")
 async def smart_canvas_prompt_templates():
@@ -17610,6 +18047,7 @@ async def delete_prompt_library(library_id: str):
         raise HTTPException(status_code=400, detail="系统提示词库不能删除，可以删除其中的提示词")
     data = load_prompt_libraries()
     libraries = data.get("libraries", []) or []
+    removed_library = next((lib for lib in libraries if lib.get("id") == library_id), None)
     kept = [lib for lib in libraries if lib.get("id") != library_id]
     if len(kept) == len(libraries):
         raise HTTPException(status_code=404, detail="提示词库不存在")
@@ -17617,6 +18055,8 @@ async def delete_prompt_library(library_id: str):
     if data.get("active_library_id") == library_id:
         data["active_library_id"] = "system"
     data = save_prompt_libraries(data)
+    for item in (removed_library or {}).get("items") or []:
+        remove_prompt_thumbnail(item.get("thumbnail"))
     return {"library": public_prompt_libraries(data)}
 
 @app.post("/api/prompt-libraries/items")
@@ -17677,6 +18117,45 @@ async def update_prompt_library_item(item_id: str, payload: PromptLibraryItemReq
                 return {"library": public_prompt_libraries(data), "item": next_item}
     raise HTTPException(status_code=404, detail="提示词不存在")
 
+@app.post("/api/prompt-libraries/items/{item_id}/thumbnail")
+async def upload_prompt_library_thumbnail(item_id: str, file: UploadFile = File(...)):
+    content_type = str(file.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="请选择图片文件")
+    content = await file.read(PROMPT_THUMBNAIL_MAX_BYTES + 1)
+    data = load_prompt_libraries()
+    _library, item = find_prompt_library_item(data, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="提示词不存在")
+    try:
+        next_url = await asyncio.to_thread(save_prompt_thumbnail_bytes, content, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    previous_url = item.get("thumbnail") or ""
+    item["thumbnail"] = next_url
+    item["updated_at"] = now_ms()
+    try:
+        data = save_prompt_libraries(data)
+    except Exception:
+        remove_prompt_thumbnail(next_url)
+        raise
+    if previous_url != next_url:
+        remove_prompt_thumbnail(previous_url)
+    return {"library": public_prompt_libraries(data), "item": normalize_prompt_library_item(item)}
+
+@app.delete("/api/prompt-libraries/items/{item_id}/thumbnail")
+async def delete_prompt_library_thumbnail(item_id: str):
+    data = load_prompt_libraries()
+    _library, item = find_prompt_library_item(data, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="提示词不存在")
+    previous_url = item.get("thumbnail") or ""
+    item["thumbnail"] = ""
+    item["updated_at"] = now_ms()
+    data = save_prompt_libraries(data)
+    remove_prompt_thumbnail(previous_url)
+    return {"library": public_prompt_libraries(data), "item": normalize_prompt_library_item(item)}
+
 @app.delete("/api/prompt-libraries/items/{item_id}")
 async def delete_prompt_library_item(item_id: str):
     data = load_prompt_libraries()
@@ -17692,6 +18171,7 @@ async def delete_prompt_library_item(item_id: str):
     if not removed:
         raise HTTPException(status_code=404, detail="提示词不存在")
     data = save_prompt_libraries(data)
+    remove_prompt_thumbnail(removed.get("thumbnail"))
     return {"library": public_prompt_libraries(data), "removed": 1}
 
 @app.post("/api/prompt-libraries/items/delete")
@@ -17701,15 +18181,19 @@ async def batch_delete_prompt_library_items(payload: PromptLibraryBatchDeleteReq
         raise HTTPException(status_code=400, detail="没有选择提示词")
     data = load_prompt_libraries()
     removed = 0
+    removed_thumbnails = []
     for library in data.get("libraries", []) or []:
         keep = []
         for item in library.get("items", []) or []:
             if item.get("id") in ids:
                 removed += 1
+                removed_thumbnails.append(item.get("thumbnail") or "")
             else:
                 keep.append(item)
         library["items"] = keep
     data = save_prompt_libraries(data)
+    for thumbnail in removed_thumbnails:
+        remove_prompt_thumbnail(thumbnail)
     return {"library": public_prompt_libraries(data), "removed": removed}
 
 PROMPT_BUILTIN_CATEGORY_IDS = {"view", "storyboard", "character", "product", "lighting", "custom"}
@@ -18397,6 +18881,11 @@ async def restore_canvas(canvas_id: str):
 async def purge_canvas(canvas_id: str):
     path = canvas_path(canvas_id)
     if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                remove_canvas_uploaded_cover(json.load(handle))
+        except Exception:
+            pass
         os.remove(path)
     return {"ok": True}
 

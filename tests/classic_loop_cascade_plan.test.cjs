@@ -501,6 +501,30 @@ test('tolerant round runner attempts every ordinary failure but still propagates
     );
 });
 
+test('slot-aware loop selection preserves failed upstream positions for downstream stages', () => {
+    const planner = loadPlanner();
+    const rounds = [1, 2, 3, 4].map(index => ({index}));
+    assert.deepEqual(planner.selectLoopRoundsBySlots(rounds, [
+        {cascadeSlot:0},
+        {cascadeSlot:2},
+        {cascadeSlot:3},
+    ], 1), {
+        rounds:[{index:1}, {index:3}, {index:4}],
+        skippedRounds:[{index:2}],
+        hasSlots:true,
+    });
+    assert.deepEqual(planner.selectLoopRoundsBySlots(rounds, [{cascadeSlot:0}, {cascadeSlot:1}], 2), {
+        rounds:[{index:1}],
+        skippedRounds:[{index:2}, {index:3}, {index:4}],
+        hasSlots:true,
+    });
+    assert.deepEqual(planner.selectLoopRoundsBySlots(rounds, [{url:'legacy'}], 1), {
+        rounds,
+        skippedRounds:[],
+        hasSlots:false,
+    });
+});
+
 test('removing loop connections closes only the final image input and preserves prompt mode', () => {
     const planner = loadPlanner();
     const nodes = [
@@ -731,12 +755,18 @@ test('classic controller tolerates failed loop rounds and trims only unavailable
     assert.match(runBlock, /fitLoopRoundsToAvailableImages/);
     assert.match(runBlock, /fitLoopRoundsToAvailablePrompts/);
     assert.match(runBlock, /classicLoopPromptCapacity/);
+    assert.match(runBlock, /selectLoopRoundsBySlots/);
+    assert.match(runBlock, /_cascadeProcessedRoundIndexes/);
+    assert.match(runBlock, /等待上游/);
     assert.match(runBlock, /Math\.min\(imageFit\.runnableRounds,\s*promptFit\.runnableRounds\)/);
-    assert.match(runBlock, /rounds\.slice\(0,\s*runnableRounds\)/);
+    assert.match(runBlock, /stage\.rounds\.slice\(0,\s*fallbackRunnableRounds\)/);
     assert.match(runBlock, /totalRounds\s*-\s*runnableRounds/);
     assert.match(runBlock, /finalizeCascade\(nodeId,\s*'partial'/);
     assert.match(renderBlock, /partial\s*:\s*'部分完成'/);
     assert.match(css, /\.node-run-status\.partial/);
+    assert.match(source, /function loopRetryBarHtml/);
+    assert.match(source, /async function retryFailedLoopRounds/);
+    assert.match(source, /data-loop-retry/);
 });
 
 test('zero usable loop prompts skip the stage before any downstream submission', () => {

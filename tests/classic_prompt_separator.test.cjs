@@ -69,15 +69,16 @@ test('classic prompt separator edits refresh preview, persist, and resync genera
 test('classic loops consume split items while API and LLM readers keep one normalized prompt', () => {
     const source = fs.readFileSync(SOURCE_PATH, 'utf8');
     const loopBlock = sourceBlock(source, 'function loopInputPromptItems', 'function loopInputImageRefs');
-    const llmBlock = sourceBlock(source, 'function llmInputText', 'function llmInputImages');
+    const llmBlock = sourceBlock(source, 'function classicPromptMentionPart', 'function llmInputImages');
     const generatorBlock = sourceBlock(source, 'function generatorSources', 'function orderedSources');
 
     assert.match(loopBlock, /classicPromptItems\(n\)/);
     assert.match(loopBlock, /flatMap\(p => classicPromptItems\(p\)\)/);
     assert.doesNotMatch(loopBlock, /classicPromptText\(/);
-    assert.match(llmBlock, /classicPromptText\(n\)/);
-    assert.match(llmBlock, /classicPromptText\(p\)/);
-    assert.match(generatorBlock, /classicPromptText\(p\)/);
+    assert.match(llmBlock, /classicPromptText\(node\)/);
+    assert.match(llmBlock, /n\.type === 'prompt'/);
+    assert.match(llmBlock, /n\.type === 'promptGroup'/);
+    assert.match(generatorBlock, /promptNodes\.map\(classicPromptMentionPart\)/);
     assert.match(generatorBlock, /classicPromptText\(n\)/);
     assert.doesNotMatch(loopBlock, /p\.text\s*\|\|\s*['"]/);
     assert.doesNotMatch(llmBlock, /p\.text\s*\|\|\s*['"]/);

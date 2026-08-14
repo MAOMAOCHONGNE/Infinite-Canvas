@@ -309,13 +309,13 @@ def merge_prompt_libraries(
                 target["categories"].append(copy.deepcopy(category))
                 existing_category_ids.add(str(category.get("id")))
 
-        hashes = {canonical_content_hash(item) for item in target["items"] if isinstance(item, dict)}
+        hashes = {canonical_content_hash(item, ignored_keys=("id", "updated_at", "created_at", "thumbnail")) for item in target["items"] if isinstance(item, dict)}
         used_names = {str(item.get("name") or "") for item in target["items"] if isinstance(item, dict)}
         used_ids = {str(item.get("id") or "") for item in target["items"] if isinstance(item, dict)}
         for incoming_item in source.get("items") or []:
             if not isinstance(incoming_item, dict):
                 continue
-            digest = canonical_content_hash(incoming_item)
+            digest = canonical_content_hash(incoming_item, ignored_keys=("id", "updated_at", "created_at", "thumbnail"))
             if digest in hashes:
                 stats["skipped_identical"] += 1
                 continue

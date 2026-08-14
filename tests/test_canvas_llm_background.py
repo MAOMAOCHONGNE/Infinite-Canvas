@@ -93,6 +93,46 @@ class CanvasLLMBackgroundPersistenceTests(unittest.TestCase):
         self.assertEqual(completed["llmResultKey"], "kept-key")
         self.assertEqual(completed["llmResultMemory"][-1]["text"], "KEPT_LLM_RESULT")
 
+    def test_chat_user_message_saves_display_text_request_text_and_its_own_images(self):
+        self.write_canvas([{
+            "id": "llm_chat_images",
+            "type": "llm",
+            "messages": [{"role": "user", "content": "old", "images": ["/assets/old.png"]}],
+        }])
+        self.assertTrue(main.update_canvas_llm_task_node(
+            "canvas_test",
+            "llm_chat_images",
+            "task_chat_images",
+            "chat",
+            "queued",
+            message="下面是参考图编号：\n图1：正面图\n\n用户需求：\n分析 图1",
+            display_message="分析 @正面图",
+            message_images=["/assets/front.png"],
+            runtime_id="runtime-test",
+        ))
+        pending, _ = self.read_node("llm_chat_images")
+        current = pending["messages"][-1]
+        self.assertEqual(current["content"], "分析 @正面图")
+        self.assertIn("分析 图1", current["requestContent"])
+        self.assertEqual(current["images"], ["/assets/front.png"])
+        self.assertEqual(pending["messages"][0]["images"], ["/assets/old.png"])
+        self.assertEqual(pending["chatInputMentions"], [])
+
+    def test_history_message_builds_multimodal_content_without_breaking_legacy_text(self):
+        legacy = main.canvas_llm_history_message({"role": "user", "content": "legacy"})
+        self.assertEqual(legacy, {"role": "user", "content": "legacy"})
+
+        with patch.object(main, "media_reference_to_url", side_effect=lambda value, **_kwargs: f"data:{value}"):
+            multimodal = main.canvas_llm_history_message({
+                "role": "user",
+                "content": "显示文字",
+                "requestContent": "请求文字 图1",
+                "images": ["/assets/front.png"],
+            })
+        self.assertEqual(multimodal["role"], "user")
+        self.assertEqual(multimodal["content"][0], {"type": "text", "text": "请求文字 图1"})
+        self.assertEqual(multimodal["content"][1]["image_url"]["url"], "data:/assets/front.png")
+
     def test_smart_prompt_result_is_written_to_text(self):
         self.write_canvas([{"id": "prompt_1", "type": "smart-prompt", "text": "old"}])
         self.assertTrue(self.attach("prompt_1", "task_smart", "smart-prompt"))

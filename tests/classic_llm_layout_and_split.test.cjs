@@ -143,7 +143,7 @@ test('classic LLM split settings refresh downstream views without running a prov
 test('loop, LLM, and API generator consume split-aware LLM output', () => {
     const source = fs.readFileSync(SOURCE_PATH, 'utf8');
     const loopBlock = sourceBlock(source, 'function loopInputPromptItems', 'function loopInputImageRefs');
-    const llmBlock = sourceBlock(source, 'function llmInputText', 'function llmInputImages');
+    const llmBlock = sourceBlock(source, 'function classicPromptMentionPart', 'function llmInputImages');
     const generatorBlock = sourceBlock(source, 'function generatorSources', 'function orderedSources');
 
     assert.match(loopBlock, /classicLLMOutputItems\(n\)/);

@@ -131,14 +131,15 @@ test('classic API generation still blocks when local prompt, upstream prompts, a
     assert.deepEqual(harness.submitted, []);
 });
 
-test('classic API local prompt UI is one simple labeled textarea without nested hint or counter chrome', () => {
+test('classic API local prompt UI is one simple labeled inline editor without nested hint or counter chrome', () => {
     const {editor:renderEditor} = localPromptRenderers();
     assert.equal(typeof renderEditor, 'function');
 
     const html = renderEditor({localPrompt:'保留原来的字体'});
     assert.match(html, /提示词/);
-    assert.match(html, /class="api-local-prompt-input"/);
-    assert.match(html, />保留原来的字体<\/textarea>/);
+    assert.match(html, /class="api-local-prompt-input classic-inline-mention-editor"/);
+    assert.match(html, /contenteditable="true"/);
+    assert.match(html, /role="textbox"/);
     assert.doesNotMatch(html, /prompt-counter/);
     assert.doesNotMatch(html, /api-local-prompt-hint/);
 });

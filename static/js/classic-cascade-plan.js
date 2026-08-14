@@ -242,6 +242,32 @@
         };
     }
 
+    function selectLoopRoundsBySlots(rounds, refs, batchSize=1){
+        const list = Array.isArray(rounds) ? [...rounds] : [];
+        const size = Math.max(1, Math.floor(Number(batchSize) || 1));
+        const slotRefs = (Array.isArray(refs) ? refs : [])
+            .map(ref => Number(ref?.cascadeSlot))
+            .filter(Number.isFinite)
+            .map(slot => Math.max(0, Math.floor(slot)));
+        if(!slotRefs.length){
+            return {rounds:list, skippedRounds:[], hasSlots:false};
+        }
+        const available = new Set(slotRefs);
+        const hasInputForRound = round => {
+            const index = Math.max(1, Math.floor(Number(round?.index) || 1));
+            const start = (index - 1) * size;
+            for(let offset = 0; offset < size; offset++){
+                if(available.has(start + offset)) return true;
+            }
+            return false;
+        };
+        return {
+            rounds:list.filter(hasInputForRound),
+            skippedRounds:list.filter(round => !hasInputForRound(round)),
+            hasSlots:true,
+        };
+    }
+
     async function runTolerantLoopRounds(rounds, limit, runner, isAbort=()=>false){
         const list = Array.isArray(rounds) ? [...rounds] : [];
         if(!list.length) return {attemptedRounds:0, successfulRounds:0, failedRounds:0, failures:[], outcomes:[]};
@@ -426,6 +452,7 @@
         checkLoopImageAvailability,
         fitLoopRoundsToAvailableImages,
         fitLoopRoundsToAvailablePrompts,
+        selectLoopRoundsBySlots,
         runTolerantLoopRounds,
         runActionTooltip,
         buildCurrentNodePreview,
