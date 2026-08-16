@@ -185,9 +185,10 @@ function canvasesInProject(pid){ return canvases.filter(c => (c.project || 'defa
 
 async function loadAll(){
     try {
+        const refreshQuery = `_refresh=${Date.now()}`;
         const [pRes, cRes] = await Promise.all([
-            fetch('/api/projects'),
-            fetch('/api/canvases')
+            fetch(`/api/projects?${refreshQuery}`, {cache: 'no-store'}),
+            fetch(`/api/canvases?${refreshQuery}`, {cache: 'no-store'})
         ]);
         const pData = pRes.ok ? await pRes.json() : { projects: [] };
         const cData = cRes.ok ? await cRes.json() : { canvases: [] };
@@ -209,6 +210,7 @@ async function loadAll(){
         setStatus(L('加载失败','Load failed'));
     }
 }
+window.loadAll = loadAll;
 
 function projectCanvasCount(pid){
     const p = projects.find(x => x.id === pid);
@@ -1049,7 +1051,7 @@ async function deleteCanvas(id){
 /* ===== Trash / recycle bin ===== */
 async function refreshTrashCount(){
     try {
-        const res = await fetch('/api/canvases/trash');
+        const res = await fetch(`/api/canvases/trash?_refresh=${Date.now()}`, {cache: 'no-store'});
         if(!res.ok) return;
         const data = await res.json();
         deletedCanvases = data.canvases || [];
@@ -1070,7 +1072,7 @@ function closeTrashView(){
 }
 async function loadTrash(){
     try {
-        const res = await fetch('/api/canvases/trash');
+        const res = await fetch(`/api/canvases/trash?_refresh=${Date.now()}`, {cache: 'no-store'});
         if(!res.ok) throw new Error('trash load failed');
         const data = await res.json();
         deletedCanvases = data.canvases || [];

@@ -34,6 +34,21 @@ class AdaptiveImageStretchTests(unittest.TestCase):
     def test_requested_example_dimensions(self):
         self.assertEqual(main.stretch_dimensions_to_aspect(310, 400, "3:4"), (300, 400))
 
+    def test_requested_ratio_allowlist_is_exact(self):
+        self.assertEqual(main.ADAPTIVE_STRETCH_RATIOS, {
+            "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1",
+            "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9",
+        })
+
+    def test_extreme_landscape_ratio_is_temporarily_stretched(self):
+        result = main.stretched_reference_image({
+            "url": "/output/source.png",
+            "stretch_aspect_ratio": "4:1",
+        })
+        self.assertIsNotNone(result)
+        with Image.open(BytesIO(result["bytes"])) as adapted:
+            self.assertEqual(adapted.size, (1600, 400))
+
     def test_in_memory_stretch_does_not_modify_source_file(self):
         result = main.stretched_reference_image({
             "url": "/output/source.png",
@@ -59,6 +74,10 @@ class AdaptiveImageStretchTests(unittest.TestCase):
         self.assertIsNone(main.stretched_reference_image({
             "url": "/output/source.png",
             "stretch_aspect_ratio": "31:40",
+        }))
+        self.assertIsNone(main.stretched_reference_image({
+            "url": "/output/source.png",
+            "stretch_aspect_ratio": "9:21",
         }))
 
 

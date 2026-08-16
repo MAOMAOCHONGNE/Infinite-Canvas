@@ -29,6 +29,17 @@ test('default export selection includes all visible content and referenced asset
     assert.equal(state.includeAssets, true);
 });
 
+test('preference backup is selectable and included without exposing browser secrets', () => {
+    const state = backup.createBackupSelection({...fixture(), preferences:{available:true}});
+    assert.equal(state.includePreferences, true);
+    const payload = backup.buildBackupExportRequest(state);
+    assert.equal(payload.include_preferences, true);
+    assert.deepEqual(payload.preferences, {theme:'light', scale_mode:'auto', favorites:{}});
+    backup.setAllSelected(state, false);
+    assert.equal(state.includePreferences, false);
+    assert.equal(payload.preferences.favorites?.api_key, undefined);
+});
+
 test('project tri-state follows its selected canvases', () => {
     const state = backup.createBackupSelection(fixture());
     backup.setCanvasSelected(state, 'a-2', false);
@@ -64,6 +75,33 @@ test('workspace wires a global Backup menu, modal, and backend endpoints', () =>
     assert.match(backend, /@app\.post\("\/api\/backups\/export"\)/);
     assert.match(backend, /@app\.post\("\/api\/backups\/inspect"\)/);
     assert.match(backend, /@app\.post\("\/api\/backups\/import"\)/);
+});
+
+test('backup UI explains endpoint changes and secret-preserving provider conflicts', () => {
+    const manager = fs.readFileSync(MODULE_PATH, 'utf8');
+    assert.match(manager, /采用备份的平台和模型设置（保留本机密钥）/);
+    assert.match(manager, /RunningHub 请求地址将切换为/);
+    assert.match(manager, /界面与使用偏好/);
+    assert.match(manager, /RunningHub 应用 \$\{result\.runninghub_apps_imported\}/);
+    assert.match(manager, /RunningHub 工作流 \$\{result\.runninghub_workflows_imported\}/);
+});
+
+test('backup import defaults to backup policies, reports skips, and refreshes after acknowledgement', () => {
+    const manager = fs.readFileSync(MODULE_PATH, 'utf8');
+    assert.match(manager, /provider_conflict:'backup', runninghub_conflict:'backup'/);
+    assert.match(manager, /采用备份的平台和模型设置（保留本机密钥）（推荐）/);
+    assert.match(manager, /采用备份应用\/工作流（推荐）/);
+    assert.match(manager, /result\.providers_skipped/);
+    assert.match(manager, /result\.runninghub_apps_skipped/);
+    assert.match(manager, /result\.runninghub_workflows_skipped/);
+    assert.match(manager, /result\.prompt_libraries_skipped/);
+    assert.match(manager, /window\.loadAll\(\)/);
+    assert.match(manager, /backup-imported/);
+    const canvasList = fs.readFileSync(path.join(ROOT, 'static', 'js', 'canvas-list.js'), 'utf8');
+    assert.match(canvasList, /window\.loadAll\s*=\s*loadAll/);
+    assert.match(manager, /const importMessage = zh/);
+    assert.doesNotMatch(manager, /alert\(zh\(`导入完成/);
+    assert.match(manager, /_backup_refresh/);
 });
 
 test('backup modal gives its middle content a definite scrollable viewport', () => {

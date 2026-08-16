@@ -22,6 +22,7 @@ function settingsHarness(){
 
     return new Function(
         'resolveImageModel', 'addNode', 'defaultPoint', 'imageApiProviders', 'allImageModels', 'uid', 'escapeAttr',
+        'imageResolutionRoutingEnabled', 'availableImageResolutions',
         `
             ${defaultBlock}
             ${normalizeBlock}
@@ -44,6 +45,8 @@ function settingsHarness(){
         () => ['gpt-image-2'],
         prefix => `${prefix}-1`,
         value => String(value),
+        () => false,
+        () => [],
     );
 }
 
@@ -118,7 +121,7 @@ test('classic ordinary generator uses the shared count control and the same 1-10
     assert.match(body, /countPresetSelect\.onchange/);
     assert.doesNotMatch(body, /\.gen-count-toggle/);
     assert.doesNotMatch(body, /\.gen-count-menu/);
-    assert.ok((body.match(/defaultClassicApiGeneratorResolution\(node\.model\)/g) || []).length >= 3);
+    assert.ok((body.match(/defaultClassicApiGeneratorResolution\(node\.model(?:,\s*node\.apiProvider)?\)/g) || []).length >= 3);
     assert.equal((run.match(/const count = normalizeClassicApiCount\(gen\.count/g) || []).length, 2);
 });
 

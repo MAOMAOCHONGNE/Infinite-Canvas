@@ -27,20 +27,26 @@ test('backend update metadata targets the qianse70 repository and my-custom bran
     assert.match(source, /GITHUB_VERSION_URL\s*=\s*f"https:\/\/raw\.githubusercontent\.com\/MAOMAOCHONGNE\/Infinite-Canvas\/\{CUSTOM_UPDATE_BRANCH\}\/VERSION"/);
     assert.match(source, /GITHUB_TREE_URL\s*=\s*f"https:\/\/api\.github\.com\/repos\/MAOMAOCHONGNE\/Infinite-Canvas\/git\/trees\/\{CUSTOM_UPDATE_BRANCH\}\?recursive=1"/);
     assert.match(source, /GITHUB_RAW_ROOT\s*=\s*f"https:\/\/raw\.githubusercontent\.com\/MAOMAOCHONGNE\/Infinite-Canvas\/\{CUSTOM_UPDATE_BRANCH\}"/);
+    assert.match(source, /MODELSCOPE_REPO_URL\s*=\s*"https:\/\/modelscope\.cn\/studios\/qisese70\/Infinite-Canvas"/);
+    assert.match(source, /MODELSCOPE_FILE_API_ROOT\s*=\s*"https:\/\/www\.modelscope\.cn\/api\/v1\/studio\/qisese70\/Infinite-Canvas\/repo\?Revision=master&FilePath="/);
+    assert.doesNotMatch(source, /modelscope\.(?:cn|ai)\/studios\/daniel8152\/Infinite-Canvas/i);
 });
 
-test('backend updater exposes and accepts only the custom GitHub channel', () => {
+test('backend updater exposes only the user-owned GitHub and ModelScope channels', () => {
     const source = fs.readFileSync(MAIN_PATH, 'utf8');
     const appInfo = sourceBlock(source, 'def app_info():', 'def connectivity_probe(');
     const checkUpdate = sourceBlock(source, 'def check_update():', 'def update_allowed_file(');
     const requestModel = sourceBlock(source, 'class UpdateRequest(BaseModel):', 'def github_update_file_list(');
     const updateEndpoint = sourceBlock(source, 'def update_from_github(req:', '@app.get("/api/update-backups")');
 
-    assert.doesNotMatch(appInfo, /"modelscope"\s*:/i);
-    assert.doesNotMatch(checkUpdate, /MODELSCOPE_VERSION_URL|source"\s*:\s*"modelscope"/);
-    assert.match(requestModel, /fallback:\s*bool\s*=\s*False/);
-    assert.match(updateEndpoint, /source_order\s*=\s*\["github"\]/);
-    assert.doesNotMatch(updateEndpoint, /source_order\.append|other\s*=\s*"modelscope"/);
+    assert.match(appInfo, /"modelscope"\s*:\s*\{/i);
+    assert.match(appInfo, /"label"\s*:\s*"qisese70 ModelScope"/);
+    assert.match(checkUpdate, /MODELSCOPE_VERSION_URL/);
+    assert.match(checkUpdate, /"source"\s*:\s*"modelscope"/);
+    assert.match(requestModel, /fallback:\s*bool\s*=\s*True/);
+    assert.match(updateEndpoint, /source_order\s*=\s*\[requested_source\]/);
+    assert.match(updateEndpoint, /other\s*=\s*"modelscope"\s*if\s*requested_source\s*==\s*"github"\s*else\s*"github"/);
+    assert.match(updateEndpoint, /source_order\.append\(other\)/);
 });
 
 test('main page identifies qianse70 and keeps the upstream project link', () => {
@@ -62,14 +68,19 @@ test('Infinite Canvas navigation keeps its four-square shape with a vivid gradie
     assert.equal((html.match(/<rect x="(?:3|14)" y="(?:3|14)" width="7" height="7"><\/rect>/g) || []).length, 4);
 });
 
-test('browser update flow has no ModelScope selector or automatic fallback', () => {
+test('browser update flow offers the user-owned ModelScope mirror and automatic fallback', () => {
     const html = fs.readFileSync(INDEX_PATH, 'utf8');
     const updateFlow = sourceBlock(html, 'function updateSourceLabel(', 'window.rollbackProjectUpdate = rollbackProjectUpdate;');
     const checkFlow = sourceBlock(html, 'async function checkForUpdates(', '</script>');
-    assert.doesNotMatch(html, /data-update-source="modelscope"/);
-    assert.match(updateFlow, /fallback:false/);
-    assert.doesNotMatch(updateFlow, /fallback:true|bestUpdateSourceFromConnectivity|source === 'modelscope'/);
-    assert.doesNotMatch(checkFlow, /source:'modelscope'|sources\.modelscope|GitHub or ModelScope|GitHub 或 ModelScope/);
+    const sourceState = sourceBlock(html, 'const savedUpdateSource', 'function setSidebarPinned(');
+    assert.match(html, /data-update-source="modelscope"/);
+    assert.match(html, /qisese70 ModelScope 国内镜像/);
+    assert.match(html, /data-update-source="github"[^>]*onclick="setUpdateSource\('github'\)"/);
+    assert.match(html, /data-update-source="modelscope"[^>]*onclick="setUpdateSource\('modelscope'\)"/);
+    assert.match(sourceState, /savedUpdateSource[^]*?\['github', 'modelscope'\]\.includes\(savedUpdateSource\)/);
+    assert.match(updateFlow, /fallback:true/);
+    assert.match(updateFlow, /source === 'modelscope'/);
+    assert.match(checkFlow, /sources\.modelscope|GitHub or ModelScope|GitHub 或 ModelScope/);
     assert.match(html, /qianse70 GitHub 定制版更新源/);
 });
 
@@ -79,7 +90,7 @@ test('custom version and update notes form one release identity', () => {
     const main = fs.readFileSync(MAIN_PATH, 'utf8');
     assert.match(version, /^\d{4}\.\d{2}\.\d{2}-custom\.\d+$/);
     assert.equal(notes.version, version);
-    assert.deepEqual(notes.items, [{ type: 'fix', text: '优化bug' }]);
+    assert.deepEqual(notes.items, [{ type: 'fix', text: '修复BUG' }]);
     assert.match(main, /"edition":\s*CUSTOM_MAINTAINER/);
     assert.match(main, /"update_channel":\s*CUSTOM_UPDATE_BRANCH/);
     assert.match(main, /"upstream_repo_url":\s*UPSTREAM_REPO_URL/);

@@ -54,6 +54,39 @@ test('Alt duplication copies every selected node and only their internal connect
     );
 });
 
+test('classic Alt duplication preserves external incoming links but not external outgoing links', () => {
+    const nodes = [
+        {id:'upstream', type:'output', x:10, y:20},
+        {id:'runninghub', type:'runninghub', x:210, y:20},
+        {id:'output', type:'output', x:410, y:20},
+        {id:'downstream', type:'generator', x:610, y:20}
+    ];
+    const connections = [
+        {id:'c1', from:'upstream', to:'runninghub'},
+        {id:'c2', from:'runninghub', to:'output'},
+        {id:'c3', from:'output', to:'downstream'}
+    ];
+    const result = duplicateFixture({
+        nodes,
+        connections,
+        selectedIds:['runninghub', 'output'],
+        anchorId:'runninghub',
+        preserveExternalIncoming:true
+    });
+
+    assert.deepEqual(
+        result.copiedConnections.map(connection => [connection.from, connection.to]),
+        [
+            ['upstream', result.idMap.get('runninghub')],
+            [result.idMap.get('runninghub'), result.idMap.get('output')]
+        ]
+    );
+    assert.equal(
+        result.copiedConnections.some(connection => connection.to === 'downstream'),
+        false
+    );
+});
+
 test('Alt dragging an unselected node does not also duplicate an unrelated selection', () => {
     const nodes = [
         {id:'selected-a', type:'image', x:0, y:0},
@@ -89,7 +122,7 @@ test('group members are copied once and group item ids are remapped', () => {
     assert.deepEqual(result.selectedCopyIds, [result.idMap.get('group'), result.idMap.get('child-a')]);
 });
 
-test('classic canvas loads duplication helper and records one undo before Alt cloning', () => {
+test('classic canvas Alt-drag preserves incoming links while clipboard copy remains internal-only', () => {
     const html = fs.readFileSync(path.join(ROOT, 'static', 'canvas.html'), 'utf8');
     const source = fs.readFileSync(path.join(ROOT, 'static', 'js', 'canvas.js'), 'utf8');
     const start = source.indexOf('function startNodeDrag(e, node)');
@@ -99,8 +132,10 @@ test('classic canvas loads duplication helper and records one undo before Alt cl
     assert.match(html, /canvas-duplication\.js[^\n]*\n[^]*canvas\.js/);
     assert.match(source, /selected\.has\(node\.id\) \? \[\.\.\.selected\] : \[node\.id\]/);
     assert.ok(dragSource.indexOf('pushUndo();') < dragSource.indexOf('duplicateNodesForAltDrag'));
+    assert.match(dragSource, /duplicateNodesForAltDrag\(node, true\)/);
     assert.match(dragSource, /\(duplicated\.rootCopyIds \|\| duplicated\.selectedCopyIds\)\.forEach/);
     assert.match(dragSource, /historyCaptured:Boolean\(e\.altKey\)/);
+    assert.match(source, /connections \|\| \[\]\)\.filter\(c => ids\.has\(c\.from\) && ids\.has\(c\.to\)\)/);
 });
 
 test('smart canvas keeps every Alt-drag copy selected so the whole copy set moves', () => {

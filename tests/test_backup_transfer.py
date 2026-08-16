@@ -154,6 +154,93 @@ class BackupTransferTests(unittest.TestCase):
         self.assertEqual(imported["name"], "商品（导入）")
         self.assertNotEqual(imported["id"], "other")
 
+    def test_provider_identity_normalizes_trailing_slash_and_host_case(self):
+        self.assertEqual(
+            backup_transfer.normalize_provider_url(" HTTPS://AI.Example.org/v1/// "),
+            "https://ai.example.org/v1",
+        )
+        self.assertEqual(
+            backup_transfer.normalize_provider_url("https://ai.example.org/v1?api_key=secret&mode=fast"),
+            "https://ai.example.org/v1?mode=fast",
+        )
+        self.assertNotEqual(
+            backup_transfer.normalize_provider_url("https://ai.example.org"),
+            backup_transfer.normalize_provider_url("https://ai.example.org/v1"),
+        )
+
+    def test_provider_same_id_and_url_preserves_local_key_fields(self):
+        existing = [{
+            "id": "custom-api",
+            "name": "本机平台",
+            "base_url": "https://ai.example.org/",
+            "has_key": True,
+            "key_preview": "sk-***",
+            "model_names": {"m": "本机名称"},
+        }]
+        incoming = [{
+            "id": "custom-api",
+            "name": "备份平台",
+            "base_url": "https://AI.EXAMPLE.ORG",
+            "model_names": {"m": "备份名称"},
+        }]
+
+        merged, stats, id_map = backup_transfer.merge_provider_entries_by_identity(
+            existing, incoming, overwrite=True
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["name"], "备份平台")
+        self.assertEqual(merged[0]["model_names"]["m"], "备份名称")
+        self.assertTrue(merged[0]["has_key"])
+        self.assertEqual(merged[0]["key_preview"], "sk-***")
+        self.assertEqual(id_map, {"custom-api": "custom-api"})
+        self.assertEqual(stats["overwritten"], 1)
+        self.assertEqual(stats["cloned"], 0)
+
+    def test_provider_same_id_different_url_clones_without_overwriting_local(self):
+        existing = [
+            {"id": "custom-api", "name": "本机平台", "base_url": "https://ai.example.org", "has_key": True},
+            {"id": "custom-api-2", "name": "另一个平台", "base_url": "https://other.example.org"},
+        ]
+        incoming = [{
+            "id": "custom-api",
+            "name": "备份平台",
+            "base_url": "https://backup.example.org",
+            "model_names": {"m": "备份名称"},
+        }]
+
+        merged, stats, id_map = backup_transfer.merge_provider_entries_by_identity(
+            existing, incoming, overwrite=True
+        )
+
+        self.assertEqual([item["id"] for item in merged], ["custom-api", "custom-api-2", "custom-api-3"])
+        self.assertTrue(merged[0]["has_key"])
+        self.assertEqual(merged[2]["base_url"], "https://backup.example.org")
+        self.assertEqual(id_map, {"custom-api": "custom-api-3"})
+        self.assertEqual(stats["cloned"], 1)
+
+    def test_provider_id_collision_clone_keeps_name_unique(self):
+        merged, _stats, _id_map = backup_transfer.merge_provider_entries_by_identity(
+            [{"id": "custom-api", "name": "同名", "base_url": "https://local.example.org"}],
+            [{"id": "custom-api", "name": "同名", "base_url": "https://backup.example.org"}],
+            overwrite=False,
+        )
+        self.assertEqual(merged[-1]["name"], "同名（导入）")
+
+    def test_provider_reference_rewrite_only_changes_known_fields(self):
+        source = {
+            "nodes": [{
+                "apiProvider": "custom-api",
+                "settings": {"provider_id": "custom-api", "prompt": "custom-api should stay text"},
+                "videoProvider": "other",
+            }],
+        }
+        rewritten = backup_transfer.rewrite_provider_references(source, {"custom-api": "custom-api-2"})
+        self.assertEqual(rewritten["nodes"][0]["apiProvider"], "custom-api-2")
+        self.assertEqual(rewritten["nodes"][0]["settings"]["provider_id"], "custom-api-2")
+        self.assertEqual(rewritten["nodes"][0]["settings"]["prompt"], "custom-api should stay text")
+        self.assertEqual(rewritten["nodes"][0]["videoProvider"], "other")
+
 
 if __name__ == "__main__":
     unittest.main()

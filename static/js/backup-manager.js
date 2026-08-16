@@ -11,6 +11,45 @@
 
     function asArray(value){ return Array.isArray(value) ? value : []; }
     function itemId(item){ return String(item?.id || ''); }
+    function storageRef(){
+        try { return globalThis.localStorage || null; } catch(_error){ return null; }
+    }
+    function readPortablePreferences(){
+        const storage = storageRef();
+        const themeApi = globalThis.StudioTheme;
+        const scaleApi = globalThis.StudioScale;
+        let favorites = {};
+        try {
+            if(globalThis.ClassicNodeFavorites?.loadPreference) favorites = globalThis.ClassicNodeFavorites.loadPreference(storage);
+            else favorites = JSON.parse(storage?.getItem?.('infinite_canvas_classic_node_favorites_v1') || '{}');
+        } catch(_error) { favorites = {}; }
+        return {
+            theme: themeApi?.get?.() || storage?.getItem?.('studio_theme') || storage?.getItem?.('canvas_theme') || 'light',
+            scale_mode: scaleApi?.getMode?.() || storage?.getItem?.('studio_ui_scale_mode') || 'auto',
+            favorites,
+        };
+    }
+    function applyPortablePreferences(preferences){
+        const source = preferences && typeof preferences === 'object' ? preferences : {};
+        const storage = storageRef();
+        const theme = source.theme === 'dark' ? 'dark' : 'light';
+        const scaleMode = typeof source.scale_mode === 'string' ? source.scale_mode : 'auto';
+        try {
+            if(globalThis.StudioTheme?.set) globalThis.StudioTheme.set(theme);
+            else {
+                storage?.setItem?.('studio_theme', theme);
+                storage?.setItem?.('canvas_theme', theme);
+            }
+            if(globalThis.StudioScale?.set) globalThis.StudioScale.set(scaleMode);
+            else storage?.setItem?.('studio_ui_scale_mode', scaleMode);
+            if(source.favorites && globalThis.ClassicNodeFavorites?.savePreference){
+                globalThis.ClassicNodeFavorites.savePreference(storage, source.favorites);
+            } else if(source.favorites && storage){
+                storage.setItem('infinite_canvas_classic_node_favorites_v1', JSON.stringify(source.favorites));
+            }
+            return true;
+        } catch(_error){ return false; }
+    }
     function createBackupSelection(options={}){
         const projects = asArray(options.projects);
         const providers = asArray(options.providers);
@@ -29,6 +68,7 @@
             runninghubWorkflowIds:new Set(workflows.map(itemId).filter(Boolean)),
             promptLibraryIds:new Set(promptLibraries.map(itemId).filter(Boolean)),
             includeAssets:true,
+            includePreferences:Boolean(options.preferences?.available),
         };
     }
     function projectSelectionState(state, projectId){
@@ -71,6 +111,7 @@
         setIdsSelected(state.runninghubWorkflowIds, asArray(state.options.runninghub?.workflows).map(itemId), selected);
         setIdsSelected(state.promptLibraryIds, asArray(state.options.prompt_libraries).map(itemId), selected);
         state.includeAssets = selected;
+        state.includePreferences = selected && Boolean(state.options.preferences?.available);
     }
     function overallSelectionState(state){
         const flags = [];
@@ -79,6 +120,7 @@
         if(asArray(state.options.runninghub?.apps).length) flags.push(idsSelectionState(state.runninghubAppIds, asArray(state.options.runninghub.apps).map(itemId)));
         if(asArray(state.options.runninghub?.workflows).length) flags.push(idsSelectionState(state.runninghubWorkflowIds, asArray(state.options.runninghub.workflows).map(itemId)));
         if(asArray(state.options.prompt_libraries).length) flags.push(idsSelectionState(state.promptLibraryIds, asArray(state.options.prompt_libraries).map(itemId)));
+        if(state.options.preferences?.available) flags.push(state.includePreferences ? 'checked' : 'unchecked');
         if(flags.length && state.includeAssets) flags.push('checked');
         if(flags.length && flags.every(value => value === 'checked')) return 'checked';
         if(flags.some(value => value !== 'unchecked') || state.includeAssets) return 'mixed';
@@ -94,13 +136,15 @@
             runninghub_app_ids:[...state.runninghubAppIds],
             runninghub_workflow_ids:[...state.runninghubWorkflowIds],
             prompt_library_ids:[...state.promptLibraryIds],
+            include_preferences:Boolean(state.includePreferences),
+            preferences:state.includePreferences ? readPortablePreferences() : {},
         };
     }
     function hasAnySelection(state){
         const payload = buildBackupExportRequest(state);
         return payload.project_ids.length > 0 || payload.canvas_ids.length > 0 || payload.provider_ids.length > 0
             || payload.runninghub_app_ids.length > 0 || payload.runninghub_workflow_ids.length > 0
-            || payload.prompt_library_ids.length > 0;
+            || payload.prompt_library_ids.length > 0 || payload.include_preferences;
     }
     function formatBytes(value){
         const bytes = Math.max(0, Number(value) || 0);
@@ -131,7 +175,7 @@
         let state = null;
         let importFile = null;
         let inspectResult = null;
-        let conflictPolicies = {project_conflict:'copy', provider_conflict:'keep-local', runninghub_conflict:'keep-local'};
+        let conflictPolicies = {project_conflict:'copy', provider_conflict:'backup', runninghub_conflict:'backup'};
         let busy = false;
         const collapsedGroups = new Set();
 
@@ -142,7 +186,7 @@
             modal.classList.remove('open'); modal.setAttribute('aria-hidden', 'true'); document.body.classList.remove('backup-modal-open');
             mode = ''; options = null; state = null; importFile = null; inspectResult = null;
             collapsedGroups.clear();
-            conflictPolicies = {project_conflict:'copy', provider_conflict:'keep-local', runninghub_conflict:'keep-local'};
+            conflictPolicies = {project_conflict:'copy', provider_conflict:'backup', runninghub_conflict:'backup'};
             if(fileInput) fileInput.value = '';
         }
         function setBusy(value, label=''){
@@ -241,14 +285,19 @@
             const conflicts = inspectResult.conflicts || {};
             const projectCount = asArray(conflicts.projects).length;
             const providerCount = asArray(conflicts.providers).length;
+            const providerCollisionCount = asArray(conflicts.provider_id_collisions).length;
             const rhCount = asArray(conflicts.runninghub_apps).length + asArray(conflicts.runninghub_workflows).length;
             const repeated = conflicts.already_imported ? `<div class="backup-warning"><i data-lucide="history"></i><span>${zh('这个备份以前导入过，继续导入会创建新的项目副本。','This backup was imported before. Continuing creates another copy.')}</span></div>` : '';
+            const providerCollisionWarning = providerCollisionCount ? `<div class="backup-warning"><i data-lucide="copy-plus"></i><span>${zh(`有 ${providerCollisionCount} 个平台 ID 相同但请求地址不同，导入时会自动新增平台并保留本机平台。`, `${providerCollisionCount} provider IDs use different URLs; import will create new suffixed providers and keep local ones.`)}</span></div>` : '';
+            const endpoint = conflicts.runninghub_endpoint || {};
+            const hasRhSelection = Boolean(state?.runninghubAppIds?.size || state?.runninghubWorkflowIds?.size);
+            const endpointWarning = endpoint.changed && hasRhSelection ? `<div class="backup-warning"><i data-lucide="globe-2"></i><span>${zh(`RunningHub 请求地址将切换为 ${endpoint.backup_base_url || '备份地址'}。由于地址不同，本机 RunningHub 密钥将在导入成功后清空。`, `RunningHub endpoint will switch to ${endpoint.backup_base_url || 'the backup endpoint'}. Local RunningHub keys will be cleared after a successful import because the endpoint differs.`)}</span></div>` : '';
             return `${repeated}<div class="backup-conflicts">
                 <div class="backup-conflict-title">${zh('遇到重复内容时','When duplicates are found')}</div>
                 ${projectCount ? `<label><span>${zh(`同名项目 ${projectCount} 个`, `${projectCount} project conflicts`)}</span><select data-conflict="project_conflict"><option value="copy"${conflictPolicies.project_conflict === 'copy' ? ' selected' : ''}>${zh('创建“（导入）”副本（推荐）','Create imported copies')}</option><option value="merge"${conflictPolicies.project_conflict === 'merge' ? ' selected' : ''}>${zh('合并到同名项目','Merge into same-name projects')}</option></select></label>` : ''}
-                ${providerCount ? `<label><span>${zh(`API 平台 ${providerCount} 个`, `${providerCount} provider conflicts`)}</span><select data-conflict="provider_conflict"><option value="keep-local"${conflictPolicies.provider_conflict === 'keep-local' ? ' selected' : ''}>${zh('保留本机配置（推荐）','Keep local')}</option><option value="backup"${conflictPolicies.provider_conflict === 'backup' ? ' selected' : ''}>${zh('使用备份配置（无密钥）','Use backup config')}</option></select></label>` : ''}
-                ${rhCount ? `<label><span>${zh(`RunningHub ${rhCount} 项`, `${rhCount} RunningHub conflicts`)}</span><select data-conflict="runninghub_conflict"><option value="keep-local"${conflictPolicies.runninghub_conflict === 'keep-local' ? ' selected' : ''}>${zh('保留本机配置（推荐）','Keep local')}</option><option value="backup"${conflictPolicies.runninghub_conflict === 'backup' ? ' selected' : ''}>${zh('使用备份配置（无密钥）','Use backup config')}</option></select></label>` : ''}
-            </div>`;
+                ${providerCount ? `<label><span>${zh(`API 平台 ${providerCount} 个`, `${providerCount} provider conflicts`)}</span><select data-conflict="provider_conflict"><option value="keep-local"${conflictPolicies.provider_conflict === 'keep-local' ? ' selected' : ''}>${zh('保留本机平台和模型设置','Keep local platform and model settings')}</option><option value="backup"${conflictPolicies.provider_conflict === 'backup' ? ' selected' : ''}>${zh('采用备份的平台和模型设置（保留本机密钥）（推荐）','Use backup platform and model settings (keep local key) (recommended)')}</option></select></label>` : ''}
+                ${rhCount ? `<label><span>${zh(`RunningHub 应用/工作流 ${rhCount} 项`, `${rhCount} RunningHub app/workflow conflicts`)}</span><select data-conflict="runninghub_conflict"><option value="keep-local"${conflictPolicies.runninghub_conflict === 'keep-local' ? ' selected' : ''}>${zh('保留本机应用/工作流','Keep local apps/workflows')}</option><option value="backup"${conflictPolicies.runninghub_conflict === 'backup' ? ' selected' : ''}>${zh('采用备份应用/工作流（推荐）','Use backup apps/workflows (recommended)')}</option></select></label>` : ''}
+            </div>${providerCollisionWarning}${endpointWarning}`;
         }
         function renderTree(){
             const previousScrollTop = modalBody.scrollTop;
@@ -273,7 +322,8 @@
                     ${renderFlatGroup(zh('RunningHub 应用','RunningHub apps'), 'blocks', 'group:runninghub-apps', 'rh-app-group', 'rh-app', apps, state.runninghubAppIds)}
                     ${renderFlatGroup(zh('RunningHub 工作流','RunningHub workflows'), 'workflow', 'group:runninghub-workflows', 'rh-workflow-group', 'rh-workflow', workflows, state.runninghubWorkflowIds)}
                     ${renderFlatGroup(zh('提示词模板库','Prompt template libraries'), 'library', 'group:prompt-libraries', 'prompt-group', 'prompt-library', libraries, state.promptLibraryIds, 'item_count')}
-                    ${(!providers.length && !apps.length && !workflows.length && !libraries.length) ? `<div class="backup-tree-empty">${zh('没有可迁移的全局配置','No global configuration available')}</div>` : ''}
+                    ${options?.preferences?.available ? checkbox(state.includePreferences ? 'checked' : 'unchecked', 'preferences', '', zh('界面与使用偏好', 'Interface and usage preferences'), zh('主题、UI 缩放、普通画布常用节点排序', 'Theme, UI scale, and classic-canvas favorite-node order')) : ''}
+                    ${(!providers.length && !apps.length && !workflows.length && !libraries.length && !options?.preferences?.available) ? `<div class="backup-tree-empty">${zh('没有可迁移的全局配置','No global configuration available')}</div>` : ''}
                 `, zh('不含密钥','No secrets'))}
                 ${conflictHtml()}
                 <div class="backup-inline-status" aria-live="polite"></div>`;
@@ -299,6 +349,7 @@
             else if(kind === 'rh-workflow') setIdsSelected(state.runninghubWorkflowIds, [id], checked);
             else if(kind === 'prompt-group') setIdsSelected(state.promptLibraryIds, promptIds, checked);
             else if(kind === 'prompt-library') setIdsSelected(state.promptLibraryIds, [id], checked);
+            else if(kind === 'preferences') state.includePreferences = checked;
             renderTree();
         }
         function showLoading(title, subtitle){
@@ -373,8 +424,50 @@
                 form.append('selection', JSON.stringify(request));
                 const result = await responseJson(await fetch('/api/backups/import', {method:'POST', body:form}));
                 busy = false; closeModal();
-                if(typeof window.loadAll === 'function') await window.loadAll();
-                alert(zh(`导入完成：${result.projects || 0} 个项目，${result.canvases || 0} 个画布。`, `Imported ${result.projects || 0} projects and ${result.canvases || 0} canvases.`));
+                if(result.preferences && Object.keys(result.preferences).length) applyPortablePreferences(result.preferences);
+                const providerMapCount = Object.keys(result.provider_id_map || {}).filter(id => result.provider_id_map[id] && result.provider_id_map[id] !== id).length;
+                const importedParts = [];
+                const skippedParts = [];
+                if(Number(result.projects || 0) || Number(result.canvases || 0)) importedParts.push(zh(`项目 ${result.projects || 0} 个、画布 ${result.canvases || 0} 个`, `${result.projects || 0} projects, ${result.canvases || 0} canvases`));
+                if(Number(result.providers_imported || 0)) importedParts.push(zh(`API 平台 ${result.providers_imported} 个`, `${result.providers_imported} API providers`));
+                if(Number(result.runninghub_apps_imported || 0)) importedParts.push(zh(`RunningHub 应用 ${result.runninghub_apps_imported} 个`, `${result.runninghub_apps_imported} RunningHub apps`));
+                if(Number(result.runninghub_workflows_imported || 0)) importedParts.push(zh(`RunningHub 工作流 ${result.runninghub_workflows_imported} 个`, `${result.runninghub_workflows_imported} RunningHub workflows`));
+                if(Number(result.prompt_libraries_imported || 0)) importedParts.push(zh(`提示词模板库 ${result.prompt_libraries_imported} 个`, `${result.prompt_libraries_imported} prompt libraries`));
+                if(result.preferences && Object.keys(result.preferences).length) importedParts.push(zh('界面与使用偏好 1 组', '1 interface preference set'));
+                if(Number(result.providers_skipped || 0)) skippedParts.push(zh(`API 平台 ${result.providers_skipped} 个`, `${result.providers_skipped} API providers`));
+                if(Number(result.runninghub_apps_skipped || 0)) skippedParts.push(zh(`RunningHub 应用 ${result.runninghub_apps_skipped} 个`, `${result.runninghub_apps_skipped} RunningHub apps`));
+                if(Number(result.runninghub_workflows_skipped || 0)) skippedParts.push(zh(`RunningHub 工作流 ${result.runninghub_workflows_skipped} 个`, `${result.runninghub_workflows_skipped} RunningHub workflows`));
+                if(Number(result.prompt_libraries_skipped || 0)) skippedParts.push(zh(`提示词模板库 ${result.prompt_libraries_skipped} 个`, `${result.prompt_libraries_skipped} prompt libraries`));
+                if(!importedParts.length) importedParts.push(zh('没有写入新的内容', 'No new content was written'));
+                const endpointNote = result.runninghub_endpoint_changed
+                    ? zh('RunningHub 地址已更新，本机密钥已清空，请重新填写。', 'RunningHub endpoint updated; local keys were cleared. Please enter them again.')
+                    : '';
+                const providerNote = providerMapCount ? zh(`新增 ${providerMapCount} 个地址不同的平台。`, `Added ${providerMapCount} providers with different endpoints.`) : '';
+                const skippedNote = skippedParts.length
+                    ? zh(`跳过冲突：${skippedParts.join('、')}。`, `Skipped conflicts: ${skippedParts.join(', ')}.`)
+                    : '';
+                // 直接重读当前页面数据，不依赖本地浏览器壳是否允许脚本导航。
+                // 这会立即刷新项目、画布和回收站；API 设置页下次打开时也会通过 no-store 读取新配置。
+                if(typeof window.loadAll === 'function') {
+                    try { await window.loadAll(); } catch(_error) { /* 导入已经完成，导航兜底仍可用 */ }
+                }
+                const importMessage = zh(`导入完成：${importedParts.join('、')}。${skippedNote}${providerNote}${endpointNote ? `\n${endpointNote}` : ''}`, `Import complete: ${importedParts.join(', ')}. ${skippedNote}${providerNote ? ` ${providerNote}` : ''}${endpointNote ? ` ${endpointNote}` : ''}`);
+                if(typeof window.setStatus === 'function') window.setStatus(importMessage);
+                window.dispatchEvent(new CustomEvent('backup-imported', {detail:result}));
+                // Notify API settings and other open views that global providers/workflows changed.
+                const changeMessage = {type:'providers-changed', updated_at:Date.now(), source:'backup-import'};
+                try { localStorage.setItem('studio_api_updated_at', String(changeMessage.updated_at)); } catch(_error) {}
+                try { new BroadcastChannel('studio-api').postMessage(changeMessage); } catch(_error) {}
+                try { window.parent?.postMessage(changeMessage, '*'); } catch(_error) {}
+                // The backup UI runs in an iframe in the main studio shell. Reload the
+                // top-level shell so every iframe rebuilds its in-memory provider/workflow state.
+                try {
+                    const topWindow = window.top;
+                    if(topWindow && topWindow.location){
+                        const refreshUrl = `${topWindow.location.pathname}?_backup_refresh=${changeMessage.updated_at}`;
+                        topWindow.location.href = refreshUrl;
+                    }
+                } catch(_error) {}
             } catch(error){ setBusy(false); showError(error.message); }
         }
 

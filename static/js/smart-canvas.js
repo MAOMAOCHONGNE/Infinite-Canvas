@@ -409,11 +409,15 @@ const MS_GEN_MODELS = {
 };
 const SIZE_MAP = {
     square: {'1k':'1024x1024','2k':'2048x2048','4k':'4096x4096'},
+    portrait14: {'1k':'384x1536','2k':'512x2048','4k':'960x3840'},
+    portrait18: {'1k':'192x1536','2k':'256x2048','4k':'480x3840'},
     portrait: {'1k':'1024x1536','2k':'1360x2048','4k':'2352x3520'},
     portrait43: {'1k':'1008x1344','2k':'1536x2048','4k':'2448x3264'},
     landscape43: {'1k':'1344x1008','2k':'2048x1536','4k':'3264x2448'},
     portrait45: {'1k':'1024x1280','2k':'1600x2000','4k':'2560x3200'},
     landscape54: {'1k':'1280x1024','2k':'2000x1600','4k':'3200x2560'},
+    landscape41: {'1k':'1536x384','2k':'2048x512','4k':'3840x960'},
+    landscape81: {'1k':'1536x192','2k':'2048x256','4k':'3840x480'},
     landscape: {'1k':'1536x1024','2k':'2048x1360','4k':'3520x2352'},
     story: {'1k':'720x1280','2k':'1152x2048','4k':'2160x3840'},
     wide: {'1k':'1280x720','2k':'2048x1152','4k':'3840x2160'},
@@ -422,12 +426,16 @@ const SIZE_MAP = {
 };
 const API_RATIO_VALUES = {
     square:'1:1',
+    portrait14:'1:4',
+    portrait18:'1:8',
     portrait:'2:3',
     landscape:'3:2',
     portrait43:'3:4',
     landscape43:'4:3',
     portrait45:'4:5',
     landscape54:'5:4',
+    landscape41:'4:1',
+    landscape81:'8:1',
     story:'9:16',
     wide:'16:9',
     ultrawide:'21:9',
@@ -764,8 +772,47 @@ function isGptImageAutoSizeModel(model){
         || compact.startsWith('gptimage2')
         || compact.endsWith('gptimage2');
 }
-function defaultSmartApiResolution(model){
-    return isGptImageAutoSizeModel(model) ? '4k' : '1k';
+function bananaModelFixedResolution(model){
+    const raw = String(model || '').trim().toLowerCase();
+    const normalized = raw.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const isBanana = normalized.startsWith('nano-banana') || normalized.startsWith('gemini-3-1-flash-image-preview');
+    if(!isBanana) return '';
+    const match = normalized.match(/(?:^|-)(1k|2k|4k)$/);
+    return match ? match[1] : '';
+}
+function smartProviderForModel(providerId, model, kind='image'){
+    const key = kind === 'video' ? 'video_models' : kind === 'chat' ? 'chat_models' : 'image_models';
+    return (apiProviders || []).find(provider => provider.id === providerId)
+        || (apiProviders || []).find(provider => (provider?.[key] || []).includes(model))
+        || null;
+}
+function smartModelDisplayName(providerId, model, kind='image'){
+    return ModelConfigTools.displayName(smartProviderForModel(providerId, model, kind), model);
+}
+function smartImageModelSupportsAutoSize(providerId, model, resolution=''){
+    const provider = smartProviderForModel(providerId, model, 'image');
+    if(typeof ModelConfigTools !== 'undefined' && typeof ModelConfigTools.imageModelSupportsAutoSize === 'function'){
+        const effectiveModel = ModelConfigTools.effectiveModel(provider, model, resolution) || model;
+        return ModelConfigTools.imageModelSupportsAutoSize(provider, model, effectiveModel);
+    }
+    return isGptImageAutoSizeModel(model);
+}
+function smartImageResolutionRoutingEnabled(providerId=settings.provider_id, model=settings.model){
+    return ModelConfigTools.resolutionRoutingEnabled(smartProviderForModel(providerId, model, 'image'), model);
+}
+function smartAvailableImageResolutions(providerId=settings.provider_id, model=settings.model){
+    return ModelConfigTools.availableResolutions(smartProviderForModel(providerId, model, 'image'), model);
+}
+function effectiveSmartFixedImageResolution(model=settings.model, providerId=settings.provider_id){
+    return smartImageResolutionRoutingEnabled(providerId, model) ? '' : bananaModelFixedResolution(model);
+}
+function bananaModelResolutionTitle(model, providerId=settings.provider_id){
+    const fixed = effectiveSmartFixedImageResolution(model, providerId);
+    return fixed ? `该模型固定输出 ${fixed.toUpperCase()}，尺寸选择已锁定` : '';
+}
+function defaultSmartApiResolution(model, providerId=settings.provider_id){
+    if(smartImageResolutionRoutingEnabled(providerId, model)) return smartAvailableImageResolutions(providerId, model)[0] || '';
+    return effectiveSmartFixedImageResolution(model, providerId) || (smartImageModelSupportsAutoSize(providerId, model) ? '4k' : '1k');
 }
 function mediaItemForStorage(item){
     if(!item || typeof item !== 'object') return item;
@@ -2591,7 +2638,7 @@ function runningHubEntries(kind){
     if(kind === 'model'){
         return (provider?.image_models || []).map(model => ({
             id:String(model || '').trim(),
-            title:String(model || '').trim(),
+            title:ModelConfigTools.displayName(provider, model),
             enabled:true
         })).filter(item => item.id);
     }
@@ -2807,7 +2854,7 @@ function chatModelOptions(selectedModel='', providerId=''){
     const selectedProvider = resolveChatProviderId(providerId);
     const models = providerChatModels(selectedProvider);
     const selected = resolveChatModel(selectedModel, selectedProvider);
-    return [...new Set([selected, ...models].filter(Boolean))].map(model => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    return [...new Set([selected, ...models].filter(Boolean))].map(model => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(smartModelDisplayName(selectedProvider, model, 'chat'))}</option>`).join('');
 }
 function apiProviderById(providerId){
     if(providerId === 'volcengine') return volcengineProvider();
@@ -2920,9 +2967,24 @@ function sanitizeSmartApiSelection(target=settings){
         if(models.length && !models.includes(target.model)) target.model = models[0] || '';
     }
     if((target.engine || 'api') === 'api' && (target.apiKind || 'image') !== 'video'){
-        const allowAuto = isGptImageAutoSizeModel(target.model);
-        if(!target.resolution) target.resolution = allowAuto ? defaultSmartApiResolution(target.model) : '1k';
-        if(!allowAuto && target.resolution === 'auto') target.resolution = '1k';
+        const routingEnabled = smartImageResolutionRoutingEnabled(target.provider_id, target.model);
+        const availableResolutions = routingEnabled ? smartAvailableImageResolutions(target.provider_id, target.model) : [];
+        const fixedBananaResolution = effectiveSmartFixedImageResolution(target.model, target.provider_id);
+        if(routingEnabled){
+            if(!availableResolutions.includes(String(target.resolution || '').toLowerCase())) target.resolution = availableResolutions[0] || '';
+            target.customSize = '';
+            target.customWidth = '';
+            target.customHeight = '';
+        } else if(fixedBananaResolution){
+            target.resolution = fixedBananaResolution;
+            target.customSize = '';
+            target.customWidth = '';
+            target.customHeight = '';
+        } else {
+            const allowAuto = smartImageModelSupportsAutoSize(target.provider_id, target.model, target.resolution);
+            if(!target.resolution) target.resolution = allowAuto ? defaultSmartApiResolution(target.model, target.provider_id) : '1k';
+            if(!allowAuto && target.resolution === 'auto') target.resolution = '1k';
+        }
     }
     if(target.videoProvider){
         const models = providerVideoModels(target.videoProvider);
@@ -2969,12 +3031,13 @@ function renderVideoProviderControl(providers){
     </div>`;
 }
 function renderVideoModelControl(models){
+    const currentLabel = smartModelDisplayName(settings.videoProvider, settings.videoModel, 'video');
     return `<div class="smart-control model-control">
-        <button class="smart-pill" type="button"><i data-lucide="film"></i><span class="sub">${escapeHtml(settings.videoModel || tr('smart.model'))}</span></button>
+        <button class="smart-pill" type="button"><i data-lucide="film"></i><span class="sub">${escapeHtml(currentLabel || tr('smart.model'))}</span></button>
         <div class="smart-popover compact-popover">
             <div class="smart-popover-title">${escapeHtml(tr('smart.videoModel'))}</div>
             <div class="model-list">
-                ${models.map(m => `<button type="button" class="direct-option ${m === settings.videoModel ? 'active' : ''}" data-smart-param="videoModel" data-smart-value="${escapeHtml(m)}"><span>${escapeHtml(m)}</span></button>`).join('') || `<div class="muted-note">${escapeHtml(tr('smart.noVideoModel'))}</div>`}
+                ${models.map(m => `<button type="button" class="direct-option ${m === settings.videoModel ? 'active' : ''}" data-smart-param="videoModel" data-smart-value="${escapeHtml(m)}" title="${escapeHtml(m)}"><span>${escapeHtml(smartModelDisplayName(settings.videoProvider, m, 'video'))}</span></button>`).join('') || `<div class="muted-note">${escapeHtml(tr('smart.noVideoModel'))}</div>`}
             </div>
         </div>
     </div>`;
@@ -3091,8 +3154,28 @@ function apiImageSize(ratioValue, resolutionValue, customRatioValue='', customSi
 function normalizeApiSizeSettings(prefix=''){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
-    const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
-    if(!settings[resKey]) settings[resKey] = allowAuto ? defaultSmartApiResolution(settings.model) : '1k';
+    const routingEnabled = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        && smartImageResolutionRoutingEnabled(settings.provider_id, settings.model);
+    const availableResolutions = routingEnabled ? smartAvailableImageResolutions(settings.provider_id, settings.model) : [];
+    const fixedBananaResolution = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        ? effectiveSmartFixedImageResolution(settings.model, settings.provider_id)
+        : '';
+    if(routingEnabled){
+        if(!availableResolutions.includes(String(settings[resKey] || '').toLowerCase())) settings[resKey] = availableResolutions[0] || '';
+        settings.customSize = '';
+        settings.customWidth = '';
+        settings.customHeight = '';
+        return;
+    }
+    if(fixedBananaResolution){
+        settings[resKey] = fixedBananaResolution;
+        settings.customSize = '';
+        settings.customWidth = '';
+        settings.customHeight = '';
+        return;
+    }
+    const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && smartImageModelSupportsAutoSize(settings.provider_id, settings.model, settings.resolution);
+    if(!settings[resKey]) settings[resKey] = allowAuto ? defaultSmartApiResolution(settings.model, settings.provider_id) : '1k';
     if(!allowAuto && settings[resKey] === 'auto') settings[resKey] = '1k';
     if(settings[resKey] === 'auto' && !settings[ratioKey]) settings[ratioKey] = 'square';
 }
@@ -3467,13 +3550,23 @@ function renderSizeControls(prefix='', includeSource=false){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
     const ratios = [
-        ['square','1:1'], ['portrait','2:3'], ['landscape','3:2'], ['portrait43','3:4'], ['landscape43','4:3'], ['portrait45','4:5'], ['landscape54','5:4'], ['story','9:16'], ['wide','16:9'], ['ultrawide','21:9'], ['ultratall','9:21'],
-        ...(includeSource ? [['source', tr('canvas.adaptiveRatio') || '适配比例']] : []),
+        ['square','1:1'], ['portrait14','1:4'], ['portrait18','1:8'], ['portrait','2:3'], ['landscape','3:2'], ['portrait43','3:4'], ['landscape41','4:1'],
+        ['landscape43','4:3'], ['portrait45','4:5'], ['landscape54','5:4'], ['landscape81','8:1'], ['story','9:16'], ['wide','16:9'], ['ultrawide','21:9'],
+        ...(includeSource ? [['source', tr('canvas.adaptiveRatio') || '拉伸适配'], ['adaptive', tr('canvas.autoRatio') || '自适应']] : []),
         ['custom', tr('canvas.custom') || '自定义']
     ];
-    const resolutionOptions = (!prefix && settings.engine === 'api') ? ['auto','1k','2k','4k','custom'] : ['1k','2k','4k','custom'];
+    const routingEnabled = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        && smartImageResolutionRoutingEnabled(settings.provider_id, settings.model);
+    const fixedBananaResolution = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        ? effectiveSmartFixedImageResolution(settings.model, settings.provider_id)
+        : '';
+    const resolutionOptions = routingEnabled
+        ? smartAvailableImageResolutions(settings.provider_id, settings.model)
+        : fixedBananaResolution
+        ? [fixedBananaResolution]
+        : ((!prefix && settings.engine === 'api') ? ['auto','1k','2k','4k','custom'] : ['1k','2k','4k','custom']);
     return `<select data-param="${resKey}">
-            ${resolutionOptions.map(v => optionHtml(v, v === 'auto' ? '自动' : (v === 'custom' ? (tr('canvas.custom') || '自定义') : v.toUpperCase()), settings[resKey] || (prefix ? '1k' : defaultSmartApiResolution(settings.model)))).join('')}
+            ${resolutionOptions.map(v => optionHtml(v, v === 'auto' ? '自动' : (v === 'custom' ? (tr('canvas.custom') || '自定义') : v.toUpperCase()), settings[resKey] || (prefix ? '1k' : defaultSmartApiResolution(settings.model, settings.provider_id)))).join('')}
         </select>
         <select data-param="${ratioKey}" ${settings[resKey] === 'custom' || settings[resKey] === 'auto' ? 'disabled' : ''}>
             ${ratios.map(([v,l]) => `<option value="${escapeHtml(v)}" ${v === (settings[ratioKey] || 'square') ? 'selected' : ''}>${escapeHtml(l)}</option>`).join('')}
@@ -3483,7 +3576,11 @@ function ratioLabel(prefix=''){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const customKey = prefix ? `${prefix}CustomRatio` : 'customRatio';
     const sourceLabel = sourceImageRatioLabel(prefix) || tr('smart.imageRatio');
-    const map = {square:'1:1', portrait:'2:3', landscape:'3:2', portrait43:'3:4', landscape43:'4:3', portrait45:'4:5', landscape54:'5:4', story:'9:16', wide:'16:9', ultrawide:'21:9', ultratall:'9:21', source:settings[customKey] || sourceLabel, custom:settings[customKey] || tr('smart.custom')};
+    const map = {
+        square:'1:1', portrait14:'1:4', portrait18:'1:8', portrait:'2:3', landscape:'3:2', portrait43:'3:4', landscape41:'4:1',
+        landscape43:'4:3', portrait45:'4:5', landscape54:'5:4', landscape81:'8:1', story:'9:16', wide:'16:9', ultrawide:'21:9',
+        ultratall:'9:21', source:tr('canvas.adaptiveRatio') || sourceLabel, adaptive:tr('canvas.autoRatio') || '自适应', custom:settings[customKey] || tr('smart.custom')
+    };
     return map[settings[ratioKey] || 'square'] || '1:1';
 }
 function gcdInt(a, b){
@@ -3514,17 +3611,21 @@ function reducedRatioForImage(img){
 }
 function sourceImageRatioLabel(prefix=''){
     const node = activeComposerNode() || selectedNode();
-    const ratio = reducedRatioForImage(sourceRatioImageForNode(node));
-    if(!ratio) return '';
-    return `${ratio.w}:${ratio.h}`;
+    const image = sourceRatioImageForNode(node);
+    const size = imageSizeForRatio(image);
+    if(!size) return '';
+    const matched = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(size.w, size.h) || '';
+    if(matched) return matched;
+    const ratio = reducedRatioForImage(image);
+    return ratio ? `${ratio.w}:${ratio.h}` : '';
 }
 function applySourceRatioToSettings(prefix=''){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     if(settings[ratioKey] !== 'source') return;
-    const ratio = reducedRatioForImage(sourceRatioImageForNode(activeComposerNode() || selectedNode()));
-    if(!ratio) return;
-    const matched = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(ratio.w, ratio.h) || '1:1';
-    const matchedParts = ADAPTIVE_RATIO_TOOLS?.ratioParts(matched) || {width:1, height:1};
+    const size = imageSizeForRatio(sourceRatioImageForNode(activeComposerNode() || selectedNode()));
+    if(!size) return;
+    const matched = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(size.w, size.h) || '1:1';
+    const matchedParts = ADAPTIVE_RATIO_TOOLS?.canonicalRatioParts(matched) || {width:1, height:1};
     const customKey = prefix ? `${prefix}CustomRatio` : 'customRatio';
     const wKey = prefix ? `${prefix}CustomRatioWidth` : 'customRatioWidth';
     const hKey = prefix ? `${prefix}CustomRatioHeight` : 'customRatioHeight';
@@ -3535,18 +3636,19 @@ function applySourceRatioToSettings(prefix=''){
 function resolutionLabel(prefix=''){
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
     const sizeKey = prefix ? `${prefix}CustomSize` : 'customSize';
-    const value = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k');
+    const value = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model, settings.provider_id) : '1k');
+    if(!value && !prefix && smartImageResolutionRoutingEnabled(settings.provider_id, settings.model)) return '未配置';
     if(value === 'auto') return '自动';
     return value === 'custom' ? (settings[sizeKey] || tr('smart.custom')) : value.toUpperCase();
 }
 function ratioIconClass(value){
     if(value === 'portrait') return 'r-portrait';
     if(value === 'portrait43' || value === 'portrait45') return 'r-portrait43';
+    if(value === 'portrait14' || value === 'portrait18' || value === 'story' || value === 'ultratall') return 'r-story';
     if(value === 'landscape') return 'r-landscape';
     if(value === 'landscape43' || value === 'landscape54') return 'r-landscape43';
-    if(value === 'wide' || value === 'ultrawide') return 'r-wide';
-    if(value === 'story' || value === 'ultratall') return 'r-story';
-    if(value === 'source') return 'r-source';
+    if(value === 'landscape41' || value === 'landscape81' || value === 'wide' || value === 'ultrawide') return 'r-wide';
+    if(value === 'source' || value === 'adaptive') return 'r-source';
     if(value === 'custom') return 'r-custom';
     return '';
 }
@@ -3571,12 +3673,13 @@ function renderProviderControl(providers){
     </div>`;
 }
 function renderModelControl(models){
+    const currentLabel = smartModelDisplayName(settings.provider_id, settings.model, 'image');
     return `<div class="smart-control model-control">
-        <button class="smart-pill" type="button"><i data-lucide="sparkles"></i><span class="sub">${escapeHtml(settings.model || tr('smart.model'))}</span></button>
+        <button class="smart-pill" type="button"><i data-lucide="sparkles"></i><span class="sub">${escapeHtml(currentLabel || tr('smart.model'))}</span></button>
         <div class="smart-popover compact-popover">
             <div class="smart-popover-title">${escapeHtml(tr('smart.imageModel'))}</div>
             <div class="model-list">
-                ${models.map(m => `<button type="button" class="direct-option ${m === settings.model ? 'active' : ''}" data-smart-param="model" data-smart-value="${escapeHtml(m)}"><span>${escapeHtml(m)}</span></button>`).join('') || `<div class="muted-note">${escapeHtml(tr('smart.noImageModel'))}</div>`}
+                ${models.map(m => `<button type="button" class="direct-option ${m === settings.model ? 'active' : ''}" data-smart-param="model" data-smart-value="${escapeHtml(m)}" title="${escapeHtml(m)}"><span>${escapeHtml(smartModelDisplayName(settings.provider_id, m, 'image'))}</span></button>`).join('') || `<div class="muted-note">${escapeHtml(tr('smart.noImageModel'))}</div>`}
             </div>
         </div>
     </div>`;
@@ -3614,9 +3717,9 @@ function renderRatioControl(prefix='', includeSource=false){
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
     const ratios = [
-        ['square','1:1'], ['portrait','2:3'], ['landscape','3:2'], ['portrait43','3:4'], ['landscape43','4:3'], ['portrait45','4:5'], ['landscape54','5:4'],
-        ['story','9:16'], ['wide','16:9'], ['ultrawide','21:9'], ['ultratall','9:21'],
-        ...(includeSource ? [['source', tr('smart.imageRatio')]] : []),
+        ['square','1:1'], ['portrait14','1:4'], ['portrait18','1:8'], ['portrait','2:3'], ['landscape','3:2'], ['portrait43','3:4'], ['landscape41','4:1'],
+        ['landscape43','4:3'], ['portrait45','4:5'], ['landscape54','5:4'], ['landscape81','8:1'], ['story','9:16'], ['wide','16:9'], ['ultrawide','21:9'],
+        ...(includeSource ? [['source', tr('canvas.adaptiveRatio')], ['adaptive', tr('canvas.autoRatio')]] : []),
         ['custom', tr('smart.custom')]
     ];
     return `<div class="smart-control ratio-control">
@@ -3631,15 +3734,27 @@ function renderRatioControl(prefix='', includeSource=false){
 }
 function renderResolutionControl(prefix=''){
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
-    const options = (!prefix && settings.engine === 'api') ? ['auto','1k','2k','4k','custom'] : ['1k','2k','4k','custom'];
-    const current = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k');
-    const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
+    const routingEnabled = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        && smartImageResolutionRoutingEnabled(settings.provider_id, settings.model);
+    const fixedBananaResolution = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        ? effectiveSmartFixedImageResolution(settings.model, settings.provider_id)
+        : '';
+    const options = routingEnabled
+        ? smartAvailableImageResolutions(settings.provider_id, settings.model)
+        : fixedBananaResolution
+        ? [fixedBananaResolution]
+        : ((!prefix && settings.engine === 'api') ? ['auto','1k','2k','4k','custom'] : ['1k','2k','4k','custom']);
+    const current = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model, settings.provider_id) : '1k');
+    const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && smartImageModelSupportsAutoSize(settings.provider_id, settings.model, settings.resolution);
+    const title = fixedBananaResolution
+        ? bananaModelResolutionTitle(settings.model, settings.provider_id)
+        : (routingEnabled ? (options.length ? '选择分辨率时将调用对应的真实模型' : '请先在 API 设置中配置分辨率模型') : tr('smart.resolution'));
     return `<div class="smart-control resolution-control">
         <button class="smart-pill" type="button"><i data-lucide="monitor"></i><span>${escapeHtml(resolutionLabel(prefix))}</span></button>
         <div class="smart-popover compact-popover">
-            <div class="smart-popover-title">${escapeHtml(tr('smart.resolution'))}</div>
+            <div class="smart-popover-title" title="${escapeHtml(title)}">${escapeHtml(title)}</div>
             <div class="seg-row">
-                ${options.map(value => `<button type="button" class="${value === current ? 'active' : ''}" data-smart-param="${resKey}" data-smart-value="${value}" ${value === 'auto' && !allowAuto ? 'disabled' : ''}>${value === 'auto' ? '自动' : (value === 'custom' ? escapeHtml(tr('smart.custom')) : value.toUpperCase())}</button>`).join('')}
+                ${options.map(value => `<button type="button" class="${value === current ? 'active' : ''}" data-smart-param="${resKey}" data-smart-value="${value}" ${value === 'auto' && !allowAuto ? 'disabled' : ''}>${value === 'auto' ? '自动' : (value === 'custom' ? escapeHtml(tr('smart.custom')) : value.toUpperCase())}</button>`).join('') || `<span class="muted-note">未配置可用档位</span>`}
             </div>
         </div>
     </div>`;
@@ -3647,13 +3762,19 @@ function renderResolutionControl(prefix=''){
 function sizePickerScope(prefix=''){
     const resKey = prefix ? `${prefix}Resolution` : 'resolution';
     const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
-    const value = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k');
+    const routingEnabled = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        && smartImageResolutionRoutingEnabled(settings.provider_id, settings.model);
+    const fixedBananaResolution = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        ? effectiveSmartFixedImageResolution(settings.model, settings.provider_id)
+        : '';
+    const value = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model, settings.provider_id) : '1k');
+    if(routingEnabled || fixedBananaResolution) return 'preset';
     if(value === 'auto') return 'auto';
     if(value === 'custom' || settings[ratioKey] === 'custom') return 'custom';
     return 'preset';
 }
 function sizePickerDefaultResolution(prefix=''){
-    const value = (!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k';
+    const value = (!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model, settings.provider_id) : '1k';
     return value === 'auto' ? '1k' : value;
 }
 function sizePickerLabel(prefix=''){
@@ -3677,27 +3798,42 @@ function renderSizePickerControl(prefix='', includeSource=false){
     const customRatioKey = prefix ? `${prefix}CustomRatio` : 'customRatio';
     if(settings[ratioKey] === 'source') applySourceRatioToSettings(prefix);
     const scope = sizePickerScope(prefix);
-    const options = (!prefix && settings.engine === 'api') ? ['auto','1k','2k','4k'] : ['1k','2k','4k'];
-    const currentRes = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k');
+    const routingEnabled = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        && smartImageResolutionRoutingEnabled(settings.provider_id, settings.model);
+    const fixedBananaResolution = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+        ? effectiveSmartFixedImageResolution(settings.model, settings.provider_id)
+        : '';
+    const options = routingEnabled
+        ? smartAvailableImageResolutions(settings.provider_id, settings.model)
+        : fixedBananaResolution
+        ? [fixedBananaResolution]
+        : ((!prefix && settings.engine === 'api') ? ['auto','1k','2k','4k'] : ['1k','2k','4k']);
+    const currentRes = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model, settings.provider_id) : '1k');
     const currentRatio = settings[ratioKey] || 'square';
     const currentCustomRatio = settings[customRatioKey] || (currentRatio === 'source' ? sourceImageRatioLabel(prefix) : '');
-    const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
+    const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && smartImageModelSupportsAutoSize(settings.provider_id, settings.model, settings.resolution);
     const ratios = [
-        ['square','1:1','正方形'], ['portrait','2:3','竖图'], ['landscape','3:2','横图'], ['portrait43','3:4','竖图'], ['landscape43','4:3','横图'], ['portrait45','4:5','竖图'], ['landscape54','5:4','横图'],
-        ['story','9:16','竖屏'], ['wide','16:9','宽屏'], ['ultrawide','21:9','超宽'], ['ultratall','9:21','超竖'],
-        ...(includeSource ? [['source', sourceImageRatioLabel(prefix) || '原图', '适配输入']] : [])
+        ['square','1:1','正方形'], ['portrait14','1:4','超竖'], ['portrait18','1:8','极竖'], ['portrait','2:3','竖图'], ['landscape','3:2','横图'], ['portrait43','3:4','竖图'], ['landscape41','4:1','超宽'],
+        ['landscape43','4:3','横图'], ['portrait45','4:5','竖图'], ['landscape54','5:4','横图'], ['landscape81','8:1','极宽'], ['story','9:16','竖屏'], ['wide','16:9','宽屏'], ['ultrawide','21:9','超宽'],
+        ...(includeSource ? [
+            ['source', tr('canvas.adaptiveRatio') || '拉伸适配', sourceImageRatioLabel(prefix) || '匹配并拉伸参考图'],
+            ['adaptive', tr('canvas.autoRatio') || '自适应', '由模型决定']
+        ] : [])
     ];
     const wKey = prefix ? `${prefix}CustomWidth` : 'customWidth';
     const hKey = prefix ? `${prefix}CustomHeight` : 'customHeight';
-    return `<div class="smart-control size-picker-control ${scope === 'auto' ? 'auto-mode' : ''} ${scope === 'custom' ? 'custom-mode' : ''}">
+    const resolutionTitle = fixedBananaResolution
+        ? bananaModelResolutionTitle(settings.model, settings.provider_id)
+        : (routingEnabled ? (options.length ? '按分辨率切换真实模型' : '请先在 API 设置中配置分辨率模型') : '');
+    return `<div class="smart-control size-picker-control ${scope === 'auto' ? 'auto-mode' : ''} ${scope === 'custom' ? 'custom-mode' : ''} ${fixedBananaResolution ? 'fixed-resolution-mode' : ''} ${routingEnabled ? 'mapped-resolution-mode' : ''}" title="${escapeHtml(resolutionTitle)}">
         <button class="smart-pill size-picker-pill" type="button"><i data-lucide="scan-line"></i><span class="size-picker-label"><span class="size-picker-type">尺寸</span><span class="size-picker-dot"></span><span class="size-picker-value">${escapeHtml(sizePickerLabel(prefix))}</span></span></button>
         <div class="smart-popover size-picker-popover">
             <div class="size-picker-head">
-                <div class="smart-popover-title">尺寸选择</div>
+                <div class="smart-popover-title">${escapeHtml(resolutionTitle || '尺寸选择')}</div>
                 <div class="size-picker-scope">
-                    <button type="button" class="${scope === 'auto' ? 'active' : ''}" data-size-scope="auto" data-size-prefix="${escapeHtml(prefix)}" ${allowAuto ? '' : 'disabled'}>自动</button>
+                    ${routingEnabled ? '<button type="button" class="active" disabled>分辨率模型</button>' : fixedBananaResolution ? '<button type="button" class="active" disabled>固定参数</button>' : `<button type="button" class="${scope === 'auto' ? 'active' : ''}" data-size-scope="auto" data-size-prefix="${escapeHtml(prefix)}" ${allowAuto ? '' : 'disabled'}>自动</button>
                     <button type="button" class="${scope === 'preset' ? 'active' : ''}" data-size-scope="preset" data-size-prefix="${escapeHtml(prefix)}">系统参数</button>
-                    <button type="button" class="${scope === 'custom' ? 'active' : ''}" data-size-scope="custom" data-size-prefix="${escapeHtml(prefix)}">自定义</button>
+                    <button type="button" class="${scope === 'custom' ? 'active' : ''}" data-size-scope="custom" data-size-prefix="${escapeHtml(prefix)}">自定义</button>`}
                 </div>
             </div>
             ${scope === 'auto' ? `<div class="size-picker-pane size-picker-auto"><div class="size-picker-note"><strong>自动尺寸</strong><span>使用模型默认尺寸，或由支持自动尺寸的模型自行决定。</span></div></div>` : ''}
@@ -3706,7 +3842,7 @@ function renderSizePickerControl(prefix='', includeSource=false){
                     ${ratios.map(([value, label, sub]) => `<button type="button" class="size-picker-option ${value === currentRatio ? 'active' : ''}" data-smart-param="${ratioKey}" data-smart-value="${escapeHtml(value)}"><span>${escapeHtml(label)}</span><small>${escapeHtml(sub)}</small></button>`).join('')}
                 </div>
                 <div class="size-picker-list">
-                    ${options.filter(v => v !== 'auto').map(value => `<button type="button" class="size-picker-option ${value === currentRes ? 'active' : ''}" data-smart-param="${resKey}" data-smart-value="${value}"><span>${value.toUpperCase()}</span><small>${escapeHtml(apiImageSize(currentRatio, value, currentCustomRatio, '') || '')}</small></button>`).join('')}
+                    ${options.filter(v => v !== 'auto').map(value => `<button type="button" class="size-picker-option ${value === currentRes ? 'active' : ''}" data-smart-param="${resKey}" data-smart-value="${value}"><span>${value.toUpperCase()}</span><small>${escapeHtml(apiImageSize(currentRatio, value, currentCustomRatio, '') || '')}</small></button>`).join('') || `<div class="muted-note">未配置可用档位</div>`}
                 </div>
             </div>` : ''}
             ${scope === 'custom' ? `<div class="size-picker-pane size-picker-custom">
@@ -4405,6 +4541,35 @@ function smartComfyRandomValue(field){
 function setDynamicSetting(key, value){
     const numericKeys = new Set(['count','width','height','videoDuration','enhanceStrength','enhanceUpscaleRes','editUpscaleRes','customRatioWidth','customRatioHeight','customWidth','customHeight','msCustomRatioWidth','msCustomRatioHeight','msCustomWidth','msCustomHeight']);
     const layoutKeys = new Set(['provider_id','model','resolution','ratio','msgenModel','msCustomModel','msResolution','msRatio','videoProvider','videoModel','videoAspect','videoResolution','comfyMode','comfyWorkflow','quality','count','enhanceUpscaleRes','editUpscaleRes','jimengUpscaleRes','rhConfigKey','rhPayment','rhInstanceType']);
+    const routingEnabled = settings.engine === 'api' && settings.apiKind !== 'video'
+        && smartImageResolutionRoutingEnabled(settings.provider_id, settings.model);
+    const availableResolutions = routingEnabled ? smartAvailableImageResolutions(settings.provider_id, settings.model) : [];
+    const fixedBananaResolution = settings.engine === 'api' && settings.apiKind !== 'video'
+        ? effectiveSmartFixedImageResolution(settings.model, settings.provider_id)
+        : '';
+    const lockedSizeKey = new Set(['resolution','customSize','customWidth','customHeight']);
+    if(routingEnabled && lockedSizeKey.has(key) && !(key === 'resolution' && availableResolutions.includes(String(value || '').toLowerCase()))){
+        settings.resolution = availableResolutions[0] || '';
+        settings.customSize = '';
+        settings.customWidth = '';
+        settings.customHeight = '';
+        persistActiveSmartSettings();
+        rememberRecentSmartSettings(settings, activeSettingsSubject());
+        renderDynamicParams();
+        scheduleSave();
+        return;
+    }
+    if(fixedBananaResolution && lockedSizeKey.has(key)){
+        settings.resolution = fixedBananaResolution;
+        settings.customSize = '';
+        settings.customWidth = '';
+        settings.customHeight = '';
+        persistActiveSmartSettings();
+        rememberRecentSmartSettings(settings, activeSettingsSubject());
+        renderDynamicParams();
+        scheduleSave();
+        return;
+    }
     settings[key] = numericKeys.has(key) && value !== '' ? Number(value) : value;
     if(key === 'provider_id') settings.model = '';
     if(key === 'videoProvider') settings.videoModel = '';
@@ -4453,6 +4618,7 @@ function setDynamicSetting(key, value){
         settings.rhParams = {};
         settings.rhRandomActive = {};
     }
+    if(settings.engine === 'api') sanitizeSmartApiSelection(settings);
     persistActiveSmartSettings();
     rememberRecentSmartSettings(settings, activeSettingsSubject());
     if(layoutKeys.has(key)) renderDynamicParams();
@@ -4499,7 +4665,13 @@ function bindDynamicParams(){
             const scope = btn.dataset.sizeScope;
             const resKey = prefix ? `${prefix}Resolution` : 'resolution';
             const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
-            const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
+            const routingEnabled = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+                && smartImageResolutionRoutingEnabled(settings.provider_id, settings.model);
+            const fixedBananaResolution = !prefix && settings.engine === 'api' && settings.apiKind !== 'video'
+                ? effectiveSmartFixedImageResolution(settings.model, settings.provider_id)
+                : '';
+            if(routingEnabled || fixedBananaResolution) return;
+            const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && smartImageModelSupportsAutoSize(settings.provider_id, settings.model, settings.resolution);
             if(scope === 'auto'){
                 if(!allowAuto) return;
                 settings[resKey] = 'auto';
@@ -4677,13 +4849,14 @@ function bindDynamicParams(){
 }
 async function loadConfig(){
     try {
-        const cfg = await fetch('/api/config').then(r => r.json());
+        const refreshQuery = `_refresh=${Date.now()}`;
+        const cfg = await fetch(`/api/config?${refreshQuery}`, {cache:'no-store'}).then(r => r.json());
         apiProviders = Array.isArray(cfg.api_providers) ? cfg.api_providers : [];
         comfyInstanceCount = Math.max(1, (Array.isArray(cfg.comfy_instances) ? cfg.comfy_instances : []).filter(Boolean).length || 1);
         // 提供商配置已就绪即先渲染参数面板，避免等工作流/RunningHub 预取完成后参数才「突然刷新出来」。
         sanitizeSmartApiSelection(settings);
         updateProviderModels();
-        const wf = await fetch('/api/workflows').then(r => r.json()).catch(() => ({workflows:[]}));
+        const wf = await fetch(`/api/workflows?${refreshQuery}`, {cache:'no-store'}).then(r => r.json()).catch(() => ({workflows:[]}));
         comfyWorkflows = Array.isArray(wf.workflows) ? wf.workflows : [];
         runningHubWorkflowCache = {};
         const rhProvider = apiProviders.find(p => p.id === 'runninghub');
@@ -14341,8 +14514,9 @@ async function handleSmartImageDropPayload(payload, targetId='', opts={}){
     }
 }
 function sizeForRun(sourceSettings=settings){
-    const fallbackResolution = sourceSettings.engine === 'api' && isGptImageAutoSizeModel(sourceSettings.model)
-        ? defaultSmartApiResolution(sourceSettings.model)
+    if(sourceSettings.ratio === 'adaptive' && smartImageModelSupportsAutoSize(sourceSettings.provider_id, sourceSettings.model, sourceSettings.resolution)) return 'auto';
+    const fallbackResolution = sourceSettings.engine === 'api' && smartImageModelSupportsAutoSize(sourceSettings.provider_id, sourceSettings.model, sourceSettings.resolution)
+        ? defaultSmartApiResolution(sourceSettings.model, sourceSettings.provider_id)
         : '1k';
     return apiImageSize(sourceSettings.ratio || 'square', sourceSettings.resolution || fallbackResolution, sourceSettings.customRatio || '', sourceSettings.customSize || '') || '1024x1024';
 }
@@ -17046,17 +17220,25 @@ async function runApiGeneration(prompt, refs, runSettings=settings){
     const referenceImages = imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX).map(ref => (
         adaptiveRatio ? {...ref, stretch_aspect_ratio:adaptiveRatio} : ref
     ));
+    const requestAspectRatio = ADAPTIVE_RATIO_TOOLS?.aspectRatioForRequest
+        ? ADAPTIVE_RATIO_TOOLS.aspectRatioForRequest(
+            runSettings.ratio || 'square',
+            API_RATIO_VALUES[runSettings.ratio] || '',
+            runSettings.customRatio || '',
+            adaptiveRatio,
+        )
+        : (runSettings.ratio === 'adaptive' ? undefined : (adaptiveRatio || API_RATIO_VALUES[runSettings.ratio] || (runSettings.ratio === 'custom' ? String(runSettings.customRatio || '').trim() : '')));
     const payload = {
         prompt,
         provider_id:runSettings.provider_id,
         model:runSettings.model,
         size:sizeForRun(requestSettings),
-        aspect_ratio:adaptiveRatio || API_RATIO_VALUES[runSettings.ratio] || (runSettings.ratio === 'custom' ? String(runSettings.customRatio || '').trim() : ''),
         resolution:['1k','2k','4k'].includes(runSettings.resolution) ? runSettings.resolution : '',
         quality:runSettings.quality || 'auto',
         n:1,
         reference_images:referenceImages
     };
+    if(requestAspectRatio !== undefined) payload.aspect_ratio = requestAspectRatio;
     const tasks = await Promise.all(Array.from({length:count}, () => fetch('/api/canvas-image-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(async r => {
         if(!r.ok) throw new Error(await r.text());
         return r.json();

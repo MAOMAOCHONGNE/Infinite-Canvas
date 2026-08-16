@@ -21,7 +21,7 @@
     <script src="/static/js/theme.js?v=2026.08.12-custom.2.1785863206"></script>
     <script src="/static/js/i18n.js?v=2026.08.12-custom.2.1786671034"></script>
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.12-custom.2.1785863189">
-    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.08.12-custom.2.1786187283">
+    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.08.12-custom.2.1786863479">
 </head>
 <body>
     <div class="page">
@@ -297,6 +297,9 @@
                             <span class="rh-transfer-actions">
                                 <button class="action-btn" type="button" onclick="importRunningHubConfig()"><i data-lucide="upload" class="w-3.5 h-3.5"></i><span>导入</span></button>
                                 <button class="action-btn" type="button" onclick="exportRunningHubConfig()"><i data-lucide="download" class="w-3.5 h-3.5"></i><span>导出全部</span></button>
+                                <button id="rhRecycleBinBtn" class="action-btn rh-recycle-trigger" type="button" onclick="openRhRecycleBin()">
+                                    <i data-lucide="trash-2" class="w-3.5 h-3.5"></i><span>回收站</span><span id="rhRecycleBinCount" class="rh-recycle-count" hidden>0</span>
+                                </button>
                             </span>
                         </div>
                         <div class="rh-paste-row">
@@ -570,8 +573,35 @@
         </div>
     </div>
 
+    <div id="rhRecycleBinOverlay" class="rh-recycle-overlay" onclick="if(event.target===this) closeRhRecycleBin()">
+        <div class="rh-recycle-modal" role="dialog" aria-modal="true" aria-labelledby="rhRecycleBinTitle">
+            <div class="rh-recycle-head">
+                <div>
+                    <div id="rhRecycleBinTitle" class="rh-recycle-title">回收站</div>
+                    <div class="rh-recycle-sub">已删除的应用和工作流可恢复；彻底删除后不会出现在普通备份中。</div>
+                </div>
+                <button class="rh-workflow-editor-close" type="button" onclick="closeRhRecycleBin()" title="关闭"><i data-lucide="x" class="w-4 h-4"></i></button>
+            </div>
+            <div class="rh-recycle-body">
+                <section class="rh-recycle-section">
+                    <div class="rh-recycle-section-head"><span>AI 应用</span><b id="rhRecycleAppsCount">0</b></div>
+                    <div id="rhRecycleAppsList" class="rh-recycle-list"></div>
+                </section>
+                <section class="rh-recycle-section">
+                    <div class="rh-recycle-section-head"><span>工作流</span><b id="rhRecycleWorkflowsCount">0</b></div>
+                    <div id="rhRecycleWorkflowsList" class="rh-recycle-list"></div>
+                </section>
+            </div>
+            <div class="rh-recycle-foot">
+                <span>普通备份默认不包含这里的内容</span>
+                <button id="rhRecycleClearBtn" class="action-btn danger-btn" type="button" onclick="clearRhRecycleBin()"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i><span>清空回收站</span></button>
+            </div>
+        </div>
+    </div>
+
     <script src="/static/js/runninghub-config-transfer.js?v=2026.08.12-custom.2.1786187495"></script>
-    <script src="/static/js/api-settings.js?v=2026.08.12-custom.2.1786187283"></script>
+    <script src="/static/js/model-config.js?v=2026.08.12-custom.2.1786809997"></script>
+    <script src="/static/js/api-settings.js?v=2026.08.12-custom.2.1786897144"></script>
     <script src="/static/js/global-prompt-library.js?v=2026.08.12-custom.2.1786676777"></script>
 </body>
 </html>

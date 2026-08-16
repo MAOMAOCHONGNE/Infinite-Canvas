@@ -4,8 +4,8 @@
     if(root) root.AdaptiveImageRatio = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function(){
     const SUPPORTED_RATIOS = Object.freeze([
-        '1:1', '2:3', '3:2', '3:4', '4:3',
-        '4:5', '5:4', '9:16', '16:9', '21:9'
+        '1:1', '1:4', '1:8', '2:3', '3:2', '3:4', '4:1',
+        '4:3', '4:5', '5:4', '8:1', '9:16', '16:9', '21:9'
     ]);
     const RES_LONG_SIDE = Object.freeze({ '1k':1536, '2k':2048, '4k':3840 });
     const RES_PIXEL_LIMIT = Object.freeze({ '1k':1572864, '2k':4194304, '4k':8294400 });
@@ -25,6 +25,15 @@
         if(!(width > 0 && height > 0)) return null;
         const divisor = gcd(width, height);
         return {width:width / divisor, height:height / divisor};
+    }
+
+    function canonicalRatioParts(value){
+        const parts = String(value || '').trim().split(':');
+        if(parts.length !== 2) return null;
+        const width = Number(parts[0]);
+        const height = Number(parts[1]);
+        if(!(width > 0 && height > 0)) return null;
+        return {width, height};
     }
 
     function closestSupportedRatio(width, height, candidates=SUPPORTED_RATIOS){
@@ -76,12 +85,23 @@
         return `${parts.width * snappedScale}x${parts.height * snappedScale}`;
     }
 
+    function aspectRatioForRequest(mode, presetRatio='', customRatio='', stretchedRatio=''){
+        if(String(mode || '') === 'adaptive') return undefined;
+        const stretched = String(stretchedRatio || '').trim();
+        if(stretched) return stretched;
+        const preset = String(presetRatio || '').trim();
+        if(preset) return preset;
+        return String(mode || '') === 'custom' ? String(customRatio || '').trim() : '';
+    }
+
     return {
         SUPPORTED_RATIOS,
         ratioParts,
+        canonicalRatioParts,
         closestSupportedRatio,
         closestSupportedRatioValue,
         stretchedDimensions,
-        pixelSizeForRatio
+        pixelSizeForRatio,
+        aspectRatioForRequest
     };
 });

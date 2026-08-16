@@ -74,6 +74,7 @@ function loadCanvasOriginalImageDimensions(url){
         img.src = src;
     });
 }
+const canvasOutputImageDimensionRequests = new Map();
 function canvasVideoPreviewHtml(url, size=512, attrs=''){
     const original = canvasOriginalMediaUrl(url);
     const preview = canvasMediaPreviewUrl(original, size);
@@ -569,11 +570,15 @@ function renderCanvasIcon(icon, size = 14) {
 const ADAPTIVE_RATIO_TOOLS = window.AdaptiveImageRatio || null;
 const SIZE_MAP = {
     square: { '1k':'1024x1024', '2k':'2048x2048', '4k':'4096x4096' },
+    portrait14: { '1k':'384x1536', '2k':'512x2048', '4k':'960x3840' },
+    portrait18: { '1k':'192x1536', '2k':'256x2048', '4k':'480x3840' },
     portrait: { '1k':'1024x1536', '2k':'1360x2048', '4k':'2352x3520' },
     portrait43: { '1k':'1008x1344', '2k':'1536x2048', '4k':'2448x3264' },
     landscape43: { '1k':'1344x1008', '2k':'2048x1536', '4k':'3264x2448' },
     portrait45: { '1k':'1024x1280', '2k':'1600x2000', '4k':'2560x3200' },
     landscape54: { '1k':'1280x1024', '2k':'2000x1600', '4k':'3200x2560' },
+    landscape41: { '1k':'1536x384', '2k':'2048x512', '4k':'3840x960' },
+    landscape81: { '1k':'1536x192', '2k':'2048x256', '4k':'3840x480' },
     landscape: { '1k':'1536x1024', '2k':'2048x1360', '4k':'3520x2352' },
     story: { '1k':'720x1280', '2k':'1152x2048', '4k':'2160x3840' },
     wide: { '1k':'1280x720', '2k':'2048x1152', '4k':'3840x2160' },
@@ -582,12 +587,16 @@ const SIZE_MAP = {
 };
 const API_RATIO_VALUES = {
     square:'1:1',
+    portrait14:'1:4',
+    portrait18:'1:8',
     portrait:'2:3',
     landscape:'3:2',
     portrait43:'3:4',
     landscape43:'4:3',
     portrait45:'4:5',
     landscape54:'5:4',
+    landscape41:'4:1',
+    landscape81:'8:1',
     story:'9:16',
     wide:'16:9',
     ultrawide:'21:9',
@@ -750,6 +759,21 @@ function midjourneyProviderOptions(selectedId){
 function providerById(id){
     return (apiProviders.length ? apiProviders : defaultApiProviders()).find(p => p.id === id) || imageApiProviders()[0] || defaultApiProviders()[0];
 }
+function providerForConfiguredModel(providerId, model, kind='image'){
+    const key = kind === 'video' ? 'video_models' : kind === 'chat' ? 'chat_models' : 'image_models';
+    return apiProviders.find(provider => provider.id === providerId)
+        || apiProviders.find(provider => (provider?.[key] || []).includes(model))
+        || null;
+}
+function providerModelDisplayName(providerId, model, kind='image'){
+    return ModelConfigTools.displayName(providerForConfiguredModel(providerId, model, kind), model);
+}
+function imageResolutionRoutingEnabled(providerId, model){
+    return ModelConfigTools.resolutionRoutingEnabled(providerForConfiguredModel(providerId, model, 'image'), resolveImageModel(model));
+}
+function availableImageResolutions(providerId, model){
+    return ModelConfigTools.availableResolutions(providerForConfiguredModel(providerId, model, 'image'), resolveImageModel(model));
+}
 function resolveProviderId(id){
     return providerById(id)?.id || 'comfly';
 }
@@ -823,7 +847,7 @@ function videoModelOptions(selectedModel, providerId){
         return `<option value="" disabled selected>${tr('canvas.noModelsHint') || '暂无模型，请到 API 设置添加'}</option>`;
     }
     const selected = selectedModel || models[0];
-    return uniqueModels([selected, ...models]).filter(Boolean).map(model => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    return uniqueModels([selected, ...models]).filter(Boolean).map(model => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(providerModelDisplayName(providerId, model, 'video'))}</option>`).join('');
 }
 function allImageModels(providerId){
     const providerModels = providerImageModels(providerId || managedProviderId);
@@ -840,7 +864,7 @@ function modelscopeImageModels(selected = ''){
 }
 function modelscopeImageModelOptions(selectedModel){
     const selectedValue = selectedModel || modelscopeImageModels()[0] || 'Tongyi-MAI/Z-Image-Turbo';
-    return modelscopeImageModels(selectedValue).map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    return modelscopeImageModels(selectedValue).map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(providerModelDisplayName('modelscope', model, 'image'))}</option>`).join('');
 }
 function currentMsModelId(modelKey, node){
     if(modelKey === 'custom') return node.msCustomModel || modelscopeImageModels()[0] || 'Tongyi-MAI/Z-Image-Turbo';
@@ -883,11 +907,37 @@ function isGptImageAutoSizeModel(model){
         || compact.startsWith('gptimage2')
         || compact.endsWith('gptimage2');
 }
-function defaultApiImageResolution(model){
-    return isGptImageAutoSizeModel(resolveImageModel(model)) ? '4k' : '1k';
+function imageModelSupportsAutoSize(providerId, model, resolution=''){
+    const logicalModel = resolveImageModel(model);
+    if(typeof ModelConfigTools !== 'undefined' && typeof ModelConfigTools.imageModelSupportsAutoSize === 'function' && typeof providerForConfiguredModel === 'function'){
+        const provider = providerForConfiguredModel(providerId, logicalModel, 'image');
+        const effectiveModel = ModelConfigTools.effectiveModel(provider, logicalModel, resolution) || logicalModel;
+        return ModelConfigTools.imageModelSupportsAutoSize(provider, logicalModel, effectiveModel);
+    }
+    return isGptImageAutoSizeModel(logicalModel);
 }
-function defaultClassicApiGeneratorResolution(model){
-    return isGptImageAutoSizeModel(resolveImageModel(model)) ? '2k' : defaultApiImageResolution(model);
+function bananaModelFixedResolution(model){
+    const raw = String(model || '').trim().toLowerCase();
+    const normalized = raw.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    const isBanana = normalized.startsWith('nano-banana') || normalized.startsWith('gemini-3-1-flash-image-preview');
+    if(!isBanana) return '';
+    const match = normalized.match(/(?:^|-)(1k|2k|4k)$/);
+    return match ? match[1] : '';
+}
+function effectiveFixedImageResolution(providerId, model){
+    return imageResolutionRoutingEnabled(providerId, model) ? '' : bananaModelFixedResolution(resolveImageModel(model));
+}
+function bananaModelResolutionTitle(model, providerId=''){
+    const fixed = effectiveFixedImageResolution(providerId, model);
+    return fixed ? `该模型固定输出 ${fixed.toUpperCase()}，画布分辨率选择已锁定` : '';
+}
+function defaultApiImageResolution(model, providerId=''){
+    if(imageResolutionRoutingEnabled(providerId, model)) return availableImageResolutions(providerId, model)[0] || '';
+    return effectiveFixedImageResolution(providerId, model) || (imageModelSupportsAutoSize(providerId, model) ? '4k' : '1k');
+}
+function defaultClassicApiGeneratorResolution(model, providerId=''){
+    if(imageResolutionRoutingEnabled(providerId, model)) return availableImageResolutions(providerId, model)[0] || '';
+    return effectiveFixedImageResolution(providerId, model) || (imageModelSupportsAutoSize(providerId, model) ? '2k' : defaultApiImageResolution(model, providerId));
 }
 function classicApiQualityOptionsHtml(){
     return `
@@ -1136,9 +1186,25 @@ function exceedsFourKStandard(width, height){
 }
 function normalizeApiNodeSizeChoice(node){
     if(!node) return;
-    const allowAuto = isGptImageAutoSizeModel(resolveImageModel(node.model));
-    if(allowAuto && node._apiResolutionUserSet !== true && (!node.resolution || node.resolution === '1k' || node.resolution === 'auto')) node.resolution = defaultApiImageResolution(node.model);
-    else if(!node.resolution) node.resolution = defaultApiImageResolution(node.model);
+    if(imageResolutionRoutingEnabled(node.apiProvider, node.model)){
+        const available = availableImageResolutions(node.apiProvider, node.model);
+        if(!available.includes(String(node.resolution || '').toLowerCase())) node.resolution = available[0] || '';
+        node.customSize = '';
+        node.customWidth = '';
+        node.customHeight = '';
+        return;
+    }
+    const fixedBananaResolution = effectiveFixedImageResolution(node.apiProvider, node.model);
+    if(fixedBananaResolution){
+        node.resolution = fixedBananaResolution;
+        node.customSize = '';
+        node.customWidth = '';
+        node.customHeight = '';
+        return;
+    }
+    const allowAuto = imageModelSupportsAutoSize(node.apiProvider, node.model, node.resolution);
+    if(allowAuto && node._apiResolutionUserSet !== true && (!node.resolution || node.resolution === '1k' || node.resolution === 'auto')) node.resolution = defaultApiImageResolution(node.model, node.apiProvider);
+    else if(!node.resolution) node.resolution = defaultApiImageResolution(node.model, node.apiProvider);
     if(!allowAuto && node.resolution === 'auto') node.resolution = '1k';
 }
 async function generatorSizeForRun(gen, refs){
@@ -1148,17 +1214,18 @@ async function generatorSizeForRun(gen, refs){
             try {
                 const dims = await getImageDimensions(ref.url);
                 const matchedRatio = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(dims.width, dims.height) || '';
-                const parts = ADAPTIVE_RATIO_TOOLS?.ratioParts(matchedRatio) || ratioPartsFromDimensions(dims.width, dims.height);
+                const parts = ADAPTIVE_RATIO_TOOLS?.canonicalRatioParts(matchedRatio) || ratioPartsFromDimensions(dims.width, dims.height);
                 gen.customRatioWidth = String(parts.width);
                 gen.customRatioHeight = String(parts.height);
                 gen.customRatio = `${parts.width}:${parts.height}`;
             } catch(_) {}
         }
     }
+    if(gen.ratio === 'adaptive' && imageModelSupportsAutoSize(gen.apiProvider, gen.model, gen.resolution)) return 'auto';
     const ratio = (gen.ratio === 'source' && !gen.customRatio)
         ? 'square'
         : (gen.ratio ?? 'square');
-    return apiImageSize(ratio, gen.resolution || defaultApiImageResolution(gen.model), gen.customRatio || '', gen.customSize || '');
+    return apiImageSize(ratio, gen.resolution || defaultApiImageResolution(gen.model, gen.apiProvider), gen.customRatio || '', gen.customSize || '');
 }
 function adaptiveRatioForGeneratorRun(gen){
     if(gen?.ratio !== 'source' || ['auto','custom'].includes(String(gen.resolution || '').toLowerCase())) return '';
@@ -1170,10 +1237,18 @@ async function prepareGeneratorImageRequest(gen, refs){
     const referenceImages = refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX).map(ref => (
         adaptiveRatio ? {...ref, stretch_aspect_ratio:adaptiveRatio} : ref
     ));
+    const aspectRatio = ADAPTIVE_RATIO_TOOLS?.aspectRatioForRequest
+        ? ADAPTIVE_RATIO_TOOLS.aspectRatioForRequest(
+            gen.ratio || 'square',
+            API_RATIO_VALUES[gen.ratio] || '',
+            gen.customRatio || '',
+            adaptiveRatio,
+        )
+        : (gen.ratio === 'adaptive' ? undefined : (adaptiveRatio || API_RATIO_VALUES[gen.ratio] || (gen.ratio === 'custom' ? String(gen.customRatio || '').trim() : '')));
     return {
         size,
         adaptiveRatio,
-        aspectRatio:adaptiveRatio || API_RATIO_VALUES[gen.ratio] || (gen.ratio === 'custom' ? String(gen.customRatio || '').trim() : ''),
+        aspectRatio,
         referenceImages
     };
 }
@@ -1190,9 +1265,9 @@ function imageModelOptions(selectedModel, providerId){
         return `<option value="" disabled selected>${tr('canvas.noImageModelsHint') || '暂无生图模型，请到 API 设置添加'}</option>`;
     }
     const selectedValue = resolveImageModel(selectedModel);
-    const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(providerModelDisplayName(providerId, model, 'image'))}</option>`).join('');
     const hasSelected = models.includes(selectedValue);
-    return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`}${options}`;
+    return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(providerModelDisplayName(providerId, selectedValue, 'image'))}</option>`}${options}`;
 }
 function chatModelOptions(selectedModel, providerId=''){
     const models = providerId ? providerChatModels(providerId) : allChatModels();
@@ -1200,9 +1275,9 @@ function chatModelOptions(selectedModel, providerId=''){
         return `<option value="" disabled selected>${tr('canvas.noModelsHint') || '暂无模型，请到 API 设置添加'}</option>`;
     }
     const selectedValue = resolveChatModel(selectedModel, providerId);
-    const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(providerModelDisplayName(providerId, model, 'chat'))}</option>`).join('');
     const hasSelected = models.includes(selectedValue);
-    return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`}${options}`;
+    return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(providerModelDisplayName(providerId, selectedValue, 'chat'))}</option>`}${options}`;
 }
 function formatCanvasTime(value){
     if(!value) return '--';
@@ -1779,7 +1854,8 @@ async function saveCanvas(){
 async function loadConfig(){
     loadLocalModelLists();
     try {
-        const cfg = await fetch('/api/config').then(r=>r.json());
+        const refreshQuery = `_refresh=${Date.now()}`;
+        const cfg = await fetch(`/api/config?${refreshQuery}`, {cache:'no-store'}).then(r=>r.json());
         imageModels = cfg.image_models?.length ? cfg.image_models : imageModels;
         chatModels = cfg.chat_models?.length ? cfg.chat_models : chatModels;
         videoModels = cfg.video_models?.length ? cfg.video_models : DEFAULT_VIDEO_MODELS;
@@ -1789,7 +1865,7 @@ async function loadConfig(){
         models.nano = imageModels.find(m => m.toLowerCase().includes('nano')) || 'nano-banana-pro';
         models.gpt = imageModels.find(m => !m.toLowerCase().includes('nano')) || cfg.image_model || 'gpt-image-2';
         try {
-            const wf = await fetch('/api/workflows').then(r=>r.json());
+            const wf = await fetch(`/api/workflows?${refreshQuery}`, {cache:'no-store'}).then(r=>r.json());
             comfyWorkflows = wf.workflows || [];
         } catch(_) {
             comfyWorkflows = [];
@@ -2884,7 +2960,7 @@ function addGeneratorNode(point){
     const p = point || defaultPoint(120, 0);
     const providerId = imageApiProviders()[0]?.id || '';
     const model = allImageModels(providerId)[0] || '';
-    return addNode({id:uid('gen'), type:'generator', x:p.x, y:p.y, apiProvider:providerId, model, ratio:'square', resolution:defaultClassicApiGeneratorResolution(model), quality:'auto', count:1, localPrompt:'', customRatio:'', customSize:'', customRatioWidth:'', customRatioHeight:'', customWidth:'', customHeight:'', inputs:[]});
+    return addNode({id:uid('gen'), type:'generator', x:p.x, y:p.y, apiProvider:providerId, model, ratio:'square', resolution:defaultClassicApiGeneratorResolution(model, providerId), quality:'auto', count:1, localPrompt:'', customRatio:'', customSize:'', customRatioWidth:'', customRatioHeight:'', customWidth:'', customHeight:'', inputs:[]});
 }
 function addMidjourneyNode(point){
     const p = point || defaultPoint(140, 0);
@@ -6501,6 +6577,31 @@ function restoreMediaPlaybackStates(states){
         restoreMediaPlaybackState(media, states.get(`${tag}:${url}`));
     });
 }
+function canvasImageResolutionLabel(node){
+    const w = Number(node?.natural_w || 0);
+    const h = Number(node?.natural_h || 0);
+    return w > 0 && h > 0 ? `${Math.round(w)} x ${Math.round(h)}` : '';
+}
+function canvasImageResolutionBadgeHtml(node){
+    const label = canvasImageResolutionLabel(node);
+    return label ? `<span class="canvas-image-resolution-badge">${escapeHtml(label)}</span>` : '';
+}
+function updateCanvasImageResolutionBadge(nodeEl, node){
+    const previewWrap = nodeEl?.querySelector?.('.image-preview-wrap');
+    if(!previewWrap) return;
+    const label = canvasImageResolutionLabel(node);
+    let badge = previewWrap.querySelector('.canvas-image-resolution-badge');
+    if(!label){
+        badge?.remove();
+        return;
+    }
+    if(!badge){
+        badge = document.createElement('span');
+        badge.className = 'canvas-image-resolution-badge';
+        previewWrap.appendChild(badge);
+    }
+    badge.textContent = label;
+}
 function measureCanvasOriginalImageNodes(root=nodesEl){
     root.querySelectorAll?.('.image-node img[data-original-src]').forEach(imgEl => {
         if(imgEl.dataset.previewKind === 'video') return;
@@ -6515,6 +6616,7 @@ function measureCanvasOriginalImageNodes(root=nodesEl){
             if(!size || node.natural_w || node.natural_h) return;
             node.natural_w = size.w;
             node.natural_h = size.h;
+            updateCanvasImageResolutionBadge(nodeEl, node);
             scheduleSave();
         });
     });
@@ -6826,7 +6928,7 @@ function renderNode(node){
             const missing = isMissingAssetUrl(node.url);
             const mediaKind = mediaKindForNode(node);
             const isEditableImage = mediaKind === 'image' && !missing;
-            body.innerHTML = `<div class="image-preview-wrap">${missing ? missingAssetHtml(node.url) : canvasPreviewImgHtml(node.url, 768, 'draggable="true"')}</div><div class="image-caption text-[11px] text-gray-400 truncate">${escapeHtml(node.name || 'image')}${missing ? ` · ${langIsEn() ? 'missing' : '文件缺失'}` : ''}</div>`;
+            body.innerHTML = `<div class="image-preview-wrap">${missing ? missingAssetHtml(node.url) : canvasPreviewImgHtml(node.url, 768, 'draggable="true"')}${isEditableImage ? canvasImageResolutionBadgeHtml(node) : ''}</div><div class="image-caption text-[11px] text-gray-400 truncate">${escapeHtml(node.name || 'image')}${missing ? ` · ${langIsEn() ? 'missing' : '文件缺失'}` : ''}</div>`;
             if(!missing && mediaKind !== 'image'){
                 const mediaHtml = mediaKind === 'video'
                     ? `<div class="media-card video-card">${canvasVideoPreviewHtml(node.url, 768, 'draggable="false" data-video-fallback-attrs="controls"')}<button class="canvas-video-play" type="button" title="播放"><i data-lucide="play"></i></button></div>`
@@ -7133,6 +7235,77 @@ function bindCanvasAssetSaveDragSource(element, source){
     });
     element.addEventListener('dragend', () => setTimeout(() => { delete element.dataset.dragging; }, 0));
 }
+function outputImageResolutionSize(item){
+    const meta = item && typeof item === 'object' ? item : {};
+    return normalizedPendingPreviewSize({
+        w:meta.natural_w ?? meta.w ?? meta.width,
+        h:meta.natural_h ?? meta.h ?? meta.height,
+    });
+}
+function outputImageResolutionLabel(item){
+    const size = outputImageResolutionSize(item);
+    return size ? `${size.w} x ${size.h}` : '';
+}
+function outputImageResolutionBadgeHtml(item){
+    const label = outputImageResolutionLabel(item);
+    return label ? `<span class="canvas-image-resolution-badge output-image-resolution-badge">${escapeHtml(label)}</span>` : '';
+}
+function updateOutputImageResolutionBadge(wrap, size){
+    if(!wrap || !size) return;
+    let badge = wrap.querySelector('.output-image-resolution-badge');
+    if(!badge){
+        badge = document.createElement('span');
+        badge.className = 'canvas-image-resolution-badge output-image-resolution-badge';
+        wrap.appendChild(badge);
+    }
+    badge.textContent = `${size.w} x ${size.h}`;
+}
+function cacheOutputImageResolution(node, url, size){
+    if(!node || !url || !size) return false;
+    let changed = false;
+    node.images = (node.images || []).map(item => {
+        if(outputUrlValue(item) !== url) return item;
+        const current = item && typeof item === 'object' ? item : {url};
+        if(Number(current.natural_w) === size.w && Number(current.natural_h) === size.h) return current;
+        changed = true;
+        return {...current, natural_w:size.w, natural_h:size.h};
+    });
+    if(changed) scheduleSave();
+    return changed;
+}
+async function ensureOutputImageResolution(wrap, node){
+    const img = wrap?.querySelector?.('img:not([data-preview-kind="video"])');
+    const url = img?.dataset.originalSrc || img?.dataset.url || wrap?.dataset.outputUrl || '';
+    if(!img || !url || wrap.dataset.resolutionLoading === '1') return;
+    const item = (node?.images || []).find(entry => outputUrlValue(entry) === url);
+    const savedSize = outputImageResolutionSize(item);
+    if(savedSize){
+        updateOutputImageResolutionBadge(wrap, savedSize);
+        return;
+    }
+    const loadedSize = !isCanvasPreviewImage(img)
+        ? normalizedPendingPreviewSize({w:img.naturalWidth, h:img.naturalHeight})
+        : null;
+    if(loadedSize){
+        cacheOutputImageResolution(node, url, loadedSize);
+        updateOutputImageResolutionBadge(wrap, loadedSize);
+        return;
+    }
+    wrap.dataset.resolutionLoading = '1';
+    let request = canvasOutputImageDimensionRequests.get(url);
+    if(!request){
+        request = loadCanvasOriginalImageDimensions(url).finally(() => canvasOutputImageDimensionRequests.delete(url));
+        canvasOutputImageDimensionRequests.set(url, request);
+    }
+    try {
+        const size = await request;
+        if(!size) return;
+        cacheOutputImageResolution(node, url, size);
+        updateOutputImageResolutionBadge(wrap, size);
+    } finally {
+        delete wrap.dataset.resolutionLoading;
+    }
+}
 function bindOutputWrap(wrap, node){
     const img = wrap.querySelector('img');
     const video = wrap.querySelector('video');
@@ -7153,14 +7326,19 @@ function bindOutputWrap(wrap, node){
     };
     wrap.ondragend = () => setTimeout(() => { delete wrap.dataset.dragging; }, 0);
     if(img){
+        if(img.dataset.previewKind !== 'video') wrap.addEventListener('mouseenter', () => ensureOutputImageResolution(wrap, node), {passive:true});
         img.draggable = true;
         img.ondragstart = e => {
             e.stopPropagation();
             img.dataset.dragging = '1';
+            wrap.dataset.dragging = '1';
             setOutputDragPreview(e, img);
             setCanvasAssetSaveDragData(e.dataTransfer, {url:img.dataset.url, name:outputImageName(img.dataset.url), kind:'output', legacyOutput:true});
         };
-        img.ondragend = () => setTimeout(() => { delete img.dataset.dragging; }, 0);
+        img.ondragend = () => setTimeout(() => {
+            delete img.dataset.dragging;
+            delete wrap.dataset.dragging;
+        }, 0);
         img.onclick = e => {
             e.stopPropagation();
             if(img.dataset.dragging || wrap.dataset.dragging) return;
@@ -10438,17 +10616,21 @@ function renderGeneratorBody(node){
                 </select>
                 <select class="select-lite ratio compact-select" data-field="ratio">
                     <option value="square">1:1</option>
+                    <option value="portrait14">1:4</option>
+                    <option value="portrait18">1:8</option>
                     <option value="portrait">2:3</option>
                     <option value="landscape">3:2</option>
                     <option value="portrait43">3:4</option>
+                    <option value="landscape41">4:1</option>
                     <option value="landscape43">4:3</option>
                     <option value="portrait45">4:5</option>
                     <option value="landscape54">5:4</option>
+                    <option value="landscape81">8:1</option>
                     <option value="story">9:16</option>
                     <option value="wide">16:9</option>
                     <option value="ultrawide">21:9</option>
-                    <option value="ultratall">9:21</option>
                     <option value="source">${tr('canvas.adaptiveRatio')}</option>
+                    <option value="adaptive">${tr('canvas.autoRatio')}</option>
                     <option value="custom">${tr('canvas.custom')}</option>
                 </select>
                 <select class="select-lite quality-select">
@@ -10512,7 +10694,7 @@ function renderGeneratorBody(node){
         const providerModels = providerImageModels(node.apiProvider);
         if(!providerModels.includes(resolveImageModel(node.model))) node.model = providerModels[0] || '';
         node._apiResolutionUserSet = false;
-        node.resolution = defaultClassicApiGeneratorResolution(node.model);
+        node.resolution = defaultClassicApiGeneratorResolution(node.model, node.apiProvider);
         modelSelect.innerHTML = imageModelOptions(node.model, node.apiProvider);
         syncSizeControls();
         syncQualityControls();
@@ -10524,7 +10706,7 @@ function renderGeneratorBody(node){
         e.stopPropagation();
         node.model = e.target.value;
         node._apiResolutionUserSet = false;
-        if(node.resolution !== 'custom') node.resolution = defaultClassicApiGeneratorResolution(node.model);
+        if(node.resolution !== 'custom') node.resolution = defaultClassicApiGeneratorResolution(node.model, node.apiProvider);
         syncSizeControls();
         syncQualityControls();
         scheduleSave();
@@ -10578,7 +10760,7 @@ function renderGeneratorBody(node){
             const dims = await getImageDimensions(ref.url);
             if(requestId !== sourceRatioRequest || node.ratio !== 'source') return;
             const matchedRatio = ADAPTIVE_RATIO_TOOLS?.closestSupportedRatio(dims.width, dims.height) || '';
-            const parts = ADAPTIVE_RATIO_TOOLS?.ratioParts(matchedRatio) || ratioPartsFromDimensions(dims.width, dims.height);
+            const parts = ADAPTIVE_RATIO_TOOLS?.canonicalRatioParts(matchedRatio) || ratioPartsFromDimensions(dims.width, dims.height);
             node.customRatioWidth = String(parts.width);
             node.customRatioHeight = String(parts.height);
             node.customRatio = `${parts.width}:${parts.height}`;
@@ -10589,8 +10771,36 @@ function renderGeneratorBody(node){
     };
     const syncSizeControls = () => {
         normalizeApiNodeSizeChoice(node);
+        const routingEnabled = imageResolutionRoutingEnabled(node.apiProvider, node.model);
+        const availableResolutions = routingEnabled ? availableImageResolutions(node.apiProvider, node.model) : ['1k','2k','4k'];
+        const fixedBananaResolution = effectiveFixedImageResolution(node.apiProvider, node.model);
+        let missingOption = resolutionSelect.querySelector('option[data-resolution-unconfigured]');
+        if(routingEnabled && !availableResolutions.length){
+            if(!missingOption){
+                missingOption = document.createElement('option');
+                missingOption.value = '';
+                missingOption.dataset.resolutionUnconfigured = 'true';
+                missingOption.textContent = '未配置分辨率模型';
+                resolutionSelect.prepend(missingOption);
+            }
+        } else {
+            missingOption?.remove();
+        }
+        const allowAuto = imageModelSupportsAutoSize(node.apiProvider, node.model, node.resolution);
         const autoOption = resolutionSelect.querySelector('option[value="auto"]');
-        if(autoOption) autoOption.disabled = !isGptImageAutoSizeModel(resolveImageModel(node.model));
+        if(autoOption) autoOption.disabled = !allowAuto;
+        [...resolutionSelect.options].forEach(option => {
+            const isFixedOption = Boolean(fixedBananaResolution) && option.value !== fixedBananaResolution;
+            const isUnconfiguredRoutingOption = routingEnabled && option.value !== '' && !availableResolutions.includes(option.value);
+            option.disabled = isFixedOption || isUnconfiguredRoutingOption || (option.value === 'auto' && !allowAuto);
+            option.title = isFixedOption
+                ? bananaModelResolutionTitle(node.model, node.apiProvider)
+                : (isUnconfiguredRoutingOption ? '该分辨率尚未配置真实模型' : '');
+        });
+        resolutionSelect.disabled = Boolean(fixedBananaResolution) || (routingEnabled && availableResolutions.length <= 1);
+        resolutionSelect.title = fixedBananaResolution
+            ? bananaModelResolutionTitle(node.model, node.apiProvider)
+            : (routingEnabled ? (availableResolutions.length ? '当前分辨率将切换到对应真实模型' : '请先在 API 设置中配置分辨率模型') : '');
         const squareOption = ratioSelect.querySelector('option[value="square"]');
         if(squareOption){
             squareOption.disabled = false;
@@ -10598,7 +10808,7 @@ function renderGeneratorBody(node){
         }
         const ratioValue = node.ratio && [...ratioSelect.options].some(opt => opt.value === node.ratio) ? node.ratio : 'square';
         ratioSelect.value = ratioValue;
-        resolutionSelect.value = node.resolution || defaultClassicApiGeneratorResolution(node.model);
+        resolutionSelect.value = node.resolution || defaultClassicApiGeneratorResolution(node.model, node.apiProvider);
         ratioSelect.disabled = node.resolution === 'custom' || node.resolution === 'auto';
         customRatioRow.style.display = (node.resolution !== 'auto' && (node.ratio === 'custom' || node.ratio === 'source')) ? 'flex' : 'none';
         customSizeRow.style.display = node.resolution === 'custom' ? 'flex' : 'none';
@@ -11988,7 +12198,7 @@ function runningHubEntries(kind){
         return uniqueModels(provider?.image_models || []).map(model => ({
             id:model,
             model,
-            title:model,
+            title:ModelConfigTools.displayName(provider, model),
             enabled:true,
             source:'model'
         }));
@@ -12050,7 +12260,7 @@ function applyRhEntrySelection(node, ref){
         node.rhModel = ref.id;
         node.model = ref.id;
         node.apiProvider = 'runninghub';
-        node.resolution = node.resolution || defaultApiImageResolution(ref.id);
+        node.resolution = node.resolution || defaultApiImageResolution(ref.id, node.apiProvider);
         node.ratio = node.ratio || 'square';
         node.quality = node.quality || 'auto';
         node.count = Math.max(1, Math.min(8, Number(node.count || 1)));
@@ -12503,15 +12713,21 @@ function rhModelSettingsHtml(node){
                 </select>
                 <select class="select-lite ratio compact-select" data-rh-model-field="ratio">
                     <option value="square">1:1</option>
+                    <option value="portrait14">1:4</option>
+                    <option value="portrait18">1:8</option>
                     <option value="portrait">2:3</option>
                     <option value="landscape">3:2</option>
                     <option value="portrait43">3:4</option>
+                    <option value="landscape41">4:1</option>
                     <option value="landscape43">4:3</option>
+                    <option value="portrait45">4:5</option>
+                    <option value="landscape54">5:4</option>
+                    <option value="landscape81">8:1</option>
                     <option value="story">9:16</option>
                     <option value="wide">16:9</option>
                     <option value="ultrawide">21:9</option>
-                    <option value="ultratall">9:21</option>
                     <option value="source">${tr('canvas.adaptiveRatio')}</option>
+                    <option value="adaptive">${tr('canvas.autoRatio')}</option>
                     <option value="custom">${tr('canvas.custom')}</option>
                 </select>
                 <select class="select-lite quality-select" data-rh-model-field="quality">
@@ -12562,7 +12778,7 @@ function bindRhModelControls(wrap, node, media){
     const sync = () => {
         hydrateCustomParts();
         normalizeApiNodeSizeChoice(node);
-        if(resolutionSelect) resolutionSelect.value = node.resolution || defaultApiImageResolution(node.model);
+        if(resolutionSelect) resolutionSelect.value = node.resolution || defaultApiImageResolution(node.model, node.apiProvider);
         if(ratioSelect) ratioSelect.value = node.ratio || 'square';
         if(qualitySelect) qualitySelect.value = node.quality || 'auto';
         if(countInput) countInput.value = Math.max(1, Math.min(8, Number(node.count || 1)));
@@ -12579,7 +12795,7 @@ function bindRhModelControls(wrap, node, media){
         control.oninput = control.onchange = e => {
             const field = control.dataset.rhModelField;
             if(field === 'resolution'){
-                node.resolution = e.target.value || defaultApiImageResolution(node.model);
+                node.resolution = e.target.value || defaultApiImageResolution(node.model, node.apiProvider);
                 node._apiResolutionUserSet = true;
             } else if(field === 'ratio'){
                 node.ratio = e.target.value || 'square';
@@ -16717,7 +16933,7 @@ function renderOutputMedia(item, useGridLayout=false){
         const label = kind === 'text' ? 'TEXT' : 'FILE';
         return `<div class="output-img-wrap output-file-wrap" data-output-url="${safe}"${gridStyle}><div class="output-file-card"><i data-lucide="${icon}" class="w-7 h-7"></i><span>${escapeHtml(meta.name || outputImageName(url))}</span><small>${label}</small></div>${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
     }
-    return `<div class="output-img-wrap" data-output-url="${safe}"${gridStyle}>${canvasPreviewImgHtml(url, useGridLayout ? 512 : 768, 'alt="generated output"')}${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
+    return `<div class="output-img-wrap" data-output-url="${safe}"${gridStyle}>${canvasPreviewImgHtml(url, useGridLayout ? 512 : 768, 'alt="generated output"')}${outputImageResolutionBadgeHtml(meta)}${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
 }
 function outputGridLayout(node){
     const images = node?.images || [];
@@ -16766,6 +16982,11 @@ function appendOutputImages(out, images, compareRef, metas=[], layout=null){
         if(source.name) item.name = source.name;
         if(source.kind || source.mediaKind) item.kind = source.kind || source.mediaKind;
         if(meta.kind) item.kind = meta.kind;
+        const sourceSize = outputImageResolutionSize(source) || outputImageResolutionSize(meta.grid);
+        if(sourceSize){
+            item.natural_w = sourceSize.w;
+            item.natural_h = sourceSize.h;
+        }
         if(source.cascadeSlot !== undefined && Number.isFinite(Number(source.cascadeSlot))){
             item.cascadeSlot = Math.max(0, Math.floor(Number(source.cascadeSlot)));
         }
@@ -18250,7 +18471,7 @@ function startNodeDrag(e, node){
     if(e.altKey){
         setKnifeMode(false);
         pushUndo();
-        const duplicated = duplicateNodesForAltDrag(node, e.shiftKey);
+        const duplicated = duplicateNodesForAltDrag(node, true);
         if(!duplicated.anchorCopy) return;
         selected.clear();
         (duplicated.rootCopyIds || duplicated.selectedCopyIds).forEach(id => selected.add(id));

@@ -46,6 +46,14 @@ const rhAppsList = document.getElementById('rhAppsList');
 const rhWorkflowsList = document.getElementById('rhWorkflowsList');
 const rhAppsCount = document.getElementById('rhAppsCount');
 const rhWorkflowsCount = document.getElementById('rhWorkflowsCount');
+const rhRecycleBinBtn = document.getElementById('rhRecycleBinBtn');
+const rhRecycleBinCount = document.getElementById('rhRecycleBinCount');
+const rhRecycleBinOverlay = document.getElementById('rhRecycleBinOverlay');
+const rhRecycleAppsList = document.getElementById('rhRecycleAppsList');
+const rhRecycleWorkflowsList = document.getElementById('rhRecycleWorkflowsList');
+const rhRecycleAppsCount = document.getElementById('rhRecycleAppsCount');
+const rhRecycleWorkflowsCount = document.getElementById('rhRecycleWorkflowsCount');
+const rhRecycleClearBtn = document.getElementById('rhRecycleClearBtn');
 const settingsContent = document.getElementById('settingsContent');
 const recommendContent = document.getElementById('recommendContent');
 const recommendPanel = document.getElementById('recommendPanel');
@@ -460,6 +468,12 @@ function normalizeRhEntries(values, kind){
             sortOrder:Number.isFinite(Number(raw?.sortOrder ?? raw?.sort_order)) ? Math.max(0, Math.trunc(Number(raw.sortOrder ?? raw.sort_order))) : sourceIndex
         };
         if(raw?.hidden === true) entry.hidden = true;
+        if(raw?.recycled === true) entry.recycled = true;
+        if(raw?.purged === true) entry.purged = true;
+        if(raw?.builtin === true) entry.builtin = true;
+        const deletedAt = Number(raw?.deletedAt || raw?.deleted_at || 0);
+        if(deletedAt > 0) entry.deletedAt = Math.trunc(deletedAt);
+        if(raw?.userDefined === true || raw?.user_defined === true) entry.userDefined = true;
         if(Array.isArray(raw?.fields)) entry.fields = raw.fields.map(normalizeRhWorkflowField);
         if(raw?.workflowJson && typeof raw.workflowJson === 'object') entry.workflowJson = raw.workflowJson;
         if(raw?.raw && typeof raw.raw === 'object') entry.raw = raw.raw;
@@ -901,6 +915,9 @@ async function createRhEntryFromPaste(){
             enabled:true,
             hidden:false
         };
+        delete item[listKey][existingIndex].recycled;
+        delete item[listKey][existingIndex].purged;
+        delete item[listKey][existingIndex].deletedAt;
     } else if(!exists){
         item[listKey].unshift({
             id:parsed.id,
@@ -909,7 +926,8 @@ async function createRhEntryFromPaste(){
             title:parsed.type === 'app' ? `AI 应用 ${parsed.id.slice(-6)}` : `工作流 ${parsed.id.slice(-6)}`,
             note:'',
             thumbnail:'',
-            enabled:true
+            enabled:true,
+            userDefined:true
         });
     }
     item[listKey] = assignRhEntrySortOrders(item[listKey]);
@@ -932,6 +950,8 @@ function updateRhEntry(kind, index, prop, value){
     if(prop === 'note') setStatus('备注已修改，点保存生效');
 }
 function isStaticRunningHubEntry(kind, entry){
+    if(entry?.userDefined === true) return false;
+    if(entry?.builtin === true) return true;
     const id = String((kind === 'app' ? (entry?.appId || entry?.id) : (entry?.workflowId || entry?.id)) || '').trim();
     const thumb = String(entry?.thumbnail || '');
     if(thumb.includes('/static/runninghub/')) return true;
@@ -946,26 +966,178 @@ async function removeRhEntry(kind, index){
     ensureRunningHubLists(item);
     const entry = item[listKey][index];
     if(!entry) return;
-    const entryId = String((kind === 'workflow' ? (entry.workflowId || entry.id) : (entry.appId || entry.id)) || '').trim();
-    if(isStaticRunningHubEntry(kind, entry)){
-        item[listKey][index] = {
-            ...entry,
-            enabled:false,
-            hidden:true
-        };
-    } else {
-        item[listKey].splice(index, 1);
-    }
+    item[listKey][index] = {
+        ...entry,
+        enabled:false,
+        hidden:true,
+        recycled:true,
+        deletedAt:Date.now()
+    };
+    delete item[listKey][index].purged;
     item[listKey] = assignRhEntrySortOrders(item[listKey]);
     renderRunningHubCards();
-    setStatus('已删除，正在保存...');
+    setStatus('已移入回收站，正在保存...');
+    const ok = await saveProviders();
+    setStatus(ok ? '已移入回收站' : '已移入回收站，但自动保存失败');
+}
+function rhRecycleEntries(kind){
+    const item = provider();
+    if(!item || item.id !== 'runninghub') return [];
+    const list = kind === 'app' ? item.rh_apps : item.rh_workflows;
+    return (list || []).map((entry, index) => ({...entry, _rhIndex:index}))
+        .filter(entry => entry?.hidden === true && entry?.purged !== true);
+}
+function formatRhDeletedAt(value){
+    const timestamp = Number(value || 0);
+    if(!timestamp) return '旧版删除记录';
+    try {
+        return new Intl.DateTimeFormat('zh-CN', {
+            year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', hour12:false
+        }).format(new Date(timestamp));
+    } catch(_) {
+        return '删除时间未知';
+    }
+}
+function renderRhRecycleEntryList(target, entries, kind){
+    if(!target) return;
+    if(!entries.length){
+        target.innerHTML = '<div class="rh-recycle-empty">暂无已删除项目</div>';
+        return;
+    }
+    target.innerHTML = entries.map((entry, index) => {
+        const sourceIndex = entry._rhIndex ?? index;
+        const id = String(kind === 'app' ? (entry.appId || entry.id) : (entry.workflowId || entry.id));
+        return `
+            <div class="rh-recycle-item">
+                <div class="rh-recycle-icon"><i data-lucide="${kind === 'app' ? 'sparkles' : 'workflow'}" class="w-4 h-4"></i></div>
+                <div class="rh-recycle-main">
+                    <strong>${escapeHtml(entry.title || (kind === 'app' ? '未命名应用' : '未命名工作流'))}</strong>
+                    <span>${escapeHtml(id)}</span>
+                    <small>${escapeHtml(formatRhDeletedAt(entry.deletedAt))}</small>
+                </div>
+                <div class="rh-recycle-actions">
+                    <button class="action-btn" type="button" onclick="restoreRhEntry('${kind}', ${sourceIndex})"><i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i><span>恢复</span></button>
+                    <button class="action-btn danger-btn" type="button" onclick="purgeRhEntry('${kind}', ${sourceIndex})"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i><span>彻底删除</span></button>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+function renderRhRecycleBin(){
+    const apps = rhRecycleEntries('app');
+    const workflows = rhRecycleEntries('workflow');
+    const total = apps.length + workflows.length;
+    if(rhRecycleBinCount){
+        rhRecycleBinCount.textContent = String(total);
+        rhRecycleBinCount.hidden = total === 0;
+    }
+    if(rhRecycleBinBtn) rhRecycleBinBtn.title = total ? `回收站中有 ${total} 项` : '回收站为空';
+    if(rhRecycleAppsCount) rhRecycleAppsCount.textContent = String(apps.length);
+    if(rhRecycleWorkflowsCount) rhRecycleWorkflowsCount.textContent = String(workflows.length);
+    if(rhRecycleClearBtn) rhRecycleClearBtn.disabled = total === 0;
+    renderRhRecycleEntryList(rhRecycleAppsList, apps, 'app');
+    renderRhRecycleEntryList(rhRecycleWorkflowsList, workflows, 'workflow');
+    refreshIcons();
+}
+function openRhRecycleBin(){
+    renderRhRecycleBin();
+    rhRecycleBinOverlay?.classList.add('open');
+}
+function closeRhRecycleBin(){
+    rhRecycleBinOverlay?.classList.remove('open');
+}
+async function restoreRhEntry(kind, index){
+    const item = provider();
+    if(!item || item.id !== 'runninghub') return false;
+    const listKey = kind === 'app' ? 'rh_apps' : 'rh_workflows';
+    ensureRunningHubLists(item);
+    const entry = item[listKey][index];
+    if(!entry || entry.hidden !== true || entry.purged === true) return false;
+    item[listKey][index] = {...entry, hidden:false, enabled:true};
+    delete item[listKey][index].recycled;
+    delete item[listKey][index].purged;
+    delete item[listKey][index].deletedAt;
+    renderRunningHubCards();
+    setStatus('正在恢复...');
+    const ok = await saveProviders();
+    renderRhRecycleBin();
+    setStatus(ok ? '已恢复' : '恢复后自动保存失败');
+    return ok;
+}
+async function purgeRhEntry(kind, index, options={}){
+    const item = provider();
+    if(!item || item.id !== 'runninghub') return false;
+    const listKey = kind === 'app' ? 'rh_apps' : 'rh_workflows';
+    ensureRunningHubLists(item);
+    const entry = item[listKey][index];
+    if(!entry || entry.hidden !== true || entry.purged === true) return false;
+    const entryId = String((kind === 'workflow' ? (entry.workflowId || entry.id) : (entry.appId || entry.id)) || '').trim();
+    if(!options.skipConfirm && !confirm(`彻底删除“${entry.title || entryId}”？此操作无法恢复。`)) return false;
     if(kind === 'workflow' && entryId){
         try {
-            await fetch(`/api/runninghub/workflows/${encodeURIComponent(entryId)}`, {method:'DELETE'});
-        } catch(_) {}
+            const response = await fetch(`/api/runninghub/workflows/${encodeURIComponent(entryId)}`, {method:'DELETE'});
+            if(!response.ok && response.status !== 404){
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data.detail || '彻底删除工作流失败');
+            }
+        } catch(error){
+            if(options.throwOnError) throw error;
+            setStatus(error.message || '彻底删除工作流失败');
+            return false;
+        }
     }
+    const currentIndex = item[listKey].findIndex(candidate => String(
+        kind === 'workflow' ? (candidate.workflowId || candidate.id) : (candidate.appId || candidate.id)
+    ) === entryId);
+    if(currentIndex < 0) return false;
+    if(isStaticRunningHubEntry(kind, entry)){
+        item[listKey][currentIndex] = {
+            id:entryId,
+            ...(kind === 'app' ? {appId:entryId} : {workflowId:entryId}),
+            enabled:false,
+            hidden:true,
+            purged:true,
+            sortOrder:Number(entry.sortOrder || currentIndex)
+        };
+    } else {
+        item[listKey].splice(currentIndex, 1);
+    }
+    item[listKey] = assignRhEntrySortOrders(item[listKey]);
+    if(!options.skipRender){
+        renderRunningHubCards();
+        renderRhRecycleBin();
+    }
+    if(options.skipSave) return true;
+    setStatus('正在彻底删除...');
     const ok = await saveProviders();
-    setStatus(ok ? '已删除并保存' : '已删除，但自动保存失败');
+    renderRhRecycleBin();
+    setStatus(ok ? '已彻底删除' : '删除后自动保存失败');
+    return ok;
+}
+async function clearRhRecycleBin(){
+    const total = rhRecycleEntries('app').length + rhRecycleEntries('workflow').length;
+    if(!total) return;
+    if(!confirm(`清空回收站中的 ${total} 个项目？此操作无法恢复。`)) return;
+    setStatus('正在清空回收站...');
+    try {
+        for(const kind of ['app', 'workflow']){
+            const ids = rhRecycleEntries(kind).map(entry => String(kind === 'app' ? (entry.appId || entry.id) : (entry.workflowId || entry.id)));
+            for(const id of ids){
+                const item = provider();
+                const listKey = kind === 'app' ? 'rh_apps' : 'rh_workflows';
+                const index = item[listKey].findIndex(entry => String(kind === 'app' ? (entry.appId || entry.id) : (entry.workflowId || entry.id)) === id);
+                if(index >= 0) await purgeRhEntry(kind, index, {skipConfirm:true, skipSave:true, skipRender:true, throwOnError:true});
+            }
+        }
+        renderRunningHubCards();
+        const ok = await saveProviders();
+        renderRhRecycleBin();
+        setStatus(ok ? '回收站已清空' : '回收站已清空，但自动保存失败');
+    } catch(error){
+        renderRunningHubCards();
+        renderRhRecycleBin();
+        setStatus(error.message || '清空回收站失败');
+    }
 }
 function readFileAsDataUrl(file){
     return new Promise((resolve, reject) => {
@@ -2304,15 +2476,17 @@ function renderRunningHubCards(){
     if(!item || item.id !== 'runninghub'){
         if(rhAppsList) rhAppsList.innerHTML = '';
         if(rhWorkflowsList) rhWorkflowsList.innerHTML = '';
+        if(rhRecycleBinCount){ rhRecycleBinCount.textContent = '0'; rhRecycleBinCount.hidden = true; }
         return;
     }
     ensureRunningHubLists(item);
-    const apps = item.rh_apps.map((entry, index) => ({...entry, _rhIndex:index})).filter(entry => entry?.hidden !== true);
-    const workflows = item.rh_workflows.map((entry, index) => ({...entry, _rhIndex:index})).filter(entry => entry?.hidden !== true);
+    const apps = item.rh_apps.map((entry, index) => ({...entry, _rhIndex:index})).filter(entry => entry?.hidden !== true && entry?.purged !== true);
+    const workflows = item.rh_workflows.map((entry, index) => ({...entry, _rhIndex:index})).filter(entry => entry?.hidden !== true && entry?.purged !== true);
     if(rhAppsCount) rhAppsCount.textContent = apps.length;
     if(rhWorkflowsCount) rhWorkflowsCount.textContent = workflows.length;
     renderRhEntryList(rhAppsList, apps, 'app');
     renderRhEntryList(rhWorkflowsList, workflows, 'workflow');
+    renderRhRecycleBin();
     refreshIcons();
 }
 function rhEntryThumbnailCandidates(kind, entry){
@@ -2521,6 +2695,8 @@ function recommendedProviderForApi(api){
             item.chat_models = [];
             item.video_models = [];
             item.model_protocols = {};
+            item.model_image_strategies = {};
+            item.image_model_resolution_maps = {};
         }
         return item;
     }
@@ -2543,6 +2719,8 @@ function recommendedProviderForApi(api){
         chat_models:api.empty_models_on_save ? [] : (Array.isArray(api.chat_models) ? [...api.chat_models] : []),
         video_models:api.empty_models_on_save ? [] : (Array.isArray(api.video_models) ? [...api.video_models] : []),
         model_protocols:api.empty_models_on_save ? {} : ((api.model_protocols && typeof api.model_protocols === 'object') ? {...api.model_protocols} : {}),
+        model_image_strategies:api.empty_models_on_save ? {} : ((api.model_image_strategies && typeof api.model_image_strategies === 'object') ? {...api.model_image_strategies} : {}),
+        image_model_resolution_maps:api.empty_models_on_save ? {} : ((api.image_model_resolution_maps && typeof api.image_model_resolution_maps === 'object') ? {...api.image_model_resolution_maps} : {}),
         has_key:false,
         key_preview:''
     };
@@ -3427,6 +3605,8 @@ function runningHubReadableModelName(model, item){
     return raw;
 }
 function modelDisplayName(model, item){
+    const configured = ModelConfigTools.displayName(item, model);
+    if(configured && configured !== String(model || '').trim()) return configured;
     return isRunningHubLike(item) ? runningHubReadableModelName(model, item) : String(model || '');
 }
 function providerModelBadge(model, label){
@@ -3596,19 +3776,24 @@ function selectPickerCat(cat){
 function applyModelPicker(){
     const item = provider(); if(!item) return;
     const image = [], chat = [], video = [];
-    const modelNames = {};
+    const modelNames = (item.model_names && typeof item.model_names === 'object') ? {...item.model_names} : {};
     Object.entries(pickerState.selected).forEach(([id, sel]) => {
         if(!sel) return;
         const cat = pickerState.category[id];
         if(cat === 'image') image.push(id);
         else if(cat === 'video') video.push(id);
         else chat.push(id);
-        const label = modelDisplayName(id, item);
-        if(label && label !== id) modelNames[id] = label;
+        if(!Object.prototype.hasOwnProperty.call(modelNames, id)){
+            const fetchedLabel = String(lastFetchedModelNames?.[id] || '').trim();
+            const label = fetchedLabel || modelDisplayName(id, item);
+            if(label && label !== id) modelNames[id] = label;
+        }
     });
     item.image_models = image;
     item.chat_models = chat;
     item.video_models = video;
+    const activeModels = new Set([...image, ...chat, ...video]);
+    Object.keys(modelNames).forEach(id => { if(!activeModels.has(id)) delete modelNames[id]; });
     item.model_names = modelNames;
     renderModels('image'); renderModels('chat'); renderModels('video');
     renderMsLoras();
@@ -3634,8 +3819,20 @@ async function clearKeyOnly(){
     if(ok) keyInput.value = '';
 }
 const FIXED_PROTOCOL_PROVIDER_IDS = new Set(['modelscope', 'volcengine', 'runninghub']);
+const MODEL_IMAGE_STRATEGY_OPTIONS = [
+    {value:'auto', label:'自动'},
+    {value:'gpt-image', label:'GPT Image'},
+    {value:'banana', label:'Banana'},
+    {value:'legacy', label:'传统'}
+];
 function providerSupportsModelProtocol(item){
     return Boolean(item) && !FIXED_PROTOCOL_PROVIDER_IDS.has(item.id);
+}
+function providerSupportsModelImageStrategy(item){
+    if(!item || FIXED_PROTOCOL_PROVIDER_IDS.has(item.id)) return false;
+    const protocol = String(item.protocol || '').toLowerCase();
+    const imageMode = String(item.image_request_mode || 'openai').toLowerCase();
+    return !CLI_PROTOCOLS.has(protocol) && protocol !== 'apimart' && imageMode === 'openai';
 }
 function modelProtocolSelectHtml(kind, index, model, item){
     if(kind === 'video' || !providerSupportsModelProtocol(item)) return '';
@@ -3648,6 +3845,80 @@ function modelProtocolSelectHtml(kind, index, model, item){
         ${opt('gemini', 'Gemini')}
     </select>`;
 }
+function modelImageStrategySelectHtml(kind, index, model, item){
+    if(kind !== 'image' || !providerSupportsModelImageStrategy(item)) return '';
+    const map = (item.model_image_strategies && typeof item.model_image_strategies === 'object') ? item.model_image_strategies : {};
+    const current = String(map[String(model || '').trim()] || 'auto').toLowerCase();
+    const options = MODEL_IMAGE_STRATEGY_OPTIONS.map(option => `<option value="${option.value}" ${current === option.value ? 'selected' : ''}>${option.label}</option>`).join('');
+    return `<select class="model-image-strategy-select" title="图片参数策略：自动识别 GPT Image 或 Banana，无法识别时沿用传统参数" onchange="updateModelImageStrategy('${kind}', ${index}, this.value)">${options}</select>`;
+}
+let editingModelAliasKey = '';
+function modelAliasEditKey(kind, index){ return `${kind}:${index}`; }
+function editModelAlias(kind, index){
+    const item = provider();
+    const key = kind === 'image' ? 'image_models' : kind === 'video' ? 'video_models' : 'chat_models';
+    if(!item || !String(item[key]?.[index] || '').trim()) return;
+    editingModelAliasKey = modelAliasEditKey(kind, index);
+    renderModels(kind);
+    requestAnimationFrame(() => {
+        const input = document.querySelector(`[data-model-alias-input="${kind}:${index}"]`);
+        input?.focus();
+        input?.select();
+    });
+}
+function updateModelAlias(kind, index, value){
+    const item = provider();
+    const key = kind === 'image' ? 'image_models' : kind === 'video' ? 'video_models' : 'chat_models';
+    const model = String(item?.[key]?.[index] || '').trim();
+    if(!item || !model) return;
+    if(!item.model_names || typeof item.model_names !== 'object') item.model_names = {};
+    const alias = String(value || '').trim();
+    if(alias && alias !== model) item.model_names[model] = alias;
+    else delete item.model_names[model];
+}
+function finishModelAlias(kind){
+    editingModelAliasKey = '';
+    renderModels(kind);
+}
+function imageModelResolutionMapHtml(kind, index, model, item){
+    if(kind !== 'image' || !String(model || '').trim()) return '';
+    const config = ModelConfigTools.resolutionConfig(item, model);
+    const inputs = ModelConfigTools.RESOLUTIONS.map(resolution => `
+        <label class="resolution-model-field">
+            <span>${resolution.toUpperCase()}</span>
+            <input type="text" list="imageModelResolutionCandidates" value="${escapeAttr(config.models[resolution] || '')}" placeholder="${resolution.toUpperCase()} 对应的真实模型 ID" onchange="updateImageModelResolutionTarget(${index}, '${resolution}', this.value)">
+        </label>
+    `).join('');
+    return `<div class="model-resolution-map ${config.enabled ? 'enabled' : ''}">
+        <label class="model-resolution-toggle" title="开启后，画布选择 1K、2K、4K 时分别调用下方真实模型">
+            <input type="checkbox" ${config.enabled ? 'checked' : ''} onchange="toggleImageModelResolutionMap(${index}, this.checked)">
+            <span>按分辨率切换模型</span>
+        </label>
+        ${config.enabled ? `<div class="resolution-model-grid">${inputs}</div>` : ''}
+    </div>`;
+}
+function toggleImageModelResolutionMap(index, enabled){
+    const item = provider();
+    const model = String(item?.image_models?.[index] || '').trim();
+    if(!item || !model) return;
+    if(!item.image_model_resolution_maps || typeof item.image_model_resolution_maps !== 'object') item.image_model_resolution_maps = {};
+    const current = ModelConfigTools.resolutionConfig(item, model);
+    item.image_model_resolution_maps[model] = {enabled:Boolean(enabled), models:{...current.models}};
+    renderModels('image');
+}
+function updateImageModelResolutionTarget(index, resolution, value){
+    const item = provider();
+    const model = String(item?.image_models?.[index] || '').trim();
+    const key = String(resolution || '').trim().toLowerCase();
+    if(!item || !model || !ModelConfigTools.RESOLUTIONS.includes(key)) return;
+    if(!item.image_model_resolution_maps || typeof item.image_model_resolution_maps !== 'object') item.image_model_resolution_maps = {};
+    const current = ModelConfigTools.resolutionConfig(item, model);
+    const models = {...current.models};
+    const target = String(value || '').trim();
+    if(target) models[key] = target;
+    else delete models[key];
+    item.image_model_resolution_maps[model] = {enabled:current.enabled, models};
+}
 function renderModels(kind){
     const item = provider();
     const key = kind === 'image' ? 'image_models' : kind === 'video' ? 'video_models' : 'chat_models';
@@ -3658,19 +3929,25 @@ function renderModels(kind){
         return;
     }
     const showProtocol = kind !== 'video' && providerSupportsModelProtocol(item);
+    const showImageStrategy = kind === 'image' && providerSupportsModelImageStrategy(item);
     list.innerHTML = models.map((model, index) => {
         const label = modelDisplayName(model, item);
+        const editingAlias = editingModelAliasKey === modelAliasEditKey(kind, index);
         return `
-            <div class="model-row${showProtocol ? ' has-protocol' : ''}">
+            <div class="model-row${showProtocol ? ' has-protocol' : ''}${showImageStrategy ? ' has-image-strategy' : ''}" data-model-kind="${kind}" data-model-index="${index}">
                 <div class="model-id-field">
-                    ${label && label !== model ? `<div class="model-display-name">${escapeHtml(label)}</div>` : ''}
+                    ${editingAlias
+                        ? `<input class="model-alias-input" data-model-alias-input="${kind}:${index}" value="${escapeAttr(label || model)}" oninput="updateModelAlias('${kind}', ${index}, this.value)" onblur="finishModelAlias('${kind}')" onkeydown="if(event.key === 'Enter'){event.preventDefault();this.blur();}">`
+                        : `<div class="model-alias-line" ondblclick="editModelAlias('${kind}', ${index})" title="双击修改显示名称"><span class="model-display-name">${escapeHtml(label || model || '双击设置显示名称')}</span><button type="button" class="model-alias-edit" onclick="event.stopPropagation();editModelAlias('${kind}', ${index})" title="修改显示名称"><i data-lucide="pencil" class="w-3 h-3"></i></button></div>`}
                     <input value="${escapeAttr(model)}" oninput="updateModel('${kind}', ${index}, this.value)">
                 </div>
                 ${modelProtocolSelectHtml(kind, index, model, item)}
+                ${modelImageStrategySelectHtml(kind, index, model, item)}
                 <button class="icon-btn" type="button" onclick="removeModel('${kind}', ${index})" title="删除"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                ${imageModelResolutionMapHtml(kind, index, model, item)}
             </div>
         `;
-    }).join('');
+    }).join('') + (kind === 'image' ? `<datalist id="imageModelResolutionCandidates">${unique([...lastFetchedAll, ...models]).filter(Boolean).map(value => `<option value="${escapeAttr(value)}"></option>`).join('')}</datalist>` : '');
     refreshIcons();
 }
 function msLoraTargetOptions(selected){
@@ -3761,7 +4038,7 @@ function addProvider(){
     let id = 'custom-api';
     let index = 2;
     while(providers.some(item => item.id === id)) id = `custom-api-${index++}`;
-    providers.push({id, name:'API', base_url:'', protocol:'openai', image_request_mode:'openai', image_edit_route:'general', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], has_key:false, key_preview:''});
+    providers.push({id, name:'API', base_url:'', protocol:'openai', image_request_mode:'openai', image_edit_route:'general', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], model_names:{}, model_protocols:{}, model_image_strategies:{}, image_model_resolution_maps:{}, has_key:false, key_preview:''});
     selectedId = id;
     renderEditor();
 }
@@ -3790,6 +4067,8 @@ async function addCliProvider(kind){
             chat_models:[],
             video_models:[],
             model_protocols:{},
+            model_image_strategies:{},
+            image_model_resolution_maps:{},
             has_key:false,
             key_preview:''
         };
@@ -3913,6 +4192,22 @@ function updateModel(kind, index, value){
             if(newName && label && label !== newName) item.model_names[newName] = label;
         }
     }
+    if(item.model_image_strategies && typeof item.model_image_strategies === 'object' && oldName && oldName !== newName){
+        if(Object.prototype.hasOwnProperty.call(item.model_image_strategies, oldName)){
+            const strategy = item.model_image_strategies[oldName];
+            if(!modelProtocolStillUsed(item, oldName)) delete item.model_image_strategies[oldName];
+            if(newName && strategy) item.model_image_strategies[newName] = strategy;
+        }
+    }
+    if(kind === 'image' && item.image_model_resolution_maps && typeof item.image_model_resolution_maps === 'object' && oldName && oldName !== newName){
+        if(Object.prototype.hasOwnProperty.call(item.image_model_resolution_maps, oldName)){
+            const config = item.image_model_resolution_maps[oldName];
+            if(!item.image_models.some(model => String(model || '').trim() === oldName)) delete item.image_model_resolution_maps[oldName];
+            if(newName) item.image_model_resolution_maps[newName] = config;
+        }
+    }
+    const aliasLabel = document.querySelector(`[data-model-kind="${kind}"][data-model-index="${index}"] .model-display-name`);
+    if(aliasLabel && !(item.model_names && item.model_names[newName])) aliasLabel.textContent = newName || '双击设置显示名称';
     if(kind === 'image') renderMsLoras();
 }
 function updateModelProtocol(kind, index, value){
@@ -3928,6 +4223,16 @@ function updateModelProtocol(kind, index, value){
         delete item.model_protocols[name];
     }
 }
+function updateModelImageStrategy(kind, index, value){
+    if(kind !== 'image') return;
+    const item = provider();
+    const name = String(item?.image_models?.[index] || '').trim();
+    if(!item || !name) return;
+    if(!item.model_image_strategies || typeof item.model_image_strategies !== 'object') item.model_image_strategies = {};
+    const strategy = String(value || '').trim().toLowerCase();
+    if(['gpt-image','banana','legacy'].includes(strategy)) item.model_image_strategies[name] = strategy;
+    else delete item.model_image_strategies[name];
+}
 function removeModel(kind, index){
     const item = provider();
     const key = kind === 'image' ? 'image_models' : kind === 'video' ? 'video_models' : 'chat_models';
@@ -3940,21 +4245,52 @@ function removeModel(kind, index){
     if(removed && item.model_names && typeof item.model_names === 'object' && !modelProtocolStillUsed(item, removed)){
         delete item.model_names[removed];
     }
+    if(removed && item.model_image_strategies && typeof item.model_image_strategies === 'object' && !modelProtocolStillUsed(item, removed)){
+        delete item.model_image_strategies[removed];
+    }
+    if(kind === 'image' && removed && item.image_model_resolution_maps && typeof item.image_model_resolution_maps === 'object' && !item.image_models.includes(removed)){
+        delete item.image_model_resolution_maps[removed];
+    }
     renderModels(kind);
     if(kind === 'image') renderMsLoras();
 }
 async function loadProviders(){
     setStatus(tr('api.loading'));
     try {
-        const data = await fetch('/api/providers').then(r => r.json());
+        const previousSelectedId = selectedId;
+        const wasRecommendOpen = Boolean(recommendInlineOpen);
+        const hadLoadedProviders = Array.isArray(providers) && providers.length > 0;
+        const data = await fetch(`/api/providers?_refresh=${Date.now()}`, {cache:'no-store'}).then(r => r.json());
         providers = data.providers || [];
-        selectedId = sortedProviders()[0]?.id || '';
+        providers.forEach(item => {
+            item.model_names = (item.model_names && typeof item.model_names === 'object') ? item.model_names : {};
+            item.model_protocols = (item.model_protocols && typeof item.model_protocols === 'object') ? item.model_protocols : {};
+            item.model_image_strategies = (item.model_image_strategies && typeof item.model_image_strategies === 'object') ? item.model_image_strategies : {};
+            item.image_model_resolution_maps = (item.image_model_resolution_maps && typeof item.image_model_resolution_maps === 'object') ? item.image_model_resolution_maps : {};
+        });
+        selectedId = providers.some(item => item.id === previousSelectedId)
+            ? previousSelectedId
+            : (sortedProviders()[0]?.id || '');
         renderEditor();
-        openRecommendApi();
+        if(!hadLoadedProviders && wasRecommendOpen) openRecommendApi();
+        else if(!wasRecommendOpen) {
+            recommendInlineOpen = false;
+            syncRecommendView();
+        }
         setStatus('');
     } catch(err) {
         setStatus(tr('api.loadFailed'));
     }
+}
+function refreshProvidersIfChanged(){
+    try {
+        const marker = Number(localStorage.getItem('studio_api_updated_at') || 0);
+        if(marker && marker > (window.__studioApiLoadedAt || 0)){
+            window.__studioApiLoadedAt = marker;
+            return loadProviders();
+        }
+    } catch(_error) {}
+    return Promise.resolve();
 }
 async function saveProviders(){
     syncEditor();
@@ -3990,13 +4326,31 @@ async function saveProviders(){
         item.chat_models = unique(item.chat_models || []);
         item.video_models = unique(item.video_models || []);
         const modelNameSource = (item.model_names && typeof item.model_names === 'object') ? item.model_names : {};
-        const modelNameMap = {};
+        const modelNameMap = {...modelNameSource};
+        const activeModelNames = new Set([...item.image_models, ...item.chat_models, ...item.video_models].map(model => String(model || '').trim()).filter(Boolean));
+        Object.keys(modelNameMap).forEach(model => { if(!activeModelNames.has(model)) delete modelNameMap[model]; });
         [...item.image_models, ...item.chat_models, ...item.video_models].forEach(model => {
             const raw = String(model || '').trim();
             const label = String(modelNameSource[raw] || modelDisplayName(raw, item) || '').trim();
             if(raw && label && label !== raw) modelNameMap[raw] = label;
         });
         item.model_names = modelNameMap;
+        const imageStrategySource = (item.model_image_strategies && typeof item.model_image_strategies === 'object') ? item.model_image_strategies : {};
+        const imageStrategyMap = {};
+        item.image_models.forEach(model => {
+            const raw = String(model || '').trim();
+            const strategy = String(imageStrategySource[raw] || '').trim().toLowerCase();
+            if(raw && ['gpt-image','banana','legacy'].includes(strategy)) imageStrategyMap[raw] = strategy;
+        });
+        item.model_image_strategies = imageStrategyMap;
+        const resolutionMapSource = (item.image_model_resolution_maps && typeof item.image_model_resolution_maps === 'object') ? item.image_model_resolution_maps : {};
+        const imageResolutionMaps = {};
+        item.image_models.forEach(model => {
+            const raw = String(model || '').trim();
+            const config = ModelConfigTools.resolutionConfig({image_model_resolution_maps:resolutionMapSource}, raw);
+            if(raw && (config.enabled || Object.keys(config.models).length)) imageResolutionMaps[raw] = config;
+        });
+        item.image_model_resolution_maps = imageResolutionMaps;
         item.rh_apps = normalizeRhEntries(item.rh_apps || [], 'app');
         item.rh_workflows = normalizeRhEntries(item.rh_workflows || [], 'workflow');
         item.ms_loras = (Array.isArray(item.ms_loras) ? item.ms_loras : []).map(lora => ({
@@ -4033,6 +4387,8 @@ async function saveProviders(){
                 video_models:item.video_models || [],
                 model_names:(item.model_names && typeof item.model_names === 'object') ? item.model_names : {},
                 model_protocols:(item.model_protocols && typeof item.model_protocols === 'object') ? item.model_protocols : {},
+                model_image_strategies:(item.model_image_strategies && typeof item.model_image_strategies === 'object') ? item.model_image_strategies : {},
+                image_model_resolution_maps:(item.image_model_resolution_maps && typeof item.image_model_resolution_maps === 'object') ? item.image_model_resolution_maps : {},
                 ms_loras:item.id === 'modelscope' ? (item.ms_loras || []) : [],
                 ms_defaults_version:item.id === 'modelscope' ? (item.ms_defaults_version || 1) : 0,
                 rh_apps:item.id === 'runninghub' ? (item.rh_apps || []) : [],
@@ -4078,6 +4434,9 @@ function escapeHtml(str){
 }
 function escapeAttr(str){ return escapeHtml(str).replace(/`/g, '&#96;'); }
 window.addEventListener('message', event => {
+    if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'backup-imported'){
+        loadProviders();
+    }
     if(event.data?.type === 'studio-theme' && window.StudioTheme) window.StudioTheme.set(event.data.theme);
     if(event.data?.type === 'studio-lang' && window.StudioI18n) {
         window.StudioI18n.set(event.data.lang);
@@ -4085,11 +4444,20 @@ window.addEventListener('message', event => {
         else renderEditor();
     }
 });
+try {
+    const apiChannel = new BroadcastChannel('studio-api');
+    apiChannel.addEventListener('message', event => {
+        if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'backup-imported') loadProviders();
+    });
+} catch(_error) {}
+window.addEventListener('pageshow', () => loadProviders());
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible') loadProviders(); });
 rhWorkflowEditorOverlay?.addEventListener('mousedown', event => {
     if(event.target === rhWorkflowEditorOverlay) closeRhWorkflowEditor();
 });
 document.addEventListener('keydown', event => {
     if(event.key === 'Escape' && rhWorkflowEditorState.open) closeRhWorkflowEditor();
+    if(event.key === 'Escape' && rhRecycleBinOverlay?.classList.contains('open')) closeRhRecycleBin();
 });
 document.addEventListener('mousedown', event => {
     if(!rhWorkflowEditorState.open) return;
@@ -4111,7 +4479,10 @@ window.onload = () => {
     if(window.StudioTheme) window.StudioTheme.apply();
     if(window.StudioI18n) window.StudioI18n.apply();
     syncRecommendView();
-    loadProviders();
+    // The first visit keeps the existing default landing view; later background
+    // reloads preserve whichever provider/editor view the user is working in.
+    recommendInlineOpen = true;
+    loadProviders().then(() => { try { window.__studioApiLoadedAt = Number(localStorage.getItem('studio_api_updated_at') || Date.now()); } catch(_error) {} });
     // 平台名输入时实时预览生成的 ID
     if(nameInput) nameInput.addEventListener('input', updateIdPreview);
     if(protocolInput) protocolInput.addEventListener('change', updateProtocolFromInput);

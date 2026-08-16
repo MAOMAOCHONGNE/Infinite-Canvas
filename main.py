@@ -88,6 +88,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+NO_CACHE_STATIC_PATHS = {
+    "/static/canvas-list.html",
+    "/static/api-settings.html",
+    "/static/js/backup-manager.js",
+    "/static/js/canvas-list.js",
+    "/static/js/api-settings.js",
+}
+
+@app.middleware("http")
+async def disable_stale_shell_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path in NO_CACHE_STATIC_PATHS:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 # --- WebSocket 状态管理器 ---
 class ConnectionManager:
     def __init__(self):
@@ -184,6 +201,11 @@ GITHUB_VERSION_URL = f"https://raw.githubusercontent.com/MAOMAOCHONGNE/Infinite-
 GITHUB_TREE_URL = f"https://api.github.com/repos/MAOMAOCHONGNE/Infinite-Canvas/git/trees/{CUSTOM_UPDATE_BRANCH}?recursive=1"
 GITHUB_RAW_ROOT = f"https://raw.githubusercontent.com/MAOMAOCHONGNE/Infinite-Canvas/{CUSTOM_UPDATE_BRANCH}"
 GITHUB_UPDATE_NOTES_URL = GITHUB_RAW_ROOT + "/static/update-notes.json"
+MODELSCOPE_REPO_URL = "https://modelscope.cn/studios/qisese70/Infinite-Canvas"
+MODELSCOPE_FILE_API_ROOT = "https://www.modelscope.cn/api/v1/studio/qisese70/Infinite-Canvas/repo?Revision=master&FilePath="
+MODELSCOPE_VERSION_URL = MODELSCOPE_FILE_API_ROOT + "VERSION"
+MODELSCOPE_UPDATE_NOTES_URL = MODELSCOPE_FILE_API_ROOT + "static/update-notes.json"
+MODELSCOPE_TREE_URL = "https://www.modelscope.cn/api/v1/studio/qisese70/Infinite-Canvas/repo/files?Revision=master&Recursive=true"
 
 @app.on_event("startup")
 async def startup_event():
@@ -491,15 +513,10 @@ RUNNINGHUB_DEFAULT_APPS = [
             },
         ],
     },
-    {
-        "id": "1997622492837646338",
-        "appId": "1997622492837646338",
-        "title": "2511-光线迁移",
-        "note": "",
-        "thumbnail": "",
-        "enabled": True,
-    },
 ]
+# 旧版本曾把这个没有参数配置的应用硬编码进默认列表。它已经不再是产品默认项，
+# 但用户数据中可能还留有旧版残片；读取时应清理残片，用户明确重新添加的同 ID 项除外。
+RUNNINGHUB_RETIRED_LEGACY_APP_IDS = {"1997622492837646338"}
 RUNNINGHUB_DEFAULT_WORKFLOWS = [
     {
         "id": "2058554058318897153",
@@ -814,6 +831,8 @@ def default_api_providers():
             "image_models": MODELSCOPE_DEFAULT_IMAGE_MODELS,
             "chat_models": MODELSCOPE_CHAT_MODELS,
             "video_models": [],
+            "model_image_strategies": {},
+            "image_model_resolution_maps": {},
             "ms_loras": MODELSCOPE_DEFAULT_LORAS,
             "ms_defaults_version": MODELSCOPE_DEFAULTS_VERSION,
         },
@@ -830,6 +849,8 @@ def default_api_providers():
             "image_models": [],
             "chat_models": [],
             "video_models": [],
+            "model_image_strategies": {},
+            "image_model_resolution_maps": {},
             "ms_loras": [],
             "ms_defaults_version": 0,
             "rh_apps": RUNNINGHUB_DEFAULT_APPS,
@@ -848,6 +869,8 @@ def default_api_providers():
             "image_models": [],
             "chat_models": [],
             "video_models": [],
+            "model_image_strategies": {},
+            "image_model_resolution_maps": {},
             "ms_loras": [],
             "ms_defaults_version": 0,
             "volcengine_project_name": VOLCENGINE_DEFAULT_PROJECT_NAME,
@@ -1019,6 +1042,20 @@ def normalize_runninghub_entry(raw, kind, fallback_order=0):
         entry["sortOrder"] = max(0, int(fallback_order or 0))
     if raw.get("hidden") is True:
         entry["hidden"] = True
+    if raw.get("recycled") is True:
+        entry["recycled"] = True
+    if raw.get("purged") is True:
+        entry["purged"] = True
+    if raw.get("builtin") is True:
+        entry["builtin"] = True
+    try:
+        deleted_at = int(raw.get("deletedAt") or raw.get("deleted_at") or 0)
+        if deleted_at > 0:
+            entry["deletedAt"] = deleted_at
+    except Exception:
+        pass
+    if raw.get("userDefined") is True or raw.get("user_defined") is True:
+        entry["userDefined"] = True
     fields = raw.get("fields")
     if isinstance(fields, list):
         entry["fields"] = [runninghub_normalize_field(field) for field in fields if isinstance(field, dict)]
@@ -1054,11 +1091,36 @@ def normalize_runninghub_entries(values, kind):
         normalized.append(entry)
     return sorted(normalized, key=lambda entry: int(entry.get("sortOrder", 0)))
 
+def is_retired_legacy_runninghub_stub(entry, kind):
+    if kind != "app" or not isinstance(entry, dict):
+        return False
+    entry_id = runninghub_entry_id(entry, kind)
+    if entry_id not in RUNNINGHUB_RETIRED_LEGACY_APP_IDS:
+        return False
+    if entry.get("userDefined") is True:
+        return False
+    # 只清理旧版那个没有任何可运行配置的占位记录；带 fields/raw 的导入或用户配置继续保留。
+    return not entry.get("fields") and not entry.get("raw")
+
+def prune_retired_legacy_runninghub_stubs(provider):
+    if not isinstance(provider, dict) or str(provider.get("id") or "").strip().lower() != "runninghub":
+        return provider
+    provider = dict(provider)
+    provider["rh_apps"] = [
+        entry for entry in normalize_runninghub_entries(provider.get("rh_apps") or [], "app")
+        if not is_retired_legacy_runninghub_stub(entry, "app")
+    ]
+    provider["rh_workflows"] = normalize_runninghub_entries(provider.get("rh_workflows") or [], "workflow")
+    return provider
+
 def runninghub_entry_id(entry, kind):
     if not isinstance(entry, dict):
         return ""
     raw_id = entry.get("workflowId") if kind == "workflow" else entry.get("appId")
     return str(raw_id or entry.get("id") or "").strip()
+
+def runninghub_entry_is_backup_visible(entry):
+    return isinstance(entry, dict) and entry.get("hidden") is not True and entry.get("purged") is not True
 
 def static_runninghub_thumbnail_url(entry_id, kind):
     entry_id = re.sub(r"[^0-9A-Za-z_-]", "", str(entry_id or "").strip())
@@ -1108,6 +1170,7 @@ def merge_runninghub_system_entries(system_entries, user_entries, kind):
         entry_id = runninghub_entry_id(entry, kind)
         if not entry_id:
             continue
+        entry["builtin"] = True
         index[entry_id] = len(merged)
         merged.append(entry)
     for entry in apply_runninghub_system_thumbnails(user_entries or [], kind):
@@ -1117,6 +1180,8 @@ def merge_runninghub_system_entries(system_entries, user_entries, kind):
         if entry.get("hidden") is True:
             hidden_ids.add(entry_id)
             if entry_id in index:
+                if merged[index[entry_id]].get("builtin") is True and entry.get("userDefined") is not True:
+                    entry["builtin"] = True
                 merged.pop(index[entry_id])
                 index = {runninghub_entry_id(item, kind): idx for idx, item in enumerate(merged)}
             index[entry_id] = len(merged)
@@ -1318,7 +1383,7 @@ def normalize_provider(item):
     video_models = model_list_from_values(item.get("video_models") or [])
     if locked_rule and "video_models" in locked_rule:
         video_models = model_list_from_values(locked_rule.get("video_models") or [])
-    return {
+    normalized = {
         "id": provider_id,
         "name": name,
         "base_url": base_url,
@@ -1333,6 +1398,8 @@ def normalize_provider(item):
         "video_models": video_models,
         "model_names": normalize_model_name_map(item.get("model_names")),
         "model_protocols": normalize_model_protocols(item.get("model_protocols")),
+        "model_image_strategies": normalize_model_image_strategies(item.get("model_image_strategies")),
+        "image_model_resolution_maps": normalize_image_model_resolution_maps(item.get("image_model_resolution_maps")),
         "ms_loras": normalize_ms_loras(item.get("ms_loras") or []),
         "ms_defaults_version": int(item.get("ms_defaults_version") or 0),
         "rh_apps": normalize_runninghub_entries(item.get("rh_apps") or [], "app"),
@@ -1340,6 +1407,7 @@ def normalize_provider(item):
         "volcengine_project_name": volc_project,
         "volcengine_region": volc_region,
     }
+    return prune_retired_legacy_runninghub_stubs(normalized)
 
 def load_api_providers():
     defaults = default_api_providers()
@@ -1374,6 +1442,8 @@ def default_runninghub_static_provider():
         "chat_models": [],
         "video_models": [],
         "model_protocols": {},
+        "model_image_strategies": {},
+        "image_model_resolution_maps": {},
         "ms_loras": [],
         "ms_defaults_version": 0,
         "rh_apps": [],
@@ -1425,7 +1495,7 @@ def sync_runninghub_provider_workflows_to_static_template(provider):
     seen = set()
     for entry in normalize_runninghub_entries(provider.get("rh_workflows") or [], "workflow"):
         key = runninghub_workflow_store_key(entry.get("workflowId") or entry.get("id"))
-        if not key or entry.get("hidden") is True or key in seen:
+        if not key or entry.get("hidden") is True or entry.get("purged") is True or key in seen:
             continue
         seen.add(key)
         workflows.append(entry)
@@ -1674,8 +1744,12 @@ def fetch_remote_update_notes(url: str, version: str = "", timeout: float = 5.0)
     return info
 
 def fetch_update_notes_with_fallback(preferred_source: str, version: str, timeout: float = 3.0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    urls = {"github": GITHUB_UPDATE_NOTES_URL}
-    order = ["github"]
+    urls = {
+        "github": GITHUB_UPDATE_NOTES_URL,
+        "modelscope": MODELSCOPE_UPDATE_NOTES_URL,
+    }
+    preferred = preferred_source if preferred_source in urls else "github"
+    order = [preferred, "modelscope" if preferred == "github" else "github"]
     notes_by_source: Dict[str, Any] = {}
     best_notes: Dict[str, Any] = {"version": version, "items": []}
     for source in order:
@@ -1882,6 +1956,13 @@ def app_info():
                 "tree_url": GITHUB_TREE_URL,
                 "update_notes_url": GITHUB_UPDATE_NOTES_URL,
             },
+            "modelscope": {
+                "label": "qisese70 ModelScope",
+                "repo_url": MODELSCOPE_REPO_URL,
+                "version_url": MODELSCOPE_VERSION_URL,
+                "tree_url": MODELSCOPE_TREE_URL,
+                "update_notes_url": MODELSCOPE_UPDATE_NOTES_URL,
+            },
         },
         "update_notes": read_local_update_notes(version),
     }
@@ -1921,9 +2002,12 @@ def connectivity_probe(name: str, url: str, timeout: float = 5.0) -> Dict[str, A
 
 def update_connectivity_targets() -> List[Tuple[str, str, str, bool]]:
     return [
-        ("定制版更新列表", GITHUB_TREE_URL, "github", True),
-        ("定制版版本文件", GITHUB_VERSION_URL, "github", True),
-        ("定制版项目主页", GITHUB_REPO_URL, "github", False),
+        ("GitHub 更新列表", GITHUB_TREE_URL, "github", True),
+        ("GitHub 版本文件", GITHUB_VERSION_URL, "github", True),
+        ("GitHub 项目主页", GITHUB_REPO_URL, "github", False),
+        ("ModelScope 更新列表", MODELSCOPE_TREE_URL, "modelscope", True),
+        ("ModelScope 版本文件", MODELSCOPE_VERSION_URL, "modelscope", True),
+        ("ModelScope 空间页面", MODELSCOPE_REPO_URL, "modelscope", False),
         ("Google 连通性", "https://www.google.com/generate_204", "reference", False),
     ]
 
@@ -1948,18 +2032,18 @@ def update_connectivity():
         item["required"] = required
         results.append(item)
     sources = {}
-    for source in ("github",):
+    for source in ("github", "modelscope"):
         source_required = [item for item in results if item.get("source") == source and item.get("required")]
         sources[source] = {
             "ok": all(item["ok"] for item in source_required),
             "required": [item["name"] for item in source_required],
         }
     return {
-        "ok": sources["github"]["ok"],
+        "ok": sources["github"]["ok"] or sources["modelscope"]["ok"],
         "results": results,
         "sources": sources,
-        "required": sources["github"]["required"],
-        "optional": ["定制版项目主页", "Google 连通性"],
+        "required": sources["github"]["required"] + sources["modelscope"]["required"],
+        "optional": ["GitHub 项目主页", "ModelScope 空间页面", "Google 连通性"],
     }
 
 def fetch_remote_version(url: str, timeout: float = 5.0) -> Dict[str, Any]:
@@ -2003,13 +2087,36 @@ def version_gt(a: str, b: str) -> bool:
 
 @app.get("/api/check-update")
 def check_update():
-    """只检测 qianse70 定制仓库，避免任何上游回退覆盖本地定制。"""
+    """并发检测用户自有 GitHub 与 ModelScope 镜像，不访问原作者更新源。"""
     current = current_app_version()
-    github = fetch_remote_version(GITHUB_VERSION_URL, timeout=5.0)
-    github["source"] = "github"
+    holder: Dict[str, Dict[str, Any]] = {}
+
+    def _probe(key: str, url: str):
+        item = fetch_remote_version(url, timeout=5.0)
+        item["source"] = key
+        holder[key] = item
+
+    threads = [
+        Thread(target=_probe, args=("github", GITHUB_VERSION_URL), daemon=True),
+        Thread(target=_probe, args=("modelscope", MODELSCOPE_VERSION_URL), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.5)
+    github = holder.get("github") or {
+        "version": "", "ok": False, "error": "检测超时（超过 5s）",
+        "url": GITHUB_VERSION_URL, "source": "github",
+    }
+    modelscope = holder.get("modelscope") or {
+        "version": "", "ok": False, "error": "检测超时（超过 5s）",
+        "url": MODELSCOPE_VERSION_URL, "source": "modelscope",
+    }
     best: Dict[str, Any] = {}
-    if github["ok"] and github["version"]:
-        best = {"source": "github", "version": github["version"]}
+    for item in (github, modelscope):
+        if item["ok"] and item["version"]:
+            if not best or version_gt(item["version"], best["version"]):
+                best = {"source": item["source"], "version": item["version"]}
     update_available = bool(best and version_gt(best["version"], current))
     notes_by_source: Dict[str, Any] = {}
     if best and best.get("version"):
@@ -2018,11 +2125,12 @@ def check_update():
     return {
         "current": current,
         "github": github,
+        "modelscope": modelscope,
         "latest": best,
         "update_notes": best.get("update_notes") if best else {},
         "update_notes_sources": notes_by_source,
         "update_available": update_available,
-        "reachable": bool(github["ok"]),
+        "reachable": bool(github["ok"] or modelscope["ok"]),
     }
 
 def update_allowed_file(path: str) -> bool:
@@ -2102,6 +2210,46 @@ def download_github_update_files(files: List[str], staging_root: str) -> None:
         os.makedirs(os.path.dirname(stage_path), exist_ok=True)
         with open(stage_path, "wb") as f:
             f.write(data)
+
+def modelscope_update_file_list() -> List[str]:
+    """List only updater-approved files from the public ModelScope mirror."""
+    resp = github_get(MODELSCOPE_TREE_URL, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=30)
+    payload = json.loads(resp.content.decode("utf-8", errors="replace"))
+    entries = ((payload.get("Data") or {}).get("Files")) or []
+    files: List[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("Type") != "blob":
+            continue
+        path = str(entry.get("Path") or "").replace("\\", "/")
+        if update_allowed_file(path):
+            files.append(path)
+    return sorted(set(files))
+
+def modelscope_file_bytes(rel: str) -> bytes:
+    safe_update_target(rel)
+    url = MODELSCOPE_FILE_API_ROOT + urllib.parse.quote(rel, safe="/")
+    resp = github_get(url, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=60)
+    return resp.content
+
+def download_modelscope_update_files(staging_root: str) -> List[str]:
+    files = modelscope_update_file_list()
+    if not files:
+        raise RuntimeError("ModelScope 未返回任何允许更新的文件")
+    if "main.py" not in files or "VERSION" not in files:
+        raise RuntimeError("ModelScope 更新源缺少 main.py 或 VERSION")
+    if not any(path.startswith("static/") for path in files):
+        raise RuntimeError("ModelScope 未返回 static 文件，已取消更新")
+    staging_root_abs = os.path.abspath(staging_root)
+    for rel in files:
+        safe_update_target(rel)
+        data = modelscope_file_bytes(rel)
+        stage_path = os.path.abspath(os.path.join(staging_root_abs, *rel.split("/")))
+        if os.path.commonpath([staging_root_abs, stage_path]) != staging_root_abs:
+            raise ValueError(f"更新暂存路径不安全：{rel}")
+        os.makedirs(os.path.dirname(stage_path), exist_ok=True)
+        with open(stage_path, "wb") as f:
+            f.write(data)
+    return files
 
 def safe_update_target(path: str) -> str:
     rel = str(path or "").replace("\\", "/").lstrip("/")
@@ -2199,7 +2347,7 @@ class UpdateRequest(BaseModel):
     auto_restart: bool = False
     restart_delay: int = 3
     source: str = "github"
-    fallback: bool = False
+    fallback: bool = True
 
 def github_update_file_list() -> Tuple[List[str], List[str], List[str]]:
     tree_data = github_json(GITHUB_TREE_URL, use_etag_cache=True)
@@ -2245,15 +2393,24 @@ def staged_update_file_list(staging_root: str) -> Tuple[List[str], List[str], Li
     static_files = sorted(set(static_files))
     return root_files, static_files, root_files + static_files
 
-UPDATE_SOURCE_LABELS = {"github": "qianse70 GitHub"}
+UPDATE_SOURCE_LABELS = {
+    "github": "qianse70 GitHub",
+    "modelscope": "qisese70 ModelScope",
+}
 
 def normalize_update_source(value: str) -> str:
-    return "github"
+    source = str(value or "github").strip().lower()
+    if source == "ms":
+        return "modelscope"
+    if source not in {"github", "modelscope"}:
+        return "github"
+    return source
 
 def stage_update_from_source(source: str, staging_root: str) -> Tuple[List[str], List[str], List[str]]:
     """下载指定源的更新文件到 staging，返回 (root_files, static_files, files)。失败抛异常。"""
-    if source != "github":
-        raise RuntimeError("qianse70 定制版只允许从自有 GitHub 分支更新")
+    if source == "modelscope":
+        download_modelscope_update_files(staging_root)
+        return staged_update_file_list(staging_root)
     root_files, static_files, files = github_update_file_list()
     download_github_update_files(files, staging_root)
     return root_files, static_files, files
@@ -2411,13 +2568,16 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         raise HTTPException(status_code=409, detail="正在更新中，请稍后再试")
     staging_root = ""
     requested_source = normalize_update_source(req.source)
-    # 定制版只信任自己的发布分支；连接失败就安全停止，绝不回退到上游覆盖定制代码。
-    source_order = ["github"]
+    # 只在两个用户自有源之间兜底，绝不回退到原作者仓库。
+    source_order = [requested_source]
+    if req.fallback:
+        other = "modelscope" if requested_source == "github" else "github"
+        source_order.append(other)
     try:
         backup_root = ""
         backup_manifest: Dict[str, Any] = {}
 
-        # 下载阶段只访问 qianse70 自有 GitHub 分支。
+        # 下载阶段按用户选择优先，失败时才尝试另一个用户自有源。
         source = requested_source
         root_files = static_files = files = None
         download_errors: List[str] = []
@@ -2480,7 +2640,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
 
         staged_static_dir = os.path.join(staging_root, "static")
         if not os.path.isdir(staged_static_dir):
-            raise RuntimeError("GitHub static 暂存目录不存在，已取消更新")
+            raise RuntimeError("更新源的 static 暂存目录不存在，已取消更新")
         static_dir = safe_static_dir()
         backup_static_dir = os.path.join(backup_root, "static")
         if os.path.isdir(static_dir):
@@ -2892,6 +3052,8 @@ class ApiProviderPayload(BaseModel):
     video_models: List[str] = []
     model_names: Dict[str, str] = {}
     model_protocols: Dict[str, str] = {}
+    model_image_strategies: Dict[str, str] = {}
+    image_model_resolution_maps: Dict[str, Dict[str, Any]] = {}
     ms_loras: List[Dict[str, Any]] = []
     ms_defaults_version: int = 0
     rh_apps: List[Dict[str, Any]] = []
@@ -3026,6 +3188,8 @@ class BackupExportRequest(BaseModel):
     runninghub_app_ids: List[str] = []
     runninghub_workflow_ids: List[str] = []
     prompt_library_ids: List[str] = []
+    include_preferences: bool = False
+    preferences: Dict[str, Any] = Field(default_factory=dict)
 
 class SmartCanvasGroupExportItem(BaseModel):
     kind: str = ""
@@ -4859,6 +5023,164 @@ def normalize_model_protocols(value):
                 out[name] = proto
     return out
 
+IMAGE_PARAMETER_STRATEGY_OPTIONS = {"auto", "gpt-image", "banana", "legacy"}
+BANANA_ASPECT_RATIOS = (
+    "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1",
+    "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9",
+)
+
+def normalize_model_image_strategies(value):
+    """规整 {生图模型: 图片参数策略} 覆盖表。"""
+    out = {}
+    if isinstance(value, dict):
+        for raw_name, raw_strategy in value.items():
+            name = str(raw_name or "").strip()
+            strategy = str(raw_strategy or "").strip().lower()
+            if name and strategy in IMAGE_PARAMETER_STRATEGY_OPTIONS and strategy != "auto":
+                out[name] = strategy
+    return out
+
+IMAGE_MODEL_RESOLUTION_KEYS = ("1k", "2k", "4k")
+
+def normalize_image_model_resolution_maps(value):
+    """规整 {逻辑生图模型: {enabled, models:{1k,2k,4k}}}。"""
+    out = {}
+    if not isinstance(value, dict):
+        return out
+    for raw_logical_model, raw_config in value.items():
+        logical_model = str(raw_logical_model or "").strip()
+        if not logical_model or not isinstance(raw_config, dict):
+            continue
+        raw_models = raw_config.get("models")
+        if not isinstance(raw_models, dict):
+            raw_models = {}
+        models = {}
+        for resolution in IMAGE_MODEL_RESOLUTION_KEYS:
+            target = str(raw_models.get(resolution) or raw_models.get(resolution.upper()) or "").strip()
+            if target:
+                models[resolution] = target
+        enabled = bool(raw_config.get("enabled", False))
+        if enabled or models:
+            out[logical_model] = {"enabled": enabled, "models": models}
+    return out
+
+def image_model_resolution_config(provider, model=""):
+    logical_model = str(model or "").strip()
+    maps = (provider or {}).get("image_model_resolution_maps")
+    if not logical_model or not isinstance(maps, dict):
+        return {"enabled": False, "models": {}}
+    config = maps.get(logical_model)
+    if not isinstance(config, dict):
+        return {"enabled": False, "models": {}}
+    normalized = normalize_image_model_resolution_maps({logical_model: config}).get(logical_model)
+    return normalized or {"enabled": False, "models": {}}
+
+def resolve_image_model_for_resolution(provider, model="", resolution=""):
+    """按用户选择的档位解析真实模型；启用映射后不允许静默回退。"""
+    logical_model = str(model or "").strip()
+    config = image_model_resolution_config(provider, logical_model)
+    if not config.get("enabled"):
+        return logical_model
+    requested = str(resolution or "").strip().lower()
+    if requested not in IMAGE_MODEL_RESOLUTION_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"模型「{logical_model}」已启用按分辨率切换，请选择 1K、2K 或 4K。",
+        )
+    effective_model = str((config.get("models") or {}).get(requested) or "").strip()
+    if not effective_model:
+        raise HTTPException(
+            status_code=400,
+            detail=f"模型「{logical_model}」尚未配置 {requested.upper()} 对应的真实模型。",
+        )
+    return effective_model
+
+def is_banana_image_model(model):
+    """识别 OpenAI 兼容中转站常见的 Banana 图片模型名，不改变原生 Gemini 路径。"""
+    raw = str(model or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    compact = re.sub(r"[^a-z0-9]+", "", raw)
+    return (
+        normalized.startswith("nano-banana")
+        or compact.startswith("nanobanana")
+        or normalized.startswith("gemini-3-1-flash-image-preview")
+        or compact.startswith("gemini31flashimagepreview")
+    )
+
+def banana_model_fixed_resolution(model):
+    """返回 Banana 模型 ID 末尾声明的固定档位；无后缀模型返回空。"""
+    raw = str(model or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    if not is_banana_image_model(raw):
+        return ""
+    match = re.search(r"(?:^|-)(1k|2k|4k)$", normalized)
+    return match.group(1) if match else ""
+
+def effective_image_parameter_strategy(provider, model="", effective_model=""):
+    """返回生图模型的图片参数策略；默认自动识别，未知模型保持 legacy。"""
+    overrides = (provider or {}).get("model_image_strategies")
+    model_name = str(model or "").strip()
+    if isinstance(overrides, dict):
+        selected = str(overrides.get(model_name) or "").strip().lower()
+        if selected in {"gpt-image", "banana", "legacy"}:
+            return selected
+        mapped_name = str(effective_model or "").strip()
+        selected = str(overrides.get(mapped_name) or "").strip().lower()
+        if selected in {"gpt-image", "banana", "legacy"}:
+            return selected
+    candidate = str(effective_model or model_name).strip()
+    if is_gpt_image_2_model(candidate):
+        return "gpt-image"
+    return "banana" if is_banana_image_model(candidate) else "legacy"
+
+def banana_image_size(resolution="", size="", model=""):
+    fixed = banana_model_fixed_resolution(model)
+    if fixed:
+        return fixed.upper()
+    requested = str(resolution or "").strip().lower()
+    if requested in {"1k", "2k", "4k"}:
+        return requested.upper()
+    width, height = parse_size_pair(size)
+    edge = max(width or 0, height or 0)
+    pixels = (width or 0) * (height or 0)
+    if edge >= 2800 or pixels >= 7_000_000:
+        return "4K"
+    if edge >= 1600 or pixels >= 2_000_000:
+        return "2K"
+    return "1K"
+
+def banana_aspect_ratio(aspect_ratio="", size=""):
+    value = str(aspect_ratio or "").strip().replace(" ", "")
+    if re.fullmatch(r"\d+:\d+", value):
+        left, right = value.split(":", 1)
+        if int(left) > 0 and int(right) > 0:
+            return f"{int(left)}:{int(right)}"
+    if not value:
+        return ""
+    width, height = parse_size_pair(size)
+    if not width or not height:
+        return "1:1"
+    target = width / height
+    return min(
+        BANANA_ASPECT_RATIOS,
+        key=lambda ratio: abs(target - (int(ratio.split(":")[0]) / int(ratio.split(":")[1]))),
+    )
+
+def build_banana_image_body(model, prompt, size, aspect_ratio="", resolution="", image_payload=None):
+    """构造中转站 Banana 专用字段；不携带旧的 size，避免被上游降级到 1K。"""
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "image_size": banana_image_size(resolution, size, model),
+        "response_format": "url",
+    }
+    normalized_ratio = banana_aspect_ratio(aspect_ratio, size)
+    if normalized_ratio:
+        body["aspect_ratio"] = normalized_ratio
+    if image_payload:
+        body["image"] = image_payload
+    return body
+
 def normalize_model_name_map(value):
     """规整 {模型ID: 展示名}，只保存真正有意义的显示标签。"""
     normalized = {}
@@ -4869,6 +5191,15 @@ def normalize_model_name_map(value):
             if model and label and label != model:
                 normalized[model] = label
     return normalized
+
+def provider_model_display_name(provider, model=""):
+    model_id = str(model or "").strip()
+    names = (provider or {}).get("model_names")
+    if isinstance(names, dict):
+        label = str(names.get(model_id) or "").strip()
+        if label:
+            return label
+    return model_id
 
 def effective_protocol(provider, model=""):
     """返回某模型实际生效的协议：优先单模型覆盖，否则用平台全局协议。"""
@@ -8460,8 +8791,8 @@ def convert_output_to_jpg(url, quality=88):
         return url
 
 ADAPTIVE_STRETCH_RATIOS = {
-    "1:1", "2:3", "3:2", "3:4", "4:3",
-    "4:5", "5:4", "9:16", "16:9", "21:9",
+    "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1",
+    "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9",
 }
 
 def normalized_stretch_aspect_ratio(value):
@@ -11490,6 +11821,8 @@ async def generate_runninghub_video(payload, provider):
 
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution=""):
     provider = get_api_provider(provider_id)
+    requested_model = str(model or "").strip()
+    model = resolve_image_model_for_resolution(provider, requested_model, resolution)
     if is_tudou_provider(provider):
         model = tudou_image_model_for_request(model)
     if provider["id"] == "modelscope":
@@ -11502,7 +11835,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_jimeng_provider_image(prompt, size, model, reference_images, provider)
     if is_runninghub_provider(provider):
         return await generate_runninghub_provider_image(prompt, size, model, reference_images, provider)
-    if effective_protocol(provider, model) == "gemini":
+    if effective_protocol(provider, requested_model) == "gemini":
         return await generate_gemini_provider_image(prompt, size, model, reference_images, provider)
     if is_volcengine_provider(provider):
         return await generate_volcengine_provider_image(prompt, size, model, reference_images, provider)
@@ -11510,7 +11843,6 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_tudou_async_image(prompt, size, quality, model, reference_images, provider, aspect_ratio, resolution)
     if is_tudou_provider(provider) and is_tudou_grok_image_model(model):
         return await generate_tudou_grok_image(prompt, size, model, reference_images, provider, aspect_ratio)
-    is_gpt2 = is_gpt_image_2_model(model)
     is_apimart = is_apimart_provider(provider)
     # 不对 GPT 尺寸做任何缩小/拦截：用户选什么尺寸就原样发给上游；
     # 若超过 GPT 的最大像素限制被上游拒绝，再由 friendly_image_error_detail 给出友好的像素上限提示。
@@ -11526,6 +11858,8 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
     mask_refs = [ref for ref in refs if str(ref.get("role") or "").strip().lower() == "mask" or str(ref.get("name") or "").lower().endswith("_mask.png")]
     image_refs = [ref for ref in refs if ref not in mask_refs]
     image_request_mode = effective_image_request_mode(provider, model)
+    image_parameter_strategy = effective_image_parameter_strategy(provider, requested_model, model)
+    is_gpt2 = image_parameter_strategy == "gpt-image"
     request_timeout = httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0) if (is_gpt2 or is_apimart or image_request_mode in {"openai-json", "openai-video-proxy", "openai-responses"}) else AI_REQUEST_TIMEOUT
     async with httpx.AsyncClient(timeout=request_timeout) as client:
         response = None
@@ -11540,7 +11874,22 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 files=edit_files if edit_files is not None else {},
             )
 
-        if image_request_mode == "openai-video-proxy":
+        if image_parameter_strategy == "banana" and image_request_mode == "openai" and not is_apimart:
+            image_payload = [
+                reference_to_data_url(ref, max_size=1536)
+                for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]
+            ]
+            image_payload = [value for value in image_payload if value]
+            body = build_banana_image_body(
+                model, prompt, size, aspect_ratio, resolution,
+                image_payload=image_payload,
+            )
+            response = await client.post(
+                gen_url,
+                headers=api_headers(provider=provider, model=model),
+                json=body,
+            )
+        elif image_request_mode == "openai-video-proxy":
             body = {
                 "model": model,
                 "prompt": prompt,
@@ -13549,7 +13898,10 @@ async def ai_models():
 
 @app.get("/api/providers")
 async def api_providers():
-    return {"providers": public_api_providers()}
+    return JSONResponse(
+        content={"providers": public_api_providers()},
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
 
 @app.put("/api/providers")
 async def save_providers(payload: List[ApiProviderPayload]):
@@ -14303,6 +14655,8 @@ async def build_online_image_result(payload: OnlineImageRequest):
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
     operation = str(payload.operation or "").strip().lower()
+    effective_model = model if operation == "upscale" else resolve_image_model_for_resolution(provider, model, payload.resolution)
+    model_display_name = provider_model_display_name(provider, model)
     if operation == "upscale":
         if not is_jimeng_provider(provider):
             raise HTTPException(status_code=400, detail="图片放大目前仅支持即梦（Dreamina）平台")
@@ -14355,11 +14709,13 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "timestamp": time.time(),
         "type": "online",
         "model": model,
+        "model_display_name": model_display_name,
+        "effective_model": effective_model,
         "provider_id": provider["id"],
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs},
+        "params": {"provider_id": provider["id"], "model": model, "logical_model": model, "model_display_name": model_display_name, "effective_model": effective_model, "resolution": payload.resolution, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)
@@ -14826,6 +15182,10 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
 
 @app.post("/api/canvas-image-tasks")
 async def create_canvas_image_task(payload: OnlineImageRequest):
+    provider = get_api_provider(payload.provider_id)
+    default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
+    logical_model = selected_model(payload.model, default_model)
+    effective_model = logical_model if str(payload.operation or "").strip().lower() == "upscale" else resolve_image_model_for_resolution(provider, logical_model, payload.resolution)
     task_id = f"canvas_img_{uuid.uuid4().hex}"
     with CANVAS_TASK_LOCK:
         CANVAS_TASKS[task_id] = {
@@ -14837,7 +15197,10 @@ async def create_canvas_image_task(payload: OnlineImageRequest):
             "result": None,
             "error": "",
             "provider_id": payload.provider_id,
-            "model": payload.model,
+            "model": logical_model,
+            "model_display_name": provider_model_display_name(provider, logical_model),
+            "effective_model": effective_model,
+            "resolution": payload.resolution,
         }
     asyncio.create_task(run_canvas_image_task(task_id, payload))
     return {"task_id": task_id, "status": "queued"}
@@ -16797,11 +17160,11 @@ def backup_options_payload():
     apps_payload = [{
         "id": str(item.get("appId") or item.get("id") or ""),
         "title": item.get("title") or item.get("name") or str(item.get("appId") or item.get("id") or "AI 应用"),
-    } for item in runninghub.get("rh_apps") or [] if isinstance(item, dict) and (item.get("appId") or item.get("id"))]
+    } for item in runninghub.get("rh_apps") or [] if runninghub_entry_is_backup_visible(item) and (item.get("appId") or item.get("id"))]
     workflows_payload = [{
         "id": str(item.get("workflowId") or item.get("id") or ""),
         "title": item.get("title") or item.get("name") or str(item.get("workflowId") or item.get("id") or "工作流"),
-    } for item in runninghub.get("rh_workflows") or [] if isinstance(item, dict) and (item.get("workflowId") or item.get("id"))]
+    } for item in runninghub.get("rh_workflows") or [] if runninghub_entry_is_backup_visible(item) and (item.get("workflowId") or item.get("id"))]
     prompt_data = load_prompt_libraries()
     prompt_payload = [{
         "id": library.get("id"),
@@ -16813,6 +17176,7 @@ def backup_options_payload():
         "providers": providers_payload,
         "runninghub": {"apps": apps_payload, "workflows": workflows_payload},
         "prompt_libraries": prompt_payload,
+        "preferences": {"available": True, "label": "界面与使用偏好"},
     }
 
 def backup_file_sha256(path):
@@ -16870,10 +17234,42 @@ def backup_summary_from_manifest(manifest):
         "providers": manifest.get("providers") or [],
         "runninghub": manifest.get("runninghub") or {"apps": [], "workflows": []},
         "prompt_libraries": manifest.get("prompt_libraries") or [],
+        "preferences": manifest.get("preferences") or {"available": False},
         "resource_count": len(resources),
         "resource_bytes": sum(max(0, int(item.get("size") or 0)) for item in resources),
         "missing_resources": manifest.get("missing_resources") or [],
     }
+
+def backup_filter_runninghub_summary(archive, manifest, summary):
+    configs = manifest.get("configs") if isinstance(manifest.get("configs"), dict) else {}
+    member = configs.get("runninghub")
+    if not member:
+        return summary
+    payload = backup_archive_json(archive, member, default={})
+    if not isinstance(payload, dict):
+        return summary
+    visible_apps = {
+        str(item.get("appId") or item.get("id") or "")
+        for item in payload.get("apps") or []
+        if runninghub_entry_is_backup_visible(item)
+    }
+    visible_workflows = {
+        str(item.get("workflowId") or item.get("id") or "")
+        for item in payload.get("workflows") or []
+        if runninghub_entry_is_backup_visible(item)
+    }
+    filtered = copy.deepcopy(summary)
+    runninghub = filtered.get("runninghub") if isinstance(filtered.get("runninghub"), dict) else {}
+    runninghub["apps"] = [
+        item for item in runninghub.get("apps") or []
+        if isinstance(item, dict) and str(item.get("id") or "") in visible_apps
+    ]
+    runninghub["workflows"] = [
+        item for item in runninghub.get("workflows") or []
+        if isinstance(item, dict) and str(item.get("id") or "") in visible_workflows
+    ]
+    filtered["runninghub"] = runninghub
+    return filtered
 
 def backup_load_history():
     try:
@@ -16891,19 +17287,49 @@ def backup_save_history(items):
 def backup_conflicts_for_summary(summary):
     existing_projects = load_projects()
     project_names = {str(item.get("name") or "") for item in existing_projects}
-    provider_ids = {str(item.get("id") or "") for item in load_api_providers()}
+    existing_providers = [item for item in load_api_providers() if isinstance(item, dict)]
+    existing_provider_by_id = {str(item.get("id") or ""): item for item in existing_providers}
+    provider_conflicts = []
+    provider_id_collisions = []
+    for item in summary.get("providers") or []:
+        if not isinstance(item, dict):
+            continue
+        provider_id = str(item.get("id") or "")
+        local = existing_provider_by_id.get(provider_id)
+        if not local:
+            continue
+        incoming_url = str(backup_io.sanitize_portable_config(item.get("base_url") or "") or "")
+        local_url = str(backup_io.sanitize_portable_config(local.get("base_url") or "") or "")
+        if not incoming_url or backup_io.normalize_provider_url(incoming_url) == backup_io.normalize_provider_url(local_url):
+            provider_conflicts.append(provider_id)
+        else:
+            provider_id_collisions.append({
+                "id": provider_id,
+                "name": item.get("name") or provider_id,
+                "local_base_url": local_url,
+                "backup_base_url": incoming_url,
+            })
     runninghub = backup_runninghub_provider()
     app_ids = {str(item.get("appId") or item.get("id") or "") for item in runninghub.get("rh_apps") or [] if isinstance(item, dict)}
     workflow_ids = {str(item.get("workflowId") or item.get("id") or "") for item in runninghub.get("rh_workflows") or [] if isinstance(item, dict)}
     prompt_ids = {str(item.get("id") or "") for item in (load_prompt_libraries().get("libraries") or []) if isinstance(item, dict)}
     history = backup_load_history()
+    backup_runninghub = summary.get("runninghub") if isinstance(summary.get("runninghub"), dict) else {}
+    backup_runninghub_url = str(backup_io.sanitize_portable_config(backup_runninghub.get("base_url") or "") or "").strip()
+    local_runninghub_url = str(backup_io.sanitize_portable_config(runninghub.get("base_url") or "") or "").strip()
     return {
         "projects": [item.get("id") for item in summary.get("projects") or [] if str(item.get("name") or "") in project_names],
-        "providers": [item.get("id") for item in summary.get("providers") or [] if str(item.get("id") or "") in provider_ids],
+        "providers": provider_conflicts,
+        "provider_id_collisions": provider_id_collisions,
         "runninghub_apps": [item.get("id") for item in (summary.get("runninghub") or {}).get("apps") or [] if str(item.get("id") or "") in app_ids],
         "runninghub_workflows": [item.get("id") for item in (summary.get("runninghub") or {}).get("workflows") or [] if str(item.get("id") or "") in workflow_ids],
         "prompt_libraries": [item.get("id") for item in summary.get("prompt_libraries") or [] if str(item.get("id") or "") in prompt_ids],
         "already_imported": bool(summary.get("backup_id") and any(str(item.get("backup_id") or "") == str(summary.get("backup_id")) for item in history if isinstance(item, dict))),
+        "runninghub_endpoint": {
+            "backup_base_url": backup_runninghub_url,
+            "local_base_url": local_runninghub_url,
+            "changed": bool(backup_runninghub_url and backup_io.normalize_provider_url(backup_runninghub_url) != backup_io.normalize_provider_url(local_runninghub_url)),
+        },
     }
 
 def build_backup_archive(payload):
@@ -16934,17 +17360,19 @@ def build_backup_archive(payload):
         provider_configs.append(clean)
 
     runninghub_provider = backup_runninghub_provider()
+    runninghub_base_url = backup_io.sanitize_portable_config(runninghub_provider.get("base_url") or "")
     selected_app_ids = set(backup_id_set(payload.runninghub_app_ids, 5000))
     selected_workflow_ids = set(backup_id_set(payload.runninghub_workflow_ids, 5000))
     runninghub_apps = [backup_io.sanitize_portable_config(item) for item in runninghub_provider.get("rh_apps") or []
-        if isinstance(item, dict) and str(item.get("appId") or item.get("id") or "") in selected_app_ids]
+        if runninghub_entry_is_backup_visible(item) and str(item.get("appId") or item.get("id") or "") in selected_app_ids]
     runninghub_workflows = [backup_io.sanitize_portable_config(item) for item in runninghub_provider.get("rh_workflows") or []
-        if isinstance(item, dict) and str(item.get("workflowId") or item.get("id") or "") in selected_workflow_ids]
+        if runninghub_entry_is_backup_visible(item) and str(item.get("workflowId") or item.get("id") or "") in selected_workflow_ids]
 
     selected_prompt_ids = set(backup_id_set(payload.prompt_library_ids, 500))
     prompt_source = load_prompt_libraries()
     prompt_libraries = [backup_io.sanitize_portable_config(item) for item in prompt_source.get("libraries") or []
         if isinstance(item, dict) and str(item.get("id") or "") in selected_prompt_ids]
+    portable_preferences = backup_io.normalize_portable_preferences(payload.preferences) if payload.include_preferences else {}
     prompt_thumbnail_exports = []
     for library in prompt_libraries:
         for item in library.get("items") or []:
@@ -16960,7 +17388,7 @@ def build_backup_archive(payload):
             item["thumbnail"] = f"backup://{member}"
             prompt_thumbnail_exports.append((source_path, member, digest))
 
-    if not (selected_projects or canvas_payloads or provider_configs or runninghub_apps or runninghub_workflows or prompt_libraries):
+    if not (selected_projects or canvas_payloads or provider_configs or runninghub_apps or runninghub_workflows or prompt_libraries or portable_preferences):
         raise ValueError("请至少选择一项备份内容")
 
     timestamp = now_ms()
@@ -16989,12 +17417,18 @@ def build_backup_archive(payload):
         "backup_id": backup_id,
         "created_at": timestamp,
         "projects": project_entries,
-        "providers": [{"id": item.get("id"), "name": item.get("name") or item.get("id")} for item in provider_configs],
+        "providers": [{
+            "id": item.get("id"),
+            "name": item.get("name") or item.get("id"),
+            "base_url": item.get("base_url") or "",
+        } for item in provider_configs],
         "runninghub": {
+            "base_url": runninghub_base_url if (runninghub_apps or runninghub_workflows) else "",
             "apps": [{"id": item.get("appId") or item.get("id"), "title": item.get("title") or item.get("name") or "AI 应用"} for item in runninghub_apps],
             "workflows": [{"id": item.get("workflowId") or item.get("id"), "title": item.get("title") or item.get("name") or "工作流"} for item in runninghub_workflows],
         },
         "prompt_libraries": [{"id": item.get("id"), "name": item.get("name") or "提示词库", "item_count": len(item.get("items") or [])} for item in prompt_libraries],
+        "preferences": {"available": bool(portable_preferences)},
         "resources": [],
         "missing_resources": [],
         "configs": {},
@@ -17040,7 +17474,11 @@ def build_backup_archive(payload):
                 archive.writestr("configs/providers.json", backup_json_bytes(provider_configs))
             if runninghub_apps or runninghub_workflows:
                 manifest["configs"]["runninghub"] = "configs/runninghub.json"
-                archive.writestr("configs/runninghub.json", backup_json_bytes({"apps": runninghub_apps, "workflows": runninghub_workflows}))
+                archive.writestr("configs/runninghub.json", backup_json_bytes({
+                    "base_url": runninghub_base_url,
+                    "apps": runninghub_apps,
+                    "workflows": runninghub_workflows,
+                }))
             if prompt_libraries:
                 manifest["configs"]["prompt_libraries"] = "configs/prompt-libraries.json"
                 written_prompt_thumbnails = set()
@@ -17050,6 +17488,9 @@ def build_backup_archive(payload):
                     archive.write(source_path, member)
                     written_prompt_thumbnails.add(digest)
                 archive.writestr("configs/prompt-libraries.json", backup_json_bytes({"active_library_id": prompt_source.get("active_library_id"), "libraries": prompt_libraries}))
+            if portable_preferences:
+                manifest["configs"]["preferences"] = "configs/preferences.json"
+                archive.writestr("configs/preferences.json", backup_json_bytes(portable_preferences))
             archive.writestr("manifest.json", backup_json_bytes(manifest))
         date = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
         return archive_path, f"Infinite-Canvas备份_{date}.zip"
@@ -17089,7 +17530,7 @@ async def backup_save_upload(upload):
 def inspect_backup_path(path):
     with zipfile.ZipFile(path, "r") as archive:
         manifest = backup_read_manifest(archive)
-    summary = backup_summary_from_manifest(manifest)
+        summary = backup_filter_runninghub_summary(archive, manifest, backup_summary_from_manifest(manifest))
     return {"backup": summary, "conflicts": backup_conflicts_for_summary(summary)}
 
 def backup_copy_resource(archive, item, created_paths):
@@ -17180,7 +17621,7 @@ def import_backup_path(path, selection):
     with BACKUP_IMPORT_LOCK:
         with zipfile.ZipFile(path, "r") as archive:
             manifest = backup_read_manifest(archive)
-            summary = backup_summary_from_manifest(manifest)
+            summary = backup_filter_runninghub_summary(archive, manifest, backup_summary_from_manifest(manifest))
             project_entries = {str(item.get("id")): item for item in manifest.get("projects") or [] if isinstance(item, dict) and item.get("id")}
             all_canvas_entries = {}
             for project in project_entries.values():
@@ -17211,6 +17652,21 @@ def import_backup_path(path, selection):
             original_prompts = copy.deepcopy(load_prompt_libraries())
             original_workflows = copy.deepcopy(load_runninghub_workflow_store())
             projects_changed = providers_changed = prompts_changed = workflows_changed = False
+            provider_id_map = {}
+            runninghub_endpoint_changed = False
+            runninghub_keys_cleared = False
+            runninghub_key_snapshot = None
+            imported_provider_count = 0
+            skipped_provider_count = 0
+            imported_runninghub_app_count = 0
+            skipped_runninghub_app_count = 0
+            imported_runninghub_workflow_count = 0
+            skipped_runninghub_workflow_count = 0
+            imported_prompt_library_count = 0
+            skipped_prompt_library_count = 0
+            runninghub_changed = False
+            imported_preferences = {}
+            runninghub_workflows_need_static_sync = False
             try:
                 if selection.get("include_assets", True):
                     for item in manifest.get("resources") or []:
@@ -17278,33 +17734,75 @@ def import_backup_path(path, selection):
                     primary_by_id = {str(item.get("id") or ""): bool(item.get("primary")) for item in providers}
                     for item in incoming:
                         item["primary"] = primary_by_id.get(str(item.get("id") or ""), False)
-                    providers, provider_stats = backup_io.merge_entries_by_id(
+                    providers, provider_stats, provider_id_map = backup_io.merge_provider_entries_by_identity(
                         providers,
                         incoming,
-                        id_keys=("id",),
                         overwrite=str(selection.get("provider_conflict") or "keep-local") == "backup",
                     )
+                    imported_provider_count = sum(
+                        int(provider_stats.get(key) or 0) for key in ("imported", "overwritten", "cloned")
+                    )
+                    skipped_provider_count = int(provider_stats.get("skipped") or 0)
                     providers_changed = providers_changed or bool(
-                        provider_stats.get("imported") or provider_stats.get("overwritten")
+                        imported_provider_count
                     )
 
                 rh_member = configs.get("runninghub")
                 workflow_store = copy.deepcopy(original_workflows)
                 if rh_member:
                     rh_payload = backup_archive_json(archive, rh_member, default={})
+                    backup_rh_base_url = str(rh_payload.get("base_url") or (summary.get("runninghub") or {}).get("base_url") or "").strip().rstrip("/")
                     selected_app_ids = backup_selected_ids(selection, "runninghub_app_ids", [item.get("id") for item in (summary.get("runninghub") or {}).get("apps") or []])
                     selected_workflow_ids = backup_selected_ids(selection, "runninghub_workflow_ids", [item.get("id") for item in (summary.get("runninghub") or {}).get("workflows") or []])
-                    incoming_apps = [item for item in rh_payload.get("apps") or [] if isinstance(item, dict) and str(item.get("appId") or item.get("id") or "") in selected_app_ids]
-                    incoming_workflows = [item for item in rh_payload.get("workflows") or [] if isinstance(item, dict) and str(item.get("workflowId") or item.get("id") or "") in selected_workflow_ids]
+                    incoming_apps = [item for item in rh_payload.get("apps") or [] if runninghub_entry_is_backup_visible(item) and str(item.get("appId") or item.get("id") or "") in selected_app_ids]
+                    incoming_workflows = [item for item in rh_payload.get("workflows") or [] if runninghub_entry_is_backup_visible(item) and str(item.get("workflowId") or item.get("id") or "") in selected_workflow_ids]
+                    import_rh_endpoint = bool(backup_rh_base_url and (selected_app_ids or selected_workflow_ids))
                     rh_provider = next((item for item in providers if item.get("id") == "runninghub"), None)
-                    if rh_provider is None and (incoming_apps or incoming_workflows):
+                    if rh_provider is None and (import_rh_endpoint or incoming_apps or incoming_workflows):
                         rh_provider = default_runninghub_static_provider()
                         providers.append(rh_provider)
                     if rh_provider is not None:
+                        local_rh_base_url = str(rh_provider.get("base_url") or "").strip().rstrip("/")
+                        runninghub_endpoint_changed = bool(
+                            import_rh_endpoint
+                            and backup_io.normalize_provider_url(backup_rh_base_url)
+                            != backup_io.normalize_provider_url(local_rh_base_url)
+                        )
+                        if import_rh_endpoint:
+                            rh_provider["base_url"] = backup_rh_base_url
+                            providers_changed = providers_changed or runninghub_endpoint_changed
+                            runninghub_changed = runninghub_changed or runninghub_endpoint_changed
+                        if runninghub_endpoint_changed:
+                            runninghub_key_snapshot = {
+                                provider_key_env("runninghub"): provider_env_key_value("runninghub"),
+                                runninghub_wallet_key_env(): runninghub_wallet_key_value(),
+                            }
                         overwrite_rh = str(selection.get("runninghub_conflict") or "keep-local") == "backup"
                         old_workflow_ids = {str(item.get("workflowId") or item.get("id") or "") for item in rh_provider.get("rh_workflows") or [] if isinstance(item, dict)}
-                        rh_provider["rh_apps"], _ = backup_io.merge_entries_by_id(rh_provider.get("rh_apps") or [], incoming_apps, id_keys=("appId", "id"), overwrite=overwrite_rh)
-                        rh_provider["rh_workflows"], _ = backup_io.merge_entries_by_id(rh_provider.get("rh_workflows") or [], incoming_workflows, id_keys=("workflowId", "id"), overwrite=overwrite_rh)
+                        revive_keys = ("hidden", "recycled", "purged", "deletedAt", "deleted_at") if overwrite_rh else ()
+                        rh_provider["rh_apps"], rh_app_stats = backup_io.merge_entries_by_id(
+                            rh_provider.get("rh_apps") or [], incoming_apps,
+                            id_keys=("appId", "id"), overwrite=overwrite_rh, clear_keys=revive_keys
+                        )
+                        rh_provider["rh_workflows"], rh_workflow_stats = backup_io.merge_entries_by_id(
+                            rh_provider.get("rh_workflows") or [], incoming_workflows,
+                            id_keys=("workflowId", "id"), overwrite=overwrite_rh, clear_keys=revive_keys
+                        )
+                        imported_runninghub_app_count = sum(
+                            int(rh_app_stats.get(key) or 0) for key in ("imported", "overwritten")
+                        )
+                        skipped_runninghub_app_count = int(rh_app_stats.get("skipped") or 0)
+                        imported_runninghub_workflow_count = sum(
+                            int(rh_workflow_stats.get(key) or 0) for key in ("imported", "overwritten")
+                        )
+                        skipped_runninghub_workflow_count = int(rh_workflow_stats.get("skipped") or 0)
+                        runninghub_changed = runninghub_changed or bool(
+                            imported_runninghub_app_count or imported_runninghub_workflow_count
+                        )
+                        runninghub_workflows_need_static_sync = bool(
+                            imported_runninghub_workflow_count
+                            and overwrite_rh
+                        )
                         for workflow in incoming_workflows:
                             workflow_id = runninghub_workflow_store_key(workflow.get("workflowId") or workflow.get("id"))
                             if not workflow_id or (workflow_id in old_workflow_ids and not overwrite_rh):
@@ -17320,8 +17818,10 @@ def import_backup_path(path, selection):
                                 "updatedAt": now_ms(),
                             }
                             workflows_changed = True
-                        if incoming_apps or incoming_workflows:
-                            providers_changed = True
+                            runninghub_changed = True
+                        providers_changed = providers_changed or bool(
+                            imported_runninghub_app_count or imported_runninghub_workflow_count
+                        )
 
                 prompts = copy.deepcopy(original_prompts)
                 prompt_member = configs.get("prompt_libraries")
@@ -17335,7 +17835,9 @@ def import_backup_path(path, selection):
                     incoming_prompts = backup_restore_prompt_thumbnails(archive, incoming_prompts, created_prompt_thumbnail_paths)
                     created_resource_paths.extend(created_prompt_thumbnail_paths)
                     prompts, prompt_stats = backup_io.merge_prompt_libraries(prompts, incoming_prompts)
-                    prompts_changed = bool(prompt_stats.get("imported") or prompt_stats.get("libraries_added"))
+                    prompts_changed = bool(prompt_stats.get("libraries_changed"))
+                    imported_prompt_library_count = int(prompt_stats.get("libraries_changed") or 0)
+                    skipped_prompt_library_count = int(prompt_stats.get("libraries_skipped") or 0)
                     used_prompt_thumbnail_paths = {
                         prompt_thumbnail_path(item.get("thumbnail"))
                         for library in prompts.get("libraries") or []
@@ -17352,8 +17854,16 @@ def import_backup_path(path, selection):
                         if created_path in created_resource_paths:
                             created_resource_paths.remove(created_path)
 
+                preference_member = configs.get("preferences")
+                if preference_member and bool(selection.get("include_preferences")):
+                    imported_preferences = backup_io.normalize_portable_preferences(
+                        backup_archive_json(archive, preference_member, default={})
+                    )
+
                 os.makedirs(CANVAS_DIR, exist_ok=True)
                 for canvas in imported_canvas_records:
+                    if provider_id_map:
+                        canvas = backup_io.rewrite_provider_references(canvas, provider_id_map)
                     path_out = canvas_path(canvas["id"])
                     with CANVAS_LOCK:
                         with open(path_out, "x", encoding="utf-8") as handle:
@@ -17367,6 +17877,20 @@ def import_backup_path(path, selection):
                     save_prompt_libraries(prompts)
                 if workflows_changed:
                     save_runninghub_workflow_store(workflow_store)
+                if runninghub_endpoint_changed:
+                    update_env_values({
+                        provider_key_env("runninghub"): "",
+                        runninghub_wallet_key_env(): "",
+                    })
+                    runninghub_keys_cleared = True
+                    reload_env_globals()
+                if runninghub_workflows_need_static_sync:
+                    restored_runninghub = next(
+                        (item for item in providers if item.get("id") == "runninghub"),
+                        None,
+                    )
+                    if restored_runninghub:
+                        sync_runninghub_provider_workflows_to_static_template(restored_runninghub)
 
                 try:
                     history = backup_load_history()
@@ -17381,7 +17905,19 @@ def import_backup_path(path, selection):
                     "resources": len(url_mapping),
                     "providers_changed": providers_changed,
                     "prompts_changed": prompts_changed,
-                    "runninghub_changed": workflows_changed,
+                    "runninghub_changed": runninghub_changed,
+                    "providers_imported": imported_provider_count,
+                    "providers_skipped": skipped_provider_count,
+                    "runninghub_apps_imported": imported_runninghub_app_count,
+                    "runninghub_apps_skipped": skipped_runninghub_app_count,
+                    "runninghub_workflows_imported": imported_runninghub_workflow_count,
+                    "runninghub_workflows_skipped": skipped_runninghub_workflow_count,
+                    "prompt_libraries_imported": imported_prompt_library_count,
+                    "prompt_libraries_skipped": skipped_prompt_library_count,
+                    "runninghub_endpoint_changed": runninghub_endpoint_changed,
+                    "runninghub_keys_cleared": runninghub_keys_cleared,
+                    "provider_id_map": provider_id_map,
+                    "preferences": imported_preferences,
                 }
             except Exception:
                 for canvas_path_created in created_canvas_paths:
@@ -17395,6 +17931,9 @@ def import_backup_path(path, selection):
                     except OSError:
                         pass
                 try:
+                    if runninghub_keys_cleared and runninghub_key_snapshot is not None:
+                        update_env_values(runninghub_key_snapshot)
+                        reload_env_globals()
                     if projects_changed:
                         save_projects(original_projects)
                     if providers_changed:
@@ -20014,7 +20553,9 @@ def prune_runninghub_workflow_store_for_provider(provider):
     keep_ids = {
         runninghub_workflow_store_key(entry.get("workflowId") or entry.get("id"))
         for entry in provider.get("rh_workflows") or []
-        if isinstance(entry, dict) and entry.get("hidden") is not True
+        if isinstance(entry, dict)
+        and entry.get("purged") is not True
+        and (entry.get("hidden") is not True or entry.get("recycled") is True)
     }
     keep_ids.discard("")
     removed = False

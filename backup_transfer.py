@@ -12,6 +12,7 @@ import hashlib
 import json
 import posixpath
 import re
+import urllib.parse
 import uuid
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 
@@ -160,6 +161,69 @@ def rewrite_nested_values(value: Any, mapping: Mapping[str, str]) -> Any:
     return copy.deepcopy(value)
 
 
+_PROVIDER_REFERENCE_KEYS = {
+    "apiProvider",
+    "provider_id",
+    "providerId",
+    "videoProvider",
+    "video_provider",
+    "llmProvider",
+    "llm_provider",
+    "imageProvider",
+    "image_provider",
+}
+
+
+def rewrite_provider_references(value: Any, mapping: Mapping[str, str]) -> Any:
+    """Rewrite known provider-ID fields without touching prompt text or arbitrary strings."""
+    if isinstance(value, list):
+        return [rewrite_provider_references(item, mapping) for item in value]
+    if isinstance(value, tuple):
+        return [rewrite_provider_references(item, mapping) for item in value]
+    if not isinstance(value, Mapping):
+        return copy.deepcopy(value)
+    rewritten: Dict[str, Any] = {}
+    for raw_key, item in value.items():
+        key = str(raw_key)
+        if key in _PROVIDER_REFERENCE_KEYS and isinstance(item, str):
+            rewritten[key] = mapping.get(item, item)
+        else:
+            rewritten[key] = rewrite_provider_references(item, mapping)
+    return rewritten
+
+
+def normalize_portable_preferences(value: Any) -> Dict[str, Any]:
+    """Keep the small, non-secret browser preferences that can be portable."""
+    source = value if isinstance(value, Mapping) else {}
+    theme = str(source.get("theme") or "light").strip().lower()
+    if theme not in {"light", "dark"}:
+        theme = "light"
+    scale_mode = str(source.get("scale_mode") or "auto").strip().lower()
+    allowed_scale_modes = {"auto", "60", "65", "70", "75", "80", "85", "90", "95", "100", "115", "125", "140"}
+    if scale_mode not in allowed_scale_modes:
+        scale_mode = "auto"
+
+    def clean_types(items: Any) -> List[str]:
+        result: List[str] = []
+        for raw in items if isinstance(items, (list, tuple)) else []:
+            item = str(raw or "").strip()
+            if item and len(item) <= 80 and item not in result:
+                result.append(item)
+            if len(result) >= 64:
+                break
+        return result
+
+    favorites = source.get("favorites") if isinstance(source.get("favorites"), Mapping) else {}
+    return {
+        "theme": theme,
+        "scale_mode": scale_mode,
+        "favorites": {
+            "favoriteTypes": clean_types(favorites.get("favoriteTypes")),
+            "order": clean_types(favorites.get("order")),
+        },
+    }
+
+
 def _clear_runtime_state(value: Any) -> Any:
     if isinstance(value, list):
         return [_clear_runtime_state(item) for item in value]
@@ -276,13 +340,137 @@ def _unique_imported_label(label: str, used: set[str]) -> str:
     return candidate
 
 
+_PROVIDER_ID_SUFFIX_RE = re.compile(r"^(.*?)-(\d+)$")
+
+
+def normalize_provider_url(value: Any) -> str:
+    """Normalize a provider endpoint for identity comparison only."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    raw = raw.rstrip("/")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw.lower()
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            return raw.lower()
+        default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        netloc = hostname if not port or default_port else f"{hostname}:{port}"
+        path = parsed.path.rstrip("/")
+        safe_query = []
+        for key, query_value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+            if is_sensitive_config_key(key) or _SENSITIVE_QUERY_RE.search(f"?{key}={query_value}"):
+                continue
+            safe_query.append((key, query_value))
+        return urllib.parse.urlunsplit((scheme, netloc, path, urllib.parse.urlencode(safe_query), ""))
+    except Exception:
+        return raw.lower()
+
+
+def next_provider_id(provider_id: Any, existing_ids: Iterable[Any]) -> str:
+    """Return the next available suffix while preserving custom-api-2 style IDs."""
+    source = str(provider_id or "").strip() or "custom-api"
+    used = {str(item or "").strip() for item in existing_ids if str(item or "").strip()}
+    match = _PROVIDER_ID_SUFFIX_RE.fullmatch(source)
+    if match:
+        stem = match.group(1) or source
+        number = max(2, int(match.group(2)) + 1)
+    else:
+        stem = source
+        number = 2
+    candidate = f"{stem}-{number}"
+    while candidate in used:
+        number += 1
+        candidate = f"{stem}-{number}"
+    return candidate
+
+
+def merge_provider_entries_by_identity(
+    existing: Sequence[Mapping[str, Any]],
+    incoming: Sequence[Mapping[str, Any]],
+    *,
+    overwrite: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], Dict[str, str]]:
+    """Merge portable providers without overwriting an ID collision at another URL.
+
+    The returned ID map is source-provider-ID to imported target ID and is used to
+    repair references inside canvases imported from the same archive.
+    """
+    result = [copy.deepcopy(dict(item)) for item in existing if isinstance(item, Mapping)]
+    stats = {"imported": 0, "skipped": 0, "overwritten": 0, "cloned": 0}
+    id_map: Dict[str, str] = {}
+    used_names = {str(item.get("name") or "") for item in result if isinstance(item, Mapping)}
+
+    for raw in incoming:
+        if not isinstance(raw, Mapping):
+            continue
+        item = sanitize_portable_config(raw)
+        source_id = str(item.get("id") or "").strip()
+        if not source_id:
+            continue
+        source_url = normalize_provider_url(item.get("base_url"))
+        same_url_index = next(
+            (
+                index
+                for index, current in enumerate(result)
+                if str(current.get("id") or "").strip() == source_id
+                and normalize_provider_url(current.get("base_url")) == source_url
+            ),
+            None,
+        )
+        same_id_exists = any(str(current.get("id") or "").strip() == source_id for current in result)
+        if same_url_index is not None:
+            target = result[same_url_index]
+            id_map[source_id] = source_id
+            if not overwrite:
+                stats["skipped"] += 1
+                continue
+            primary = target.get("primary", False)
+            result[same_url_index] = {**target, **item, "primary": primary}
+            stats["overwritten"] += 1
+            continue
+
+        if same_id_exists:
+            target_id = next_provider_id(source_id, (current.get("id") for current in result))
+            item["id"] = target_id
+            label = str(item.get("name") or target_id)
+            if label in used_names:
+                item["name"] = _unique_imported_label(label, used_names)
+            else:
+                used_names.add(label)
+            result.append(item)
+            id_map[source_id] = target_id
+            stats["cloned"] += 1
+            continue
+
+        result.append(item)
+        id_map[source_id] = source_id
+        used_names.add(str(item.get("name") or ""))
+        stats["imported"] += 1
+
+    return result, stats, id_map
+
+
 def merge_prompt_libraries(
     existing: Mapping[str, Any], incoming: Mapping[str, Any]
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Merge template items without overwriting local content."""
     merged = copy.deepcopy(dict(existing or {}))
     merged.setdefault("libraries", [])
-    stats = {"imported": 0, "skipped_identical": 0, "libraries_added": 0}
+    stats = {
+        "imported": 0,
+        "skipped_identical": 0,
+        "libraries_added": 0,
+        "libraries_changed": 0,
+        "libraries_skipped": 0,
+    }
     by_id = {str(lib.get("id")): lib for lib in merged["libraries"] if isinstance(lib, dict) and lib.get("id")}
 
     for incoming_library in (incoming or {}).get("libraries", []) or []:
@@ -298,16 +486,19 @@ def merge_prompt_libraries(
             merged["libraries"].append(target)
             by_id[str(target.get("id"))] = target
             stats["libraries_added"] += 1
+            stats["libraries_changed"] += 1
             stats["imported"] += len(target.get("items") or [])
             continue
 
         target.setdefault("categories", [])
         target.setdefault("items", [])
+        library_changed = False
         existing_category_ids = {str(cat.get("id")) for cat in target["categories"] if isinstance(cat, dict)}
         for category in source.get("categories") or []:
             if isinstance(category, dict) and str(category.get("id")) not in existing_category_ids:
                 target["categories"].append(copy.deepcopy(category))
                 existing_category_ids.add(str(category.get("id")))
+                library_changed = True
 
         hashes = {canonical_content_hash(item, ignored_keys=("id", "updated_at", "created_at", "thumbnail")) for item in target["items"] if isinstance(item, dict)}
         used_names = {str(item.get("name") or "") for item in target["items"] if isinstance(item, dict)}
@@ -333,6 +524,12 @@ def merge_prompt_libraries(
             used_ids.add(item["id"])
             hashes.add(digest)
             stats["imported"] += 1
+            library_changed = True
+
+        if library_changed:
+            stats["libraries_changed"] += 1
+        else:
+            stats["libraries_skipped"] += 1
 
     return merged, stats
 
@@ -343,6 +540,7 @@ def merge_entries_by_id(
     *,
     id_keys: Sequence[str] = ("id",),
     overwrite: bool = False,
+    clear_keys: Sequence[str] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     result = [copy.deepcopy(dict(item)) for item in existing if isinstance(item, Mapping)]
 
@@ -362,7 +560,10 @@ def merge_entries_by_id(
             if not overwrite:
                 stats["skipped"] += 1
                 continue
-            result[index[key]] = {**result[index[key]], **item}
+            merged = {**result[index[key]], **item}
+            for clear_key in clear_keys:
+                merged.pop(str(clear_key), None)
+            result[index[key]] = merged
             stats["overwritten"] += 1
             continue
         index[key] = len(result)
