@@ -388,6 +388,22 @@ body.studio-theme-dark .rh-key-item { border-color:var(--line-strong); backgroun
 .rh-key-links a { height:30px; padding:0 11px; border:1px solid var(--line-strong); border-radius:9px; background:var(--panel); color:var(--text); display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:900; text-decoration:none; box-shadow:0 2px 6px rgba(15,23,42,.06); transition:all .15s ease; }
 .rh-key-links a:hover { border-color:var(--text); transform:translateY(-1px); box-shadow:0 8px 18px rgba(15,23,42,.12); }
 .rh-key-links a svg { flex:0 0 auto; }
+.rh-account-panel { display:none; margin-top:12px; gap:12px; }
+body.show-runninghub .rh-account-panel { display:flex; flex-direction:column; }
+.rh-account-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.rh-account-head .key-btn.is-loading svg { animation:rh-account-spin .8s linear infinite; }
+.rh-account-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+.rh-account-card { min-width:0; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--soft); }
+.rh-account-card-head { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--text); font-size:12px; }
+.rh-account-state { color:var(--muted); font-size:10.5px; font-weight:800; white-space:nowrap; }
+.rh-account-state.ok { color:#15803d; }
+.rh-account-state.bad { color:#b45309; }
+.rh-account-card dl { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin:12px 0 0; }
+.rh-account-card dl div { min-width:0; }
+.rh-account-card dt { color:var(--faint); font-size:10px; line-height:1.3; }
+.rh-account-card dd { overflow:hidden; margin:3px 0 0; color:var(--text); font-size:12px; line-height:1.35; font-weight:900; text-overflow:ellipsis; white-space:nowrap; }
+body.studio-theme-dark .rh-account-card { border-color:var(--line-strong); background:rgba(255,255,255,.035); }
+@keyframes rh-account-spin { to { transform:rotate(360deg); } }
 body.show-runninghub .api-standard-key-row,
 body.show-runninghub .api-key-label,
 body.show-runninghub #keyHint { display:none !important; }
@@ -4391,6 +4407,7 @@ html.studio-theme-dark body .onboarding-step-label-alt {
 
 @media (max-width:860px) { .page{padding:24px 16px 60px}.layout{grid-template-columns:1fr;gap:28px}.sidebar{position:static}.form,.model-grid,.endpoint-grid,.rh-card-columns{grid-template-columns:1fr}.models-toolbar{align-items:flex-start;flex-direction:column}.models-toolbar-actions{width:100%;justify-content:flex-end}.lora-row{grid-template-columns:1fr}.lora-row .icon-btn{width:100%;} }
 @media (max-width:680px) { .rh-key-stack{grid-template-columns:1fr}.rh-key-head{grid-template-columns:1fr}.rh-key-links{justify-content:flex-start}.key-input-line{grid-template-columns:1fr}.key-actions{justify-content:flex-end}.key-btn{width:40px;height:40px} }
+@media (max-width:680px) { .rh-account-grid{grid-template-columns:1fr}.rh-account-card dl{grid-template-columns:repeat(2,minmax(0,1fr))} }
 @media (max-width:680px) { .volcengine-key-stack,.volcengine-project-grid{grid-template-columns:1fr} }
 @media (max-width:900px) { .rh-workflow-editor-overlay{padding:12px}.rh-workflow-editor-modal{height:94vh}.rh-workflow-editor-head{align-items:flex-start;flex-direction:column}.rh-workflow-editor-actions{width:100%;justify-content:flex-end;flex-wrap:wrap}.rh-workflow-editor-body{grid-template-columns:1fr}.rh-workflow-editor-side{border-right:0;border-bottom:1px solid var(--line);max-height:44vh}.rh-workflow-editor-canvas{min-height:44vh}.rh-editor-graph-wrap{min-height:360px}.rh-editor-field-controls{grid-template-columns:1fr} }
 @media (max-width:760px) { .rh-transfer-actions{flex-wrap:wrap}.rh-recycle-overlay{padding:10px}.rh-recycle-modal{max-height:94vh}.rh-recycle-body{grid-template-columns:1fr}.rh-recycle-foot{align-items:stretch;flex-direction:column}.rh-recycle-foot .action-btn{width:100%} }

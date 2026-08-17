@@ -192,7 +192,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.08.17-custom.3"
+APP_VERSION = "2026.08.18-custom.1"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -342,12 +342,20 @@ BACKUP_DOWNLOAD_LOCK = Lock()
 BACKUP_DOWNLOADS = {}
 LOAD_LOCK = Lock()
 RUNNINGHUB_WORKFLOW_LOCK = Lock()
+ONLINE_RUNNINGHUB_OPERATION_LOCK = Lock()
+ONLINE_RUNNINGHUB_OPERATIONS: Dict[str, Dict[str, Any]] = {}
+ONLINE_RUNNINGHUB_TERMINAL_TTL_SECONDS = 10 * 60
+ONLINE_RUNNINGHUB_MAX_AGE_SECONDS = 45 * 60
 NEXT_TASK_ID = 1
 UPDATE_LOCK = Lock()
 UPDATE_PROGRESS_LOCK = Lock()
 UPDATE_PROGRESS = {
     "running": False,
     "phase": "idle",
+    "operation_id": "",
+    "cancellable": False,
+    "cancel_requested": False,
+    "message": "",
     "source": "",
     "source_label": "",
     "current_file": "",
@@ -2189,20 +2197,56 @@ def _set_update_progress(**changes: Any) -> Dict[str, Any]:
         UPDATE_PROGRESS["updated_at"] = time.time()
         return dict(UPDATE_PROGRESS)
 
+UPDATE_CANCELLABLE_PHASES = {"listing", "downloading", "validating", "backing_up"}
+
+class UpdateCancelled(Exception):
+    pass
+
+class UpdateCancelRequest(BaseModel):
+    operation_id: str = ""
+
+def _raise_if_update_cancelled() -> None:
+    with UPDATE_PROGRESS_LOCK:
+        if UPDATE_PROGRESS.get("running") and UPDATE_PROGRESS.get("cancel_requested"):
+            raise UpdateCancelled("更新已取消，当前版本未改变")
+
+def _enter_update_replacement_phase() -> Dict[str, Any]:
+    """Atomically close the cancellation window before touching live files."""
+    with UPDATE_PROGRESS_LOCK:
+        if UPDATE_PROGRESS.get("cancel_requested"):
+            raise UpdateCancelled("更新已取消，当前版本未改变")
+        UPDATE_PROGRESS.update({
+            "phase": "replacing",
+            "cancellable": False,
+            "current_file": "static/",
+            "message": "正在安装更新，暂不能取消",
+            "updated_at": time.time(),
+        })
+        return dict(UPDATE_PROGRESS)
+
 def _begin_update_progress(source: str = "") -> None:
     global UPDATE_PROGRESS_STARTED_AT, UPDATE_PROGRESS_FILES, UPDATE_DOWNLOADED_BY_FILE
     UPDATE_PROGRESS_STARTED_AT = time.monotonic()
     UPDATE_PROGRESS_FILES = []
     UPDATE_DOWNLOADED_BY_FILE = {}
-    _set_update_progress(running=True, phase="listing", source=source,
+    _set_update_progress(running=True, phase="listing", operation_id=uuid.uuid4().hex,
+                         cancellable=True, cancel_requested=False, message="", source=source,
                          source_label=UPDATE_SOURCE_LABELS.get(source, source),
                          current_file="", current_index=0, completed_files=0, total_files=0,
                          downloaded_bytes=0, total_bytes=0, current_file_bytes=0,
                          current_file_total=0, speed_bps=0, elapsed_seconds=0,
                          eta_seconds=None, error="")
 
-def _finish_update_progress(phase: str, error: str = "") -> None:
-    _set_update_progress(running=False, phase=phase, error=str(error or ""), current_file="")
+def _finish_update_progress(phase: str, error: str = "", message: str = "") -> None:
+    _set_update_progress(
+        running=False,
+        phase=phase,
+        cancellable=False,
+        cancel_requested=phase == "cancelled",
+        error=str(error or ""),
+        message=str(message or ""),
+        current_file="",
+    )
 
 def _reset_update_download_attempt(source: str) -> None:
     global UPDATE_PROGRESS_FILES, UPDATE_DOWNLOADED_BY_FILE, UPDATE_DOWNLOAD_STARTED_AT
@@ -2210,7 +2254,7 @@ def _reset_update_download_attempt(source: str) -> None:
     UPDATE_DOWNLOADED_BY_FILE = {}
     UPDATE_FILE_SIZE_HINTS.clear()
     UPDATE_DOWNLOAD_STARTED_AT = time.monotonic()
-    _set_update_progress(phase="listing", source=source,
+    _set_update_progress(phase="listing", cancellable=True, source=source,
                          source_label=UPDATE_SOURCE_LABELS.get(source, source),
                          current_file="", current_index=0, completed_files=0, total_files=0,
                          downloaded_bytes=0, total_bytes=0, current_file_bytes=0,
@@ -2248,6 +2292,31 @@ def update_progress():
     if UPDATE_PROGRESS_STARTED_AT and snapshot.get("running"):
         snapshot["elapsed_seconds"] = max(0.0, time.monotonic() - UPDATE_PROGRESS_STARTED_AT)
     return JSONResponse(snapshot, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"})
+
+@app.post("/api/update-cancel")
+def cancel_update(req: UpdateCancelRequest):
+    operation_id = str(req.operation_id or "").strip()
+    if not operation_id:
+        raise HTTPException(status_code=400, detail="缺少更新操作 ID")
+    with UPDATE_PROGRESS_LOCK:
+        current_id = str(UPDATE_PROGRESS.get("operation_id") or "")
+        if operation_id != current_id:
+            raise HTTPException(status_code=409, detail="更新任务已经变化，请重新打开版本管理")
+        phase = str(UPDATE_PROGRESS.get("phase") or "idle")
+        if not UPDATE_PROGRESS.get("running"):
+            return {"ok": True, "status": phase, "operation_id": current_id}
+        if phase == "cancelling":
+            return {"ok": True, "status": "cancelling", "operation_id": current_id}
+        if phase not in UPDATE_CANCELLABLE_PHASES or not UPDATE_PROGRESS.get("cancellable"):
+            raise HTTPException(status_code=409, detail="更新已经进入安装阶段，暂不能取消")
+        UPDATE_PROGRESS.update({
+            "phase": "cancelling",
+            "cancellable": False,
+            "cancel_requested": True,
+            "message": "正在安全取消，等待当前步骤结束",
+            "updated_at": time.time(),
+        })
+    return {"ok": True, "status": "cancelling", "operation_id": operation_id}
 
 # 缓存 GitHub Tree API 响应（含 ETag），减少 60 次/h 限流压力
 GITHUB_TREE_CACHE: Dict[str, Any] = {"etag": "", "data": None, "expires_at": 0.0}
@@ -2296,6 +2365,7 @@ def github_json(url: str, use_etag_cache: bool = False):
         raise
 
 def streamed_update_bytes(url: str, rel: str = "", progress: Optional[Any] = None) -> bytes:
+    _raise_if_update_cancelled()
     try:
         resp = requests.get(url, headers={"User-Agent": "Infinite-Canvas-Updater"},
                             timeout=60, stream=True, proxies=urllib.request.getproxies() or None)
@@ -2309,14 +2379,17 @@ def streamed_update_bytes(url: str, rel: str = "", progress: Optional[Any] = Non
         received = 0
         chunks = []
         for chunk in resp.iter_content(chunk_size=64 * 1024):
+            _raise_if_update_cancelled()
             if not chunk:
                 continue
             chunks.append(chunk)
             received += len(chunk)
             if progress:
                 progress(rel, received, total)
+            _raise_if_update_cancelled()
         if progress:
             progress(rel, received, total or received)
+        _raise_if_update_cancelled()
         return b"".join(chunks)
     finally:
         resp.close()
@@ -2330,6 +2403,7 @@ def download_github_update_files(files: List[str], staging_root: str, progress: 
     if progress:
         progress("__list__", 0, 0, 0, len(clean_files), clean_files)
     for index, rel in enumerate(clean_files, start=1):
+        _raise_if_update_cancelled()
         safe_update_target(rel)
         raw_url = f"{GITHUB_RAW_ROOT}/{urllib.parse.quote(rel, safe='/')}"
         def on_chunk(name, received, total):
@@ -2381,6 +2455,7 @@ def download_modelscope_update_files(staging_root: str, progress: Optional[Any] 
     if progress:
         progress("__list__", 0, 0, 0, len(files), files)
     for index, rel in enumerate(files, start=1):
+        _raise_if_update_cancelled()
         safe_update_target(rel)
         def on_chunk(name, received, total):
             if progress:
@@ -2734,6 +2809,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         download_errors: List[str] = []
         fallback_used = False
         for idx, candidate in enumerate(source_order):
+            _raise_if_update_cancelled()
             _reset_update_download_attempt(candidate)
             attempt_staging = os.path.join(
                 DATA_DIR, "update_staging",
@@ -2750,8 +2826,13 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
                 source = candidate
                 staging_root = attempt_staging
                 fallback_used = idx > 0
+                _raise_if_update_cancelled()
                 print(f"[update] 下载源 {label} 成功，共 {len(files or [])} 个文件")
                 break
+            except UpdateCancelled:
+                if os.path.isdir(attempt_staging):
+                    shutil.rmtree(attempt_staging, ignore_errors=True)
+                raise
             except Exception as exc:  # noqa: BLE001 — 记录后尝试下一个源
                 if os.path.isdir(attempt_staging):
                     shutil.rmtree(attempt_staging, ignore_errors=True)
@@ -2763,8 +2844,10 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             print(f"[update] 所有下载源均失败 → {detail}")
             raise HTTPException(status_code=502, detail=f"所有下载源均失败 → {detail}")
 
-        _set_update_progress(phase="validating", current_file="")
+        _raise_if_update_cancelled()
+        _set_update_progress(phase="validating", cancellable=True, current_file="")
         validate_staged_update(staging_root, root_files, static_files)
+        _raise_if_update_cancelled()
 
         new_version = ""
         try:
@@ -2781,7 +2864,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         except Exception:
             update_notes = {}
         # A restore point must be complete before any live file is replaced.
-        _set_update_progress(phase="backing_up", current_file="")
+        _set_update_progress(phase="backing_up", cancellable=True, current_file="")
         backup_root = next_update_backup_dir()
         backup_manifest = create_update_backup(
             backup_root,
@@ -2792,9 +2875,10 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             target_version=new_version,
             update_notes=update_notes,
         )
+        _raise_if_update_cancelled()
         updated = []
 
-        _set_update_progress(phase="replacing", current_file="static/")
+        _enter_update_replacement_phase()
         staged_static_dir = os.path.join(staging_root, "static")
         if not os.path.isdir(staged_static_dir):
             raise RuntimeError("更新源的 static 暂存目录不存在，已取消更新")
@@ -2841,7 +2925,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
 
         restart_scheduled = False
         if req.auto_restart and updated:
-            _set_update_progress(phase="restarting", current_file="")
+            _set_update_progress(phase="restarting", cancellable=False, current_file="", message="正在重启后端")
             restart_scheduled = schedule_self_restart(req.restart_delay)
         pruned_backups = prune_update_backups({os.path.basename(backup_root)})
         _finish_update_progress("complete")
@@ -2862,6 +2946,17 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             "restart_required": True,
             "restart_scheduled": restart_scheduled,
         }
+    except UpdateCancelled:
+        if backup_root and os.path.isdir(backup_root):
+            shutil.rmtree(backup_root, ignore_errors=True)
+        operation_id = str(UPDATE_PROGRESS.get("operation_id") or "")
+        message = "更新已取消，当前版本未改变"
+        _finish_update_progress("cancelled", message=message)
+        return JSONResponse(
+            {"ok": False, "cancelled": True, "operation_id": operation_id, "detail": message},
+            status_code=409,
+            headers={"Cache-Control": "no-store"},
+        )
     except HTTPException as exc:
         _finish_update_progress("failed", str(exc.detail))
         raise
@@ -3078,6 +3173,12 @@ class OnlineImageRequest(BaseModel):
     operation: str = ""
     resolution_type: str = ""
     runninghub_params: Dict[str, Any] = Field(default_factory=dict)
+
+class OnlineRunningHubOperationRequest(OnlineImageRequest):
+    operation_id: str = Field(min_length=8, max_length=160)
+
+class OnlineRunningHubOperationCancelRequest(BaseModel):
+    operation_id: str = Field(min_length=8, max_length=160)
 
 class MidjourneySubmitRequest(BaseModel):
     provider_id: str = ""
@@ -10958,18 +11059,56 @@ def runninghub_fail_reason(raw):
         return f"RunningHub errorCode={raw.get('errorCode')}"
     return ""
 
+def sanitize_runninghub_diagnostic(value):
+    """Remove credentials and temporary WebSocket authorization from diagnostics."""
+    if isinstance(value, dict):
+        clean = {}
+        for key, item in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized_key in {
+                "apikey",
+                "authorization",
+                "netwssurl",
+                "rhcomfyauth",
+                "token",
+                "accesstoken",
+            }:
+                clean[key] = "[REDACTED]"
+            else:
+                clean[key] = sanitize_runninghub_diagnostic(item)
+        return clean
+    if isinstance(value, (list, tuple)):
+        return [sanitize_runninghub_diagnostic(item) for item in value]
+    if isinstance(value, str):
+        text = re.sub(
+            r"(?i)(wss?://[^?\s\"']+)\?[^\s\"']+",
+            r"\1?[REDACTED]",
+            value,
+        )
+        text = re.sub(r"(?i)(bearer\s+)[a-z0-9._~+/=-]+", r"\1[REDACTED]", text)
+        text = re.sub(
+            r"(?i)((?:api[_-]?key|apikey|rh-comfy-auth)\s*[=:]\s*)[^&\s,;\"']+",
+            r"\1[REDACTED]",
+            text,
+        )
+        return text
+    return value
+
 def runninghub_error_detail(message, raw=None, **extra):
-    detail = {"message": str(message or "RunningHub 请求失败")}
-    detail.update({k: v for k, v in extra.items() if v not in (None, "")})
+    detail = {"message": sanitize_runninghub_diagnostic(str(message or "RunningHub 请求失败"))}
+    detail.update({k: sanitize_runninghub_diagnostic(v) for k, v in extra.items() if v not in (None, "")})
     if raw is not None:
-        detail["raw"] = raw
+        detail["raw"] = sanitize_runninghub_diagnostic(raw)
     return detail
 
 def log_runninghub_error(stage, raw=None, **extra):
     try:
-        payload = {"stage": stage, **{k: v for k, v in extra.items() if v not in (None, "")}}
+        payload = {
+            "stage": stage,
+            **{k: sanitize_runninghub_diagnostic(v) for k, v in extra.items() if v not in (None, "")},
+        }
         if raw is not None:
-            payload["raw"] = raw
+            payload["raw"] = sanitize_runninghub_diagnostic(raw)
         print(f"RunningHub error: {json.dumps(payload, ensure_ascii=False)[:4000]}")
     except Exception:
         print(f"RunningHub error: {stage}")
@@ -11808,17 +11947,15 @@ async def runninghub_upload_local_to_filename(client, provider, url, use_wallet=
         return raw["data"]["fileName"]
     raise HTTPException(status_code=502, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传素材失败：{raw}")
 
-async def generate_runninghub_entry_image(prompt, size, model, reference_images, provider, entry, entry_params=None):
-    """运行 RunningHub 工作流 / AI 应用（与智能画布一致的运行方式），返回首张图片结果。"""
+async def prepare_runninghub_entry_submission(prompt, reference_images, provider, entry, entry_params=None):
     kind = entry["kind"]
     entry_id = entry["id"]
     fields = rh_sort_fields(runninghub_entry_enabled_fields(entry))
     idx_map = rh_field_indexes(fields)
     reference_images = prepare_runninghub_entry_references(entry, reference_images)
     use_wallet = False
-    timeout = httpx.Timeout(connect=20.0, read=1800.0, write=240.0, pool=20.0)
     entry_params = sanitize_runninghub_entry_params(entry, entry_params)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=300.0, write=240.0, pool=20.0)) as client:
         uploaded = []
         for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
             ref_url = ref.get("url") if isinstance(ref, dict) else ref
@@ -11860,44 +11997,127 @@ async def generate_runninghub_entry_image(prompt, size, model, reference_images,
             else:
                 value = rh_default_value(field)
                 node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": value})
+    return {
+        "provider_id": str(provider.get("id") or "runninghub"),
+        "kind": kind,
+        "entry_id": entry_id,
+        "node_info_list": node_info_list,
+        "use_wallet": use_wallet,
+    }
 
-        api_key = runninghub_api_key(provider, use_wallet=use_wallet)
-        if kind == "workflow":
-            submit_url = runninghub_endpoint_url(provider, "/task/openapi/create")
-            body = {"apiKey": api_key, "workflowId": entry_id, "addMetadata": True}
-            if node_info_list:
-                body["nodeInfoList"] = node_info_list
+def runninghub_queue_maxed_payload(value, seen=None):
+    seen = seen or set()
+    if value is None:
+        return False
+    if isinstance(value, (str, int, float)):
+        return bool(re.search(r"(^|[^A-Z0-9_])TASK_QUEUE_MAXED($|[^A-Z0-9_])", str(value), re.I))
+    marker = id(value)
+    if marker in seen:
+        return False
+    seen.add(marker)
+    if isinstance(value, dict):
+        return any(runninghub_queue_maxed_payload(item, seen) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(runninghub_queue_maxed_payload(item, seen) for item in value)
+    return runninghub_queue_maxed_payload(str(value), seen)
+
+async def submit_prepared_runninghub_entry(prepared):
+    provider = get_api_provider_exact(prepared.get("provider_id") or "runninghub")
+    use_wallet = bool(prepared.get("use_wallet"))
+    api_key = runninghub_api_key(provider, use_wallet=use_wallet)
+    kind = str(prepared.get("kind") or "")
+    entry_id = str(prepared.get("entry_id") or "").strip()
+    node_info_list = sanitize_runninghub_node_info_list(prepared.get("node_info_list") or [])
+    if kind == "workflow":
+        submit_url = runninghub_endpoint_url(provider, "/task/openapi/create")
+        body = {"apiKey": api_key, "workflowId": entry_id, "addMetadata": True}
+        if node_info_list:
+            body["nodeInfoList"] = node_info_list
+    else:
+        submit_url = runninghub_endpoint_url(provider, "/task/openapi/ai-app/run")
+        body = {"apiKey": api_key, "webappId": entry_id, "nodeInfoList": node_info_list}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=180.0, write=120.0, pool=20.0)) as client:
+        try:
+            response = await client.post(submit_url, headers=runninghub_app_headers(True, use_wallet, provider), json=body)
+            raw = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=runninghub_error_detail(f"提交 RunningHub 任务失败：{exc}", endpoint=submit_url)) from exc
+    response_status = int(getattr(response, "status_code", 200) or 200)
+    if response_status >= 400 or not (isinstance(raw, dict) and raw.get("code") in (0, "0")):
+        detail = runninghub_error_detail(runninghub_fail_reason(raw) or "RunningHub 提交失败", raw, endpoint=submit_url)
+        status_code = 429 if runninghub_queue_maxed_payload(raw) else (response_status if response_status >= 400 else 502)
+        raise HTTPException(status_code=status_code, detail=detail)
+    task_id = raw.get("data", {}).get("taskId") if isinstance(raw.get("data"), dict) else ""
+    if not task_id:
+        raise HTTPException(status_code=502, detail=runninghub_error_detail("RunningHub 未返回 taskId", raw, endpoint=submit_url))
+    return str(task_id)
+
+async def query_runninghub_task_remote(task_id, use_wallet=False):
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="taskId 必填")
+    provider = runninghub_provider()
+    api_key = runninghub_api_key(provider, use_wallet=use_wallet)
+    url = runninghub_endpoint_url(provider, "/task/openapi/outputs")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=240.0, write=30.0, pool=20.0)) as client:
+        try:
+            response = await client.post(url, headers=runninghub_app_headers(True, use_wallet, provider), json={"apiKey": api_key, "taskId": task_id})
+            raw = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=runninghub_error_detail(f"查询 RunningHub 任务失败：{exc}", endpoint=url, taskId=task_id)) from exc
+        response_status = int(getattr(response, "status_code", 200) or 200)
+        if response_status >= 400:
+            log_runninghub_error("query-http", raw, endpoint=url, taskId=task_id, status=response_status)
+            raise HTTPException(status_code=response_status, detail=runninghub_error_detail(f"RunningHub HTTP {response_status}", raw, endpoint=url, taskId=task_id))
+        code = raw.get("code") if isinstance(raw, dict) else None
+        raw_data = raw.get("data") if isinstance(raw, dict) else None
+        net_wss_url = str(raw_data.get("netWssUrl") or "").strip() if isinstance(raw_data, dict) else ""
+        status = "PENDING"
+        urls = []
+        image_items = []
+        if code in (0, "0"):
+            remotes = runninghub_extract_outputs(raw_data)
+            if net_wss_url and not remotes:
+                status = "RUNNING"
+            else:
+                status = "SUCCESS"
+                for remote in remotes:
+                    try:
+                        local_url = await runninghub_store_remote_output(client, remote)
+                    except Exception:
+                        local_url = remote
+                    urls.append(local_url)
+                    image_items.append(image_output_meta(local_url))
+        elif code in (804, "804"):
+            status = "RUNNING"
+        elif code in (813, "813"):
+            status = "QUEUED"
+        elif code in (805, "805"):
+            status = "FAILED"
+            log_runninghub_error("query-failed", raw, endpoint=url, taskId=task_id, code=code)
         else:
-            submit_url = runninghub_endpoint_url(provider, "/task/openapi/ai-app/run")
-            body = {"apiKey": api_key, "webappId": entry_id, "nodeInfoList": node_info_list}
+            status = "UNKNOWN"
+            log_runninghub_error("query-unknown", raw, endpoint=url, taskId=task_id, code=code)
+        return {"status": status, "urls": urls, "image_items": image_items, "failReason": runninghub_fail_reason(raw), "code": code}
 
-        response = await client.post(submit_url, headers=runninghub_app_headers(True, use_wallet), json=body)
-        raw = response.json()
-        if not (isinstance(raw, dict) and raw.get("code") in (0, "0")):
-            raise HTTPException(status_code=502, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 提交失败：{raw}")
-        task_id = raw.get("data", {}).get("taskId") if isinstance(raw.get("data"), dict) else ""
-        if not task_id:
-            raise HTTPException(status_code=502, detail=f"RunningHub 未返回 taskId：{raw}")
-
-        query_url = runninghub_endpoint_url(provider, "/task/openapi/outputs")
-        deadline = time.monotonic() + 1800
-        last_payload = None
-        while time.monotonic() < deadline:
-            await asyncio.sleep(2.5)
-            query_response = await client.post(query_url, headers=runninghub_app_headers(True), json={"apiKey": api_key, "taskId": task_id})
-            query_raw = query_response.json()
-            last_payload = query_raw
-            code = query_raw.get("code") if isinstance(query_raw, dict) else None
-            if code in (0, "0"):
-                outputs = runninghub_extract_outputs(query_raw.get("data"))
-                for remote in outputs:
-                    if str(remote or "").startswith(("http://", "https://", "/output/", "/assets/")):
-                        return {"type": "url", "value": str(remote)}, query_raw
-                raise HTTPException(status_code=502, detail=f"RunningHub 任务无图片输出：{query_raw}")
-            if code in (805, "805"):
-                raise HTTPException(status_code=502, detail=f"RunningHub 任务失败：{runninghub_fail_reason(query_raw) or query_raw}")
-            # 804 运行中 / 813 排队中 / 其他状态继续轮询
-        raise HTTPException(status_code=504, detail=f"RunningHub 任务超时：{last_payload}")
+async def generate_runninghub_entry_image(prompt, size, model, reference_images, provider, entry, entry_params=None):
+    """运行 RunningHub 工作流 / AI 应用（与智能画布一致的运行方式），返回首张图片结果。"""
+    prepared = await prepare_runninghub_entry_submission(prompt, reference_images, provider, entry, entry_params)
+    task_id = await submit_prepared_runninghub_entry(prepared)
+    deadline = time.monotonic() + 1800
+    last_payload = None
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2.5)
+        data = await query_runninghub_task_remote(task_id, bool(prepared.get("use_wallet")))
+        last_payload = data
+        if data.get("status") == "SUCCESS":
+            outputs = data.get("urls") or []
+            if outputs:
+                return {"type": "url", "value": str(outputs[0])}, data
+            raise HTTPException(status_code=502, detail="RunningHub 任务无图片输出")
+        if data.get("status") == "FAILED":
+            raise HTTPException(status_code=502, detail=f"RunningHub 任务失败：{data.get('failReason') or '未知错误'}")
+    raise HTTPException(status_code=504, detail=f"RunningHub 任务超时：{last_payload}")
 
 async def generate_runninghub_provider_image(prompt, size, model, reference_images=None, provider=None, entry_params=None):
     entry = runninghub_entry_config_from_model(provider, model)
@@ -13746,61 +13966,57 @@ def delete_runninghub_workflow(workflow_id: str):
     remove_runninghub_workflow_from_provider(key)
     return {"success": True}
 
-@app.get("/api/runninghub/query")
-async def runninghub_query(taskId: str = "", useWallet: bool = False):
-    task_id = str(taskId or "").strip()
-    if not task_id:
-        raise HTTPException(status_code=400, detail="taskId 必填")
+@app.get("/api/runninghub/account-status")
+async def runninghub_account_status(useWallet: bool = False):
     provider = runninghub_provider()
     api_key = runninghub_api_key(provider, use_wallet=useWallet)
-    url = runninghub_endpoint_url(provider, "/task/openapi/outputs")
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=240.0, write=30.0, pool=20.0)) as client:
+    url = runninghub_endpoint_url(provider, "/uc/openapi/accountStatus")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0)) as client:
         try:
-            response = await client.post(url, headers=runninghub_app_headers(True, useWallet), json={"apiKey": api_key, "taskId": task_id})
+            response = await client.post(
+                url,
+                headers=runninghub_app_headers(True, useWallet, provider),
+                json={"apikey": api_key},
+            )
             raw = response.json()
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=runninghub_error_detail(f"查询 RunningHub 任务失败：{exc}", endpoint=url, taskId=task_id)) from exc
-        if response.status_code >= 400:
-            log_runninghub_error("query-http", raw, endpoint=url, taskId=task_id, status=response.status_code)
-            raise HTTPException(status_code=response.status_code, detail=runninghub_error_detail(f"RunningHub HTTP {response.status_code}", raw, endpoint=url, taskId=task_id))
-        code = raw.get("code") if isinstance(raw, dict) else None
-        status = "PENDING"
-        urls = []
-        image_items = []
-        if code in (0, "0"):
-            status = "SUCCESS"
-            for remote in runninghub_extract_outputs(raw.get("data")):
-                try:
-                    local_url = await runninghub_store_remote_output(client, remote)
-                except Exception:
-                    local_url = remote
-                urls.append(local_url)
-                image_items.append(image_output_meta(local_url))
-        elif code in (804, "804"):
-            status = "RUNNING"
-        elif code in (813, "813"):
-            status = "QUEUED"
-        elif code in (805, "805"):
-            status = "FAILED"
-            log_runninghub_error("query-failed", raw, endpoint=url, taskId=task_id, code=code)
-        else:
-            status = "UNKNOWN"
-            log_runninghub_error("query-unknown", raw, endpoint=url, taskId=task_id, code=code)
-        return {"success": True, "data": {"status": status, "urls": urls, "image_items": image_items, "failReason": runninghub_fail_reason(raw), "code": code, "raw": raw}}
+            message = str(exc).replace(api_key, "[REDACTED]")
+            raise HTTPException(status_code=502, detail=f"查询 RunningHub 账户状态失败：{message}") from exc
+    upstream_message = str(raw.get("msg") or "") if isinstance(raw, dict) else ""
+    upstream_message = upstream_message.replace(api_key, "[REDACTED]")[:300]
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=upstream_message or f"RunningHub HTTP {response.status_code}")
+    if not isinstance(raw, dict) or raw.get("code") not in (0, "0") or not isinstance(raw.get("data"), dict):
+        raise HTTPException(status_code=400, detail=upstream_message or "RunningHub 账户状态返回异常")
+    data = raw["data"]
+    return {
+        "success": True,
+        "data": {
+            "source": "wallet" if useWallet else "coin",
+            "remainCoins": str(data.get("remainCoins") or ""),
+            "remainMoney": str(data.get("remainMoney") or ""),
+            "currency": str(data.get("currency") or ""),
+            "currentTaskCounts": str(data.get("currentTaskCounts") or ""),
+            "apiType": str(data.get("apiType") or ""),
+        },
+    }
 
-@app.post("/api/runninghub/cancel")
-async def runninghub_cancel(payload: RunningHubCancelRequest):
-    task_id = str(payload.taskId or "").strip()
+@app.get("/api/runninghub/query")
+async def runninghub_query(taskId: str = "", useWallet: bool = False):
+    return {"success": True, "data": await query_runninghub_task_remote(taskId, useWallet)}
+
+async def cancel_runninghub_task_remote(task_id, use_wallet=False):
+    task_id = str(task_id or "").strip()
     if not task_id:
         raise HTTPException(status_code=400, detail="taskId 必填")
     provider = runninghub_provider()
-    api_key = runninghub_api_key(provider, use_wallet=payload.useWallet)
+    api_key = runninghub_api_key(provider, use_wallet=use_wallet)
     url = runninghub_endpoint_url(provider, "/task/openapi/cancel")
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)) as client:
         try:
             response = await client.post(
                 url,
-                headers=runninghub_app_headers(True, payload.useWallet, provider),
+                headers=runninghub_app_headers(True, use_wallet, provider),
                 json={"apiKey": api_key, "taskId": task_id},
             )
             try:
@@ -13820,14 +14036,18 @@ async def runninghub_cancel(payload: RunningHubCancelRequest):
         )
     code = raw.get("code") if isinstance(raw, dict) else None
     if code in (0, "0"):
-        return {"success": True, "data": {"status": "cancelled", "taskId": task_id, "code": code}}
+        return {"status": "cancelled", "taskId": task_id, "code": code}
     if code in (807, "807"):
-        return {"success": True, "data": {"status": "not_found", "taskId": task_id, "code": code}}
+        return {"status": "not_found", "taskId": task_id, "code": code}
     log_runninghub_error("cancel-rejected", raw, endpoint=url, taskId=task_id, code=code)
     raise HTTPException(
         status_code=400,
         detail=runninghub_error_detail(runninghub_fail_reason(raw) or "RunningHub 取消任务失败", raw, endpoint=url, taskId=task_id),
     )
+
+@app.post("/api/runninghub/cancel")
+async def runninghub_cancel(payload: RunningHubCancelRequest):
+    return {"success": True, "data": await cancel_runninghub_task_remote(payload.taskId, payload.useWallet)}
 
 @app.post("/api/runninghub/upload-asset")
 async def runninghub_upload_asset(payload: RunningHubUploadAssetRequest):
@@ -15002,6 +15222,313 @@ async def build_online_image_result(payload: OnlineImageRequest):
     if GLOBAL_LOOP:
         asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
     return result
+
+def cleanup_online_runninghub_operations():
+    now = time.time()
+    terminal = {"SUCCESS", "FAILED", "CANCELLED"}
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        expired = []
+        for operation_id, record in ONLINE_RUNNINGHUB_OPERATIONS.items():
+            updated_at = float(record.get("updated_at") or record.get("created_at") or now)
+            max_age = ONLINE_RUNNINGHUB_TERMINAL_TTL_SECONDS if record.get("status") in terminal else ONLINE_RUNNINGHUB_MAX_AGE_SECONDS
+            if now - updated_at > max_age:
+                expired.append(operation_id)
+        for operation_id in expired:
+            ONLINE_RUNNINGHUB_OPERATIONS.pop(operation_id, None)
+
+def new_online_runninghub_operation_record(payload: OnlineRunningHubOperationRequest):
+    now = time.time()
+    return {
+        "operation_id": str(payload.operation_id),
+        "payload": payload.model_dump() if hasattr(payload, "model_dump") else payload.dict(),
+        "status": "PREPARING",
+        "created_at": now,
+        "updated_at": now,
+        "prepared": None,
+        "task_id": "",
+        "submit_in_progress": False,
+        "cancel_requested": False,
+        "remote_cancel_started": False,
+        "remote_cancelled": False,
+        "remote_cancel_error": "",
+        "history_saved": False,
+        "result": None,
+        "error": "",
+    }
+
+def new_cancelled_online_runninghub_operation_record(operation_id):
+    now = time.time()
+    return {
+        "operation_id": str(operation_id or ""),
+        "payload": {},
+        "status": "CANCELLED",
+        "created_at": now,
+        "updated_at": now,
+        "prepared": None,
+        "task_id": "",
+        "submit_in_progress": False,
+        "cancel_requested": True,
+        "remote_cancel_started": False,
+        "remote_cancelled": False,
+        "remote_cancel_error": "",
+        "history_saved": False,
+        "result": None,
+        "error": "",
+    }
+
+def online_runninghub_operation_data(record):
+    return {
+        "operation_id": str(record.get("operation_id") or ""),
+        "status": str(record.get("status") or "UNKNOWN"),
+        "task_id": str(record.get("task_id") or ""),
+        "cancel_requested": bool(record.get("cancel_requested")),
+        "remote_cancelled": bool(record.get("remote_cancelled")),
+        "remote_cancel_error": str(record.get("remote_cancel_error") or ""),
+        "error": str(record.get("error") or ""),
+        "result": record.get("result"),
+    }
+
+def online_runninghub_operation_response(record):
+    return {"success": True, "data": online_runninghub_operation_data(record)}
+
+def online_runninghub_payload_matches(record, payload):
+    previous = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    return (
+        str(previous.get("provider_id") or "") == str(payload.provider_id or "")
+        and str(previous.get("model") or "") == str(payload.model or "")
+    )
+
+async def prepare_online_runninghub_operation(payload: OnlineRunningHubOperationRequest):
+    provider = get_api_provider(payload.provider_id)
+    if not is_runninghub_provider(provider):
+        raise HTTPException(status_code=400, detail="该操作仅支持 RunningHub 应用或工作流")
+    default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
+    model = selected_model(payload.model, default_model)
+    entry = runninghub_entry_config_from_model(provider, model)
+    if not entry:
+        raise HTTPException(status_code=400, detail="RunningHub 模型 API 不使用应用/工作流任务控制")
+    if not str(payload.prompt or "").strip() and runninghub_entry_requires_prompt(entry):
+        raise HTTPException(status_code=400, detail="请输入提示词")
+    refs = [ref.dict() for ref in payload.reference_images if ref.url]
+    refs = prepare_runninghub_entry_references(entry, refs)
+    runninghub_params = sanitize_runninghub_entry_params(entry, payload.runninghub_params)
+    prepared = await prepare_runninghub_entry_submission(
+        payload.prompt,
+        refs,
+        provider,
+        entry,
+        runninghub_params,
+    )
+    prepared["provider_id"] = str(provider.get("id") or payload.provider_id or "runninghub")
+    return prepared
+
+def build_online_runninghub_operation_result(record, remote):
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    provider = get_api_provider(payload.get("provider_id") or "runninghub")
+    model = str(payload.get("model") or "")
+    refs = [item for item in (payload.get("reference_images") or []) if isinstance(item, dict) and item.get("url")]
+    images = [str(url) for url in (remote.get("urls") or []) if str(url or "").strip()]
+    image_items = [item for item in (remote.get("image_items") or []) if isinstance(item, dict) and item.get("url")]
+    timestamp = time.time()
+    return {
+        "prompt": str(payload.get("prompt") or ""),
+        "images": images,
+        "image_items": image_items,
+        "timestamp": timestamp,
+        "type": "online",
+        "model": model,
+        "model_display_name": provider_model_display_name(provider, model),
+        "effective_model": model,
+        "provider_id": str(provider.get("id") or payload.get("provider_id") or "runninghub"),
+        "provider_name": str(provider.get("name") or provider.get("id") or "RunningHub"),
+        "task_id": str(record.get("task_id") or ""),
+        "request_id": None,
+        "params": {
+            "provider_id": str(provider.get("id") or payload.get("provider_id") or "runninghub"),
+            "model": model,
+            "logical_model": model,
+            "model_display_name": provider_model_display_name(provider, model),
+            "effective_model": model,
+            "resolution": str(payload.get("resolution") or ""),
+            "size": snap_size_to_multiple(payload.get("size") or "1024x1024", 16),
+            "requested_size": str(payload.get("size") or "1024x1024"),
+            "quality": str(payload.get("quality") or "auto"),
+            "n": 1,
+            "reference_images": refs,
+            "runninghub_params": payload.get("runninghub_params") if isinstance(payload.get("runninghub_params"), dict) else {},
+        },
+        "raw_usage": None,
+    }
+
+async def cancel_online_runninghub_remote(operation_id):
+    operation_id = str(operation_id or "").strip()
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        record = ONLINE_RUNNINGHUB_OPERATIONS.get(operation_id)
+        if not record or not record.get("task_id") or record.get("remote_cancel_started"):
+            return record
+        record["remote_cancel_started"] = True
+        record["updated_at"] = time.time()
+        task_id = str(record.get("task_id") or "")
+        prepared = record.get("prepared") if isinstance(record.get("prepared"), dict) else {}
+        use_wallet = bool(prepared.get("use_wallet"))
+    try:
+        await cancel_runninghub_task_remote(task_id, use_wallet=use_wallet)
+        remote_cancelled = True
+        remote_cancel_error = ""
+    except Exception as exc:
+        remote_cancelled = False
+        if isinstance(exc, HTTPException):
+            detail = exc.detail
+            remote_cancel_error = str(detail.get("message") if isinstance(detail, dict) else detail or "")
+        else:
+            remote_cancel_error = str(exc)
+        remote_cancel_error = remote_cancel_error[:500] or "官网任务可能仍在运行"
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        record = ONLINE_RUNNINGHUB_OPERATIONS.get(operation_id)
+        if record:
+            record["remote_cancelled"] = remote_cancelled
+            record["remote_cancel_error"] = remote_cancel_error
+            record["updated_at"] = time.time()
+        return record
+
+@app.post("/api/online-runninghub/submit")
+async def online_runninghub_operation_submit(payload: OnlineRunningHubOperationRequest):
+    cleanup_online_runninghub_operations()
+    operation_id = str(payload.operation_id)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        record = ONLINE_RUNNINGHUB_OPERATIONS.get(operation_id)
+        if record is None:
+            record = new_online_runninghub_operation_record(payload)
+            ONLINE_RUNNINGHUB_OPERATIONS[operation_id] = record
+        elif record.get("status") == "CANCELLED":
+            return online_runninghub_operation_response(record)
+        elif not online_runninghub_payload_matches(record, payload):
+            raise HTTPException(status_code=409, detail="操作 ID 已用于其他 RunningHub 请求")
+        if record.get("status") in {"SUCCESS", "FAILED", "CANCELLED"} or record.get("task_id"):
+            return online_runninghub_operation_response(record)
+        if record.get("submit_in_progress"):
+            raise HTTPException(status_code=409, detail="RunningHub 任务正在提交")
+        record["submit_in_progress"] = True
+        record["status"] = "SUBMITTING" if record.get("prepared") else "PREPARING"
+        record["updated_at"] = time.time()
+        prepared = record.get("prepared")
+
+    try:
+        if not prepared:
+            prepared = await prepare_online_runninghub_operation(payload)
+            with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+                record = ONLINE_RUNNINGHUB_OPERATIONS[operation_id]
+                record["prepared"] = prepared
+                record["updated_at"] = time.time()
+                if record.get("cancel_requested"):
+                    record["submit_in_progress"] = False
+                    return online_runninghub_operation_response(record)
+                record["status"] = "SUBMITTING"
+        task_id = await submit_prepared_runninghub_entry(prepared)
+    except HTTPException as exc:
+        with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+            record = ONLINE_RUNNINGHUB_OPERATIONS[operation_id]
+            record["submit_in_progress"] = False
+            record["updated_at"] = time.time()
+            if record.get("cancel_requested"):
+                return online_runninghub_operation_response(record)
+            if exc.status_code == 429 and runninghub_queue_maxed_payload(exc.detail):
+                record["status"] = "QUEUED"
+            else:
+                record["status"] = "FAILED"
+                record["error"] = str(exc.detail)[:500]
+        raise
+    except Exception as exc:
+        with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+            record = ONLINE_RUNNINGHUB_OPERATIONS[operation_id]
+            record["submit_in_progress"] = False
+            record["updated_at"] = time.time()
+            if record.get("cancel_requested"):
+                return online_runninghub_operation_response(record)
+            record["status"] = "FAILED"
+            record["error"] = str(exc)[:500]
+        raise
+
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        record = ONLINE_RUNNINGHUB_OPERATIONS[operation_id]
+        record["task_id"] = str(task_id)
+        record["submit_in_progress"] = False
+        record["updated_at"] = time.time()
+        cancelled = bool(record.get("cancel_requested"))
+        record["status"] = "CANCELLED" if cancelled else "RUNNING"
+    if cancelled:
+        await cancel_online_runninghub_remote(operation_id)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        return online_runninghub_operation_response(ONLINE_RUNNINGHUB_OPERATIONS[operation_id])
+
+@app.get("/api/online-runninghub/query")
+async def online_runninghub_operation_query(operation_id: str = ""):
+    cleanup_online_runninghub_operations()
+    operation_id = str(operation_id or "").strip()
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        record = ONLINE_RUNNINGHUB_OPERATIONS.get(operation_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="RunningHub 在线任务不存在或已过期")
+        if record.get("status") in {"SUCCESS", "FAILED", "CANCELLED"} or not record.get("task_id"):
+            return online_runninghub_operation_response(record)
+        task_id = str(record.get("task_id") or "")
+        prepared = record.get("prepared") if isinstance(record.get("prepared"), dict) else {}
+        use_wallet = bool(prepared.get("use_wallet"))
+
+    remote = await query_runninghub_task_remote(task_id, use_wallet=use_wallet)
+    save_result = None
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        record = ONLINE_RUNNINGHUB_OPERATIONS.get(operation_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="RunningHub 在线任务不存在或已过期")
+        if record.get("cancel_requested"):
+            return online_runninghub_operation_response(record)
+        remote_status = str(remote.get("status") or "UNKNOWN").upper()
+        if remote_status == "SUCCESS":
+            if remote.get("urls"):
+                record["result"] = build_online_runninghub_operation_result(record, remote)
+                record["status"] = "SUCCESS"
+                if not record.get("history_saved"):
+                    record["history_saved"] = True
+                    save_result = record["result"]
+            else:
+                record["status"] = "FAILED"
+                record["error"] = "RunningHub 任务无图片输出"
+        elif remote_status == "FAILED":
+            record["status"] = "FAILED"
+            record["error"] = str(remote.get("failReason") or "RunningHub 任务失败")[:500]
+        elif remote_status in {"QUEUED", "PENDING"}:
+            record["status"] = "QUEUED"
+        else:
+            record["status"] = "RUNNING"
+        record["updated_at"] = time.time()
+        response = online_runninghub_operation_response(record)
+    if save_result:
+        save_to_history(save_result)
+        if GLOBAL_LOOP:
+            asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(save_result), GLOBAL_LOOP)
+    return response
+
+@app.post("/api/online-runninghub/cancel")
+async def online_runninghub_operation_cancel(payload: OnlineRunningHubOperationCancelRequest):
+    cleanup_online_runninghub_operations()
+    operation_id = str(payload.operation_id)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        record = ONLINE_RUNNINGHUB_OPERATIONS.get(operation_id)
+        if not record:
+            record = new_cancelled_online_runninghub_operation_record(operation_id)
+            ONLINE_RUNNINGHUB_OPERATIONS[operation_id] = record
+            return online_runninghub_operation_response(record)
+        if record.get("status") in {"SUCCESS", "FAILED"}:
+            return online_runninghub_operation_response(record)
+        record["cancel_requested"] = True
+        record["status"] = "CANCELLED"
+        record["updated_at"] = time.time()
+        has_task_id = bool(record.get("task_id"))
+    if has_task_id:
+        await cancel_online_runninghub_remote(operation_id)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        return online_runninghub_operation_response(ONLINE_RUNNINGHUB_OPERATIONS[operation_id])
 
 @app.post("/api/online-image")
 async def online_image(payload: OnlineImageRequest):

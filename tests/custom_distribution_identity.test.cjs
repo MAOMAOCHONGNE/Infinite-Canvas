@@ -70,7 +70,7 @@ test('Infinite Canvas navigation keeps its four-square shape with a vivid gradie
 
 test('browser update flow offers the user-owned ModelScope mirror and automatic fallback', () => {
     const html = fs.readFileSync(INDEX_PATH, 'utf8');
-    const updateFlow = sourceBlock(html, 'function updateSourceLabel(', 'window.rollbackProjectUpdate = rollbackProjectUpdate;');
+    const updateFlow = sourceBlock(html, 'function updateSourceLabel(', 'async function checkForUpdates(');
     const checkFlow = sourceBlock(html, 'async function checkForUpdates(', '</script>');
     const sourceState = sourceBlock(html, 'const savedUpdateSource', 'function setSidebarPinned(');
     assert.match(html, /data-update-source="modelscope"/);
@@ -90,7 +90,10 @@ test('custom version and update notes form one release identity', () => {
     const main = fs.readFileSync(MAIN_PATH, 'utf8');
     assert.match(version, /^\d{4}\.\d{2}\.\d{2}-custom\.\d+$/);
     assert.equal(notes.version, version);
-    assert.deepEqual(notes.items, [{ type: 'fix', text: '修复 RunningHub 任务取消、排队与画布日志问题' }]);
+    assert.deepEqual(notes.items, [
+        { type: 'fix', text: '完善 RunningHub 跨页面排队、远程取消与任务状态控制' },
+        { type: 'fix', text: '完善版本管理、备份导入刷新及 Windows 启停脚本' }
+    ]);
     assert.match(main, /"edition":\s*CUSTOM_MAINTAINER/);
     assert.match(main, /"update_channel":\s*CUSTOM_UPDATE_BRANCH/);
     assert.match(main, /"upstream_repo_url":\s*UPSTREAM_REPO_URL/);

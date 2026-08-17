@@ -24,7 +24,7 @@ test('backend streams updater downloads and publishes no-store progress phases',
     assert.match(backend, /stream=True/);
     assert.match(backend, /iter_content\(chunk_size=64 \* 1024\)/);
     assert.match(backend, /"listing"/);
-    for (const phase of ['downloading', 'validating', 'backing_up', 'replacing', 'restarting', 'complete', 'failed']) {
+    for (const phase of ['downloading', 'validating', 'backing_up', 'replacing', 'restarting', 'cancelling', 'cancelled', 'complete', 'failed']) {
         assert.match(backend, new RegExp(`"${phase}"`));
     }
     assert.match(backend, /Cache-Control.*no-store/);

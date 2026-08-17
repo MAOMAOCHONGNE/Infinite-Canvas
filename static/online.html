@@ -16,14 +16,14 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.17-custom.2.1785863220"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.08.17-custom.2.1785863219"></script>
-    <script src="/static/js/theme.js?v=2026.08.17-custom.2.1785863206"></script>
-    <script src="/static/js/i18n.js?v=2026.08.17-custom.2.1786958929"></script>
-    <script src="/static/js/image-preview.js?v=2026.08.17-custom.2.1785863203"></script>
-    <script src="/static/js/history-bulk-manager.js?v=2026.08.17-custom.2.1785863197"></script>
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.18-custom.1.1785863220"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.08.18-custom.1.1785863219"></script>
+    <script src="/static/js/theme.js?v=2026.08.18-custom.1.1785863206"></script>
+    <script src="/static/js/i18n.js?v=2026.08.18-custom.1.1786958929"></script>
+    <script src="/static/js/image-preview.js?v=2026.08.18-custom.1.1785863203"></script>
+    <script src="/static/js/history-bulk-manager.js?v=2026.08.18-custom.1.1785863197"></script>
     <style>
-        @import url('/static/vendor/css/fonts.css?v=2026.08.17-custom.2.1785863213');
+        @import url('/static/vendor/css/fonts.css?v=2026.08.18-custom.1.1785863213');
         :root { --accent:#111827; --bg:#f9fafb; --card:#fff; --easing:cubic-bezier(0.4,0,0.2,1); }
         body { background:var(--bg); font-family:'Inter',-apple-system,sans-serif; color:var(--accent); -webkit-font-smoothing:antialiased; }
         .container-box { max-width:1280px; margin:0 auto; padding:0 40px; margin-top:50px; }
@@ -42,6 +42,7 @@
         .glass-btn { background:#111827; transition:all .3s var(--easing); }
         .glass-btn:hover { background:#000; transform:translateY(-1px); box-shadow:0 12px 24px rgba(0,0,0,.1); }
         .glass-btn.is-running { background:#334155; cursor:progress; }
+        .glass-btn.is-running.is-cancellable { cursor:pointer; }
         .glass-btn.is-running:hover { background:#334155; transform:none; box-shadow:0 8px 18px rgba(15,23,42,.12); }
         .result-frame { background:#fff; border-radius:32px; border:1px solid #f1f5f9; box-shadow:0 2px 15px rgba(0,0,0,.02); }
         .tool-panel { background:#fff; border:1px solid #edf0f3; border-radius:24px; padding:12px; display:flex; flex-direction:column; gap:10px; }
@@ -91,7 +92,7 @@
         @keyframes spin { to{transform:rotate(360deg)} }
         @keyframes noticeIn { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:none} }
     </style>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.17-custom.2.1785863189">
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.18-custom.1.1785863189">
     <style>
         html:not(.studio-theme-dark) body:not(.studio-theme-dark) #lightbox.gallery-lightbox {
             background: rgba(255,255,255,.99) !important;
@@ -256,6 +257,7 @@
         </div>
     </div>
 
+    <script src="/static/js/runninghub-capacity-queue.js?v=2026.08.18-custom.1.1786977132"></script>
     <script>
         lucide.createIcons();
         function tr(key){ return window.StudioI18n ? StudioI18n.t(key) : key; }
@@ -277,7 +279,16 @@
             updateAdaptivePanel();
         });
         const referenceStatesByContext = {};
-        const generationState = {running:false, startedAt:0, timer:null};
+        const generationState = {
+            running:false,
+            startedAt:0,
+            timer:null,
+            runningHubOperationId:'',
+            runningHubQueued:false,
+            runningHubCancelling:false,
+        };
+        const onlineRunningHubCancelledOperations = new Set();
+        const onlineRunningHubCapacityQueue = new RunningHubCapacityQueueTools.RunningHubCapacityQueue({retryDelay:12000});
         let provider = 'comfly';
         let selectedModel = 'gpt-image-2';
         let apiProviders = [];
@@ -436,6 +447,9 @@
                 return key === selectedModel;
             });
             return selected?.entry || null;
+        }
+        function isRunningHubEntryMode(){
+            return Boolean(isRunningHubProvider(provider) && currentRunningHubEntry());
         }
         function referenceContextKey(){
             return `${provider || ''}::${selectedModel || ''}`;
@@ -785,8 +799,16 @@
             const elapsed = runningElapsed();
             const label = document.getElementById('genBtnLabel');
             const loaderStatus = document.getElementById('loaderStatus');
-            if(label) label.textContent = generationState.running ? `${tr('online.generating')} ${elapsed}` : tr('online.generate');
-            if(loaderStatus) loaderStatus.textContent = generationState.running ? `${tr('online.generating')} · ${elapsed}` : tr('online.generating');
+            const runningHubActive = generationState.running && Boolean(generationState.runningHubOperationId);
+            const runningHubState = generationState.runningHubCancelling
+                ? '停止中'
+                : generationState.runningHubQueued ? '排队中' : tr('online.generating');
+            if(label){
+                label.textContent = runningHubActive
+                    ? `${generationState.runningHubCancelling ? '停止中' : '取消任务'} · ${elapsed}`
+                    : generationState.running ? `${tr('online.generating')} ${elapsed}` : tr('online.generate');
+            }
+            if(loaderStatus) loaderStatus.textContent = generationState.running ? `${runningHubActive ? runningHubState : tr('online.generating')} · ${elapsed}` : tr('online.generating');
         }
         function setGenerationControlsLocked(locked){
             ['promptInput','providerSelect','modelSelect','qualitySelect','countSelect','resolutionSelect','ratioSelect','sizeCustomWidth','sizeCustomHeight','ratioCustomWidth','ratioCustomHeight','fitImageSizeBtn']
@@ -800,6 +822,7 @@
             const button = document.getElementById('genBtn');
             if(button){
                 button.classList.toggle('is-running', generationState.running);
+                button.classList.toggle('is-cancellable', generationState.running && Boolean(generationState.runningHubOperationId));
                 button.setAttribute('aria-busy', generationState.running ? 'true' : 'false');
             }
             if(generationState.timer){ clearInterval(generationState.timer); generationState.timer = null; }
@@ -809,6 +832,87 @@
             }
             updateGenerationStatus();
             setGenerationControlsLocked(generationState.running);
+        }
+
+        function newOnlineRunningHubOperationId(){
+            const suffix = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            return `online-rh-${suffix}`;
+        }
+        function onlineRunningHubError(message, payload=null){
+            const error = new Error(String(message || 'RunningHub 请求失败'));
+            error.payload = payload;
+            return error;
+        }
+        async function submitOnlineRunningHubOperation(reqBody, operationId){
+            const response = await fetch('/api/online-runninghub/submit', {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({...reqBody, operation_id:operationId}),
+            });
+            const data = await response.json().catch(() => ({}));
+            if(!response.ok) throw onlineRunningHubError(apiErrorMessage(data, tr('online.generationFailed')), data);
+            return data?.data || {};
+        }
+        async function queryOnlineRunningHubOperation(operationId){
+            const response = await fetch(`/api/online-runninghub/query?operation_id=${encodeURIComponent(operationId)}`);
+            const data = await response.json().catch(() => ({}));
+            if(!response.ok) throw onlineRunningHubError(apiErrorMessage(data, tr('online.generationFailed')), data);
+            return data?.data || {};
+        }
+        function onlineRunningHubCancelledError(){
+            const error = new Error('RunningHub 任务已取消');
+            error.runningHubCancelled = true;
+            return error;
+        }
+        function applyOnlineRunningHubState(operationId, state){
+            if(generationState.runningHubOperationId !== operationId) return;
+            generationState.runningHubQueued = state === 'queued';
+            updateGenerationStatus();
+        }
+        async function waitForOnlineRunningHubOperation(operationId, initial){
+            let operation = initial || {};
+            while(true){
+                if(onlineRunningHubCancelledOperations.has(operationId)) throw onlineRunningHubCancelledError();
+                const status = String(operation.status || '').toUpperCase();
+                if(status === 'SUCCESS') return operation.result;
+                if(status === 'FAILED') throw onlineRunningHubError(operation.error || tr('online.generationFailed'), operation);
+                if(status === 'CANCELLED') throw onlineRunningHubCancelledError();
+                applyOnlineRunningHubState(operationId, status === 'QUEUED' ? 'queued' : 'running');
+                await new Promise(resolve => setTimeout(resolve, 2500));
+                if(onlineRunningHubCancelledOperations.has(operationId)) throw onlineRunningHubCancelledError();
+                operation = await queryOnlineRunningHubOperation(operationId);
+            }
+        }
+        async function cancelOnlineRunningHubOperation(){
+            const operationId = generationState.runningHubOperationId;
+            if(!operationId || generationState.runningHubCancelling) return;
+            generationState.runningHubCancelling = true;
+            onlineRunningHubCancelledOperations.add(operationId);
+            onlineRunningHubCapacityQueue.cancel(entry => entry.operationId === operationId, 'RunningHub 任务已取消');
+            updateGenerationStatus();
+            try {
+                const response = await fetch('/api/online-runninghub/cancel', {
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({operation_id:operationId}),
+                });
+                const data = await response.json().catch(() => ({}));
+                if(!response.ok) throw onlineRunningHubError(apiErrorMessage(data, '取消 RunningHub 任务失败'), data);
+                const operation = data?.data || {};
+                if(operation.remote_cancel_error) showNotice(`本地任务已停止，但${operation.remote_cancel_error || '官网任务可能仍在运行'}`, 'error', 7000);
+                else showNotice('RunningHub 任务已取消');
+            } catch(error){
+                showNotice(`${error.message || '取消失败'}，官网任务可能仍在运行`, 'error', 7000);
+            } finally {
+                if(generationState.runningHubOperationId === operationId){
+                    generationState.runningHubOperationId = '';
+                    generationState.runningHubQueued = false;
+                    generationState.runningHubCancelling = false;
+                    setGenerationRunning(false);
+                    document.getElementById('loader')?.classList.add('hidden');
+                    document.getElementById('placeholder')?.classList.remove('hidden');
+                }
+            }
         }
 
         function parseSizeValue(value){
@@ -1032,7 +1136,11 @@
         }
 
         async function submitImage(){
-            if(generationState.running){ showRunningNotice(); return; }
+            if(generationState.running){
+                if(generationState.runningHubOperationId) await cancelOnlineRunningHubOperation();
+                else showRunningNotice();
+                return;
+            }
             const prompt = document.getElementById('promptInput').value.trim();
             if(!prompt && runningHubPromptRequired(currentRunningHubEntry())){ showNotice(tr('online.promptRequired'), 'error'); return; }
             if(referenceUploadsPending()){ showNotice(tr('online.imagesUploading')); return; }
@@ -1042,24 +1150,55 @@
                 return;
             }
             const loader = document.getElementById('loader'), placeholder = document.getElementById('placeholder'), out = document.getElementById('outputImg'), dl = document.getElementById('downloadBtn');
+            const runningHubEntryMode = isRunningHubEntryMode();
+            const operationId = runningHubEntryMode ? newOnlineRunningHubOperationId() : '';
+            if(runningHubEntryMode){
+                generationState.runningHubOperationId = operationId;
+                generationState.runningHubQueued = false;
+                generationState.runningHubCancelling = false;
+            }
             setGenerationRunning(true);
             placeholder.classList.add('hidden'); out.classList.add('hidden'); dl.classList.add('hidden'); loader.classList.remove('hidden');
             try {
                 const reqBody = { prompt, provider_id:provider, model:selectedModel, size:currentSize(), n:outputCount, reference_images:currentReferencePayload() };
                 if(QUALITY_PROTOCOLS.has(providerProtocol(provider))) reqBody.quality = quality;
                 if(currentRunningHubEntry()) reqBody.runninghub_params = collectRunningHubParams();
-                const response = await fetch('/api/online-image', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify(reqBody)
-                });
-                if(!response.ok) throw new Error(await responseErrorMessage(response, tr('online.generationFailed')));
-                const result = await response.json();
+                let result;
+                if(runningHubEntryMode){
+                    const operation = await onlineRunningHubCapacityQueue.submit(
+                        () => submitOnlineRunningHubOperation(reqBody, operationId),
+                        {
+                            operationId,
+                            onState:state => applyOnlineRunningHubState(operationId, state),
+                        },
+                    );
+                    result = await waitForOnlineRunningHubOperation(operationId, operation);
+                    if(onlineRunningHubCancelledOperations.has(operationId) || generationState.runningHubOperationId !== operationId){
+                        throw onlineRunningHubCancelledError();
+                    }
+                } else {
+                    const response = await fetch('/api/online-image', {
+                        method:'POST', headers:{'Content-Type':'application/json'},
+                        body:JSON.stringify(reqBody)
+                    });
+                    if(!response.ok) throw new Error(await responseErrorMessage(response, tr('online.generationFailed')));
+                    result = await response.json();
+                }
                 currentResult = result; out.src = result.images[0]; out.classList.remove('hidden'); dl.href = result.images[0]; dl.classList.remove('hidden'); renderImageCard(result, true);
                 showNotice(tr('online.generatedIn').replace('{time}', runningElapsed()));
             } catch(err) {
-                showNotice(err.message || tr('online.generationFailed'), 'error'); placeholder.classList.remove('hidden');
+                const cancelled = Boolean(err?.runningHubCancelled || err?.runningHubQueueCancelled || onlineRunningHubCancelledOperations.has(operationId));
+                if(!cancelled) showNotice(err.message || tr('online.generationFailed'), 'error');
+                if(!generationState.running || !runningHubEntryMode || generationState.runningHubOperationId === operationId) placeholder.classList.remove('hidden');
             } finally {
-                loader.classList.add('hidden'); setGenerationRunning(false);
+                onlineRunningHubCancelledOperations.delete(operationId);
+                if(!runningHubEntryMode || generationState.runningHubOperationId === operationId){
+                    loader.classList.add('hidden');
+                    generationState.runningHubOperationId = '';
+                    generationState.runningHubQueued = false;
+                    generationState.runningHubCancelling = false;
+                    setGenerationRunning(false);
+                }
             }
         }
 
@@ -1174,6 +1313,6 @@
         const observer = new IntersectionObserver(entries => { if(entries[0].isIntersecting && currentIndex < allHistory.length) loadHistory(1); }, {threshold:.1});
         window.onload = async () => { applyLanguage(); setRatio('square'); setResolution('1k'); await initModels(); await loadHistory(0); window.HistoryBulkManager?.attach({masonry:'#masonry'}); observer.observe(document.getElementById('loadMoreTrigger')); document.getElementById('loadMoreTrigger').onclick = () => loadHistory(1); };
     </script>
-    <script src="/static/js/global-prompt-library.js?v=2026.08.17-custom.2.1786676777"></script>
+    <script src="/static/js/global-prompt-library.js?v=2026.08.18-custom.1.1786676777"></script>
 </body>
 </html>

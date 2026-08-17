@@ -1,10 +1,14 @@
 {
-  "version": "2026.08.17-custom.3",
-  "updated_at": "2026-08-17T00:00:00+08:00",
+  "version": "2026.08.18-custom.1",
+  "updated_at": "2026-08-18T00:00:00+08:00",
   "items": [
     {
       "type": "fix",
-      "text": "修复 RunningHub 任务取消、排队与画布日志问题"
+      "text": "完善 RunningHub 跨页面排队、远程取消与任务状态控制"
+    },
+    {
+      "type": "fix",
+      "text": "完善版本管理、备份导入刷新及 Windows 启停脚本"
     }
   ]
 }

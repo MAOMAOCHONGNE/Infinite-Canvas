@@ -6919,7 +6919,9 @@ function renderNode(node){
     const statusHtml = showStatus ? (() => {
         const label = { queued:'排队中', running:'运行中', done:'完成', partial:'部分完成', failed:'失败' }[node.runStatus] || '';
         const queuePosition = node.type === 'rh' && node.runStatus === 'queued' ? runningHubQueuePositionForNode(node.id) : 0;
-        const detail = queuePosition ? ` · ${queuePosition}` : (node._cascadeIdx ? ` ${node._cascadeIdx}` : '');
+        const detail = queuePosition
+            ? ` · ${queuePosition}`
+            : (node._cascadeIdx ? ` ${node._cascadeIdx}` : '');
         return `<span class="node-run-status ${node.runStatus}"><span class="dot"></span>${escapeHtml(label)}${escapeHtml(detail)}</span>`;
     })() : '';
     el.innerHTML = `<div class="node-head"><span class="node-title">${displayTitle}</span><div style="display:flex;align-items:center;gap:8px">${statusHtml}<button onclick="deleteNodeFromButton('${node.id}', event)" class="text-gray-300 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button></div></div>`;
@@ -13503,7 +13505,9 @@ async function runRhNode(nodeId, opts={}){
                 result = data;
                 break;
             }
-            if(data.status === 'FAILED') throw new Error(apiErrorMessage({detail:data.failReason}, tr('canvas.rhFailed')));
+            if(data.status === 'FAILED'){
+                throw new Error(apiErrorMessage({detail:data.failReason}, tr('canvas.rhFailed')));
+            }
         }
         if(!result) throw new Error(tr('canvas.rhTimeout'));
         const outputs = result.urls || [];

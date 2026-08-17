@@ -5997,7 +5997,18 @@ function syncRunButtonState(node=selectedNode()){
     if(!runBtn) return;
     // 只在“当前选中节点自己”忙时禁用运行：节点正在生成/排队，或它本身是正在跑的循环。
     // 不再因为“画布上有任意循环/级联在跑”就全局禁用——跑循环时仍可对其他节点点生成。
-    runBtn.disabled = !isSmartRunnableNode(node) || smartNodeInFlight(node) || smartCascadeIsLoopRunning(node?.id);
+    const runningHubWork = smartRunningHubNodeHasWork(node?.id);
+    if(runningHubWork){
+        const stopping = Boolean(node?._runningHubStopping);
+        runBtn.disabled = stopping;
+        runBtn.classList.add('is-stop');
+        runBtn.innerHTML = `<i data-lucide="square"></i><span>${stopping ? '停止中...' : '取消任务'}</span>`;
+    } else {
+        runBtn.disabled = !isSmartRunnableNode(node) || smartNodeInFlight(node) || smartCascadeIsLoopRunning(node?.id);
+        runBtn.classList.remove('is-stop');
+        runBtn.innerHTML = `<i data-lucide="sparkles"></i><span>${escapeHtml(tr('smart.run'))}</span>`;
+    }
+    refreshIcons();
 }
 function mergeSmartNode(local, remote){
     if(local?.type === 'smart-prompt' || remote?.type === 'smart-prompt'){
@@ -9070,7 +9081,7 @@ function nodeRunElapsedMs(node){
 }
 function runTimePillHtml(node){
     if(!node || node.runTimerHidden || node.type === 'smart-prompt') return '';
-    const running = Boolean(node.pending || node.running || node.jimengPending);
+    const running = Boolean(node.pending || node.running || node.queued || node.jimengPending || node._runningHubStopping);
     if(!running && !node.runFinishedAt) return '';
     const cls = running ? '' : ' done';
     return `<span class="run-time-pill${cls}" data-run-timer="${escapeHtml(node.id)}">${formatRunDuration(nodeRunElapsedMs(node))}</span>`;
@@ -9082,7 +9093,7 @@ function hideRunTimerForNode(node){
     return true;
 }
 function refreshRunTimerPills(){
-    const active = nodes.some(n => n.type !== 'smart-prompt' && !n.runTimerHidden && (n.pending || n.running || n.jimengPending || n.runFinishedAt));
+    const active = nodes.some(n => n.type !== 'smart-prompt' && !n.runTimerHidden && (n.pending || n.running || n.queued || n.jimengPending || n._runningHubStopping || n.runFinishedAt));
     document.querySelectorAll('[data-run-timer]').forEach(el => {
         const node = nodes.find(n => n.id === el.dataset.runTimer);
         if(!node || node.runTimerHidden || node.type === 'smart-prompt') {
@@ -9090,7 +9101,7 @@ function refreshRunTimerPills(){
             return;
         }
         el.textContent = formatRunDuration(nodeRunElapsedMs(node));
-        el.classList.toggle('done', Boolean(!node.pending && !node.running && !node.jimengPending && node.runFinishedAt));
+        el.classList.toggle('done', Boolean(!node.pending && !node.running && !node.queued && !node.jimengPending && !node._runningHubStopping && node.runFinishedAt));
     });
     if(active && !runTimerInterval) runTimerInterval = setInterval(refreshRunTimerPills, 1000);
     if(!active && runTimerInterval){ clearInterval(runTimerInterval); runTimerInterval = null; }
@@ -10831,6 +10842,7 @@ function setDropHighlight(targetId){
     if(el) el.classList.add('drop-target');
 }
 function deleteNode(id){
+    cancelSmartRunningHubNode(id, {notify:false});
     pushUndo();
     const deleteIds = new Set([id]);
     nodes.forEach(node => {
@@ -16378,7 +16390,7 @@ function buildPromptRequestForNode(node, defaultImages, ctx=smartLoopContext){
         promptInput.innerHTML = oldHtml;
     }
 }
-async function generateUrlsForCurrentSettings(node, prompt, refs, runSettings=settings){
+async function generateUrlsForCurrentSettings(node, prompt, refs, runSettings=settings, runtime={}){
     const activeSettings = runSettings || settings;
     if(activeSettings.engine === 'comfy') return generateComfyUrlsWithSettings(activeSettings, prompt, refs);
     if(activeSettings.engine === 'runninghub' && runningHubSelectedModel(activeSettings)){
@@ -16407,7 +16419,7 @@ async function generateUrlsForCurrentSettings(node, prompt, refs, runSettings=se
         return {urls, kind:mediaKindForUrls(urls, 'image')};
     }
     const urls = activeSettings.engine === 'runninghub'
-        ? await runRunningHubGeneration(prompt, refs, activeSettings)
+        ? await runRunningHubGeneration(prompt, refs, activeSettings, runtime)
         : activeSettings.engine === 'modelscope'
             ? await runModelscopeGeneration(prompt, refs, activeSettings)
             : [];
@@ -16528,7 +16540,10 @@ async function runCascadeStepIntoNode(sourceNode, targetNode, inputRefs, ctx=sma
     render();
     settings = previousSettings;
     try {
-        const result = await generateUrlsForCurrentSettings(outputNode, prompt, request.refs || [], runSettings);
+        const result = await generateUrlsForCurrentSettings(outputNode, prompt, request.refs || [], runSettings, {
+            nodeId:outputNode.id,
+            runKey:ctx?.runState?.runKey || ''
+        });
         if(!result.urls?.length) throw new Error(result.kind === 'video' ? tr('smart.errNoOutVideos') : tr('smart.errNoOutImages'));
         if(outpaintSize) delete requestNode.outpaintSize;
         addSmartGenerationLog({run:{...runLog, kind:result.kind || logKind}, outputs:result.urls, runMs:nowMs() - runLogStart});
@@ -16642,7 +16657,10 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
             }
             result = {urls:(outputSlot.images || []).map(img => img?.url ? img : null).filter(Boolean), kind:'image'};
         } else {
-            result = await generateUrlsForCurrentSettings(outputSlot, prompt, request.refs || [], runSettings);
+            result = await generateUrlsForCurrentSettings(outputSlot, prompt, request.refs || [], runSettings, {
+                nodeId:outputSlot.id,
+                runKey:ctx?.runState?.runKey || ''
+            });
         }
         if(!result.urls?.length) throw new Error(result.kind === 'video' ? tr('smart.errNoOutVideos') : tr('smart.errNoOutImages'));
         let additions;
@@ -16722,11 +16740,12 @@ function requestSmartCascadeStop(loopId=''){
         if(runState.stopRequested) return;
         runState.stopRequested = true;
         syncSmartCascadeLegacyState(runState.runKey || runState.loopId || loopId);
+        cancelSmartRunningHubRun(runState.runKey, {notify:true});
     } else {
         if(!smartCascadeRunning || smartCascadeStopRequested) return;
         smartCascadeStopRequested = true;
     }
-    toast('已请求停止，当前任务完成后停止');
+    toast(runState ? '已请求停止，RunningHub 任务将立即取消' : '已请求停止，当前任务完成后停止');
     render();
 }
 function smartCascadeParallelLimit(chain=[]){
@@ -16952,6 +16971,7 @@ async function runSmartCascade(targetNode=null){
         toast(e?.smartCascadeStopped ? '已停止一键运行' : (e.message || tr('smart.errRunFailed')).slice(0, 160));
     } finally {
         smartCascadeRuns.delete(runKey);
+        smartRunningHubRunCancelRequests.delete(runKey);
         syncSmartCascadeLegacyState();
         smartCascadeSilentSelection = false;
         syncRunButtonState();
@@ -16977,7 +16997,10 @@ async function runGeneration(){
     const request = buildPromptRequest(node, null, true, smartLoopContext);
     const prompt = request.prompt.trim();
     if(!node) return;
-    if(smartNodeInFlight(node)) return;
+    if(smartNodeInFlight(node)){
+        if(smartRunningHubNodeHasWork(node.id)) showSmartRunningHubBusyNotice(node);
+        return;
+    }
     const refs = request.refs;
     const previousSettings = cloneSmartSettings(settings);
     const runSettings = smartSettingsForNode(node);
@@ -17074,7 +17097,7 @@ async function runGeneration(){
         const outImages = rhModelMode
             ? await runApiGeneration(prompt, refs, runningHubModelApiSettings(settings))
             : settings.engine === 'runninghub'
-                ? await runRunningHubGeneration(prompt, refs)
+                ? await runRunningHubGeneration(prompt, refs, settings, {nodeId:pendingNode.id})
                 : settings.engine === 'modelscope'
                 ? await runModelscopeGeneration(prompt, refs)
                 : await runApiGeneration(prompt, refs);
@@ -17137,8 +17160,12 @@ async function runGeneration(){
         }
         if(extracted) restoreFromExtraction(node, extracted);
         delete pendingNode._runMetaTargetId;
+        if(isSmartRunningHubCancelledError(e)){
+            e.smartGenerationLogged = true;
+            toast('RunningHub 任务已取消');
+        }
         if(!e?.smartGenerationLogged) addSmartGenerationLog({run:runLog, outputs:[], runMs:nowMs() - runLogStart, error:e.message || String(e)});
-        toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
+        if(!isSmartRunningHubCancelledError(e)) toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
     } finally {
         if(!apiConcurrentRun){
             clearNodeRunningState(pendingNode);
@@ -17273,7 +17300,122 @@ function runningHubPayloadError(stage, data, fallback, extra={}){
     if(code !== '') parts.push(`code=${code}`);
     return smartDetailedError(parts.join('：'), {stage, taskId, code, raw, ...(detailObj || {}), ...extra});
 }
-async function runRunningHubGeneration(prompt, refs, runSettings=settings){
+const smartRunningHubQueueTools = window.RunningHubCapacityQueueTools || {};
+const smartRunningHubCapacityQueue = new smartRunningHubQueueTools.RunningHubCapacityQueue({retryDelay:12000});
+const smartRunningHubNodeCancelRequests = new Set();
+const smartRunningHubRunCancelRequests = new Set();
+const smartRunningHubSubmissions = new Map();
+const smartRunningHubTaskRegistry = new smartRunningHubQueueTools.RunningHubTaskRegistry(cancelSmartRunningHubRemoteTask);
+
+function smartRunningHubCancellationError(meta={}){
+    const error = new Error('RunningHub 任务已取消');
+    error.smartRunningHubCancelled = true;
+    error.smartCascadeStopped = Boolean(meta.runKey);
+    return error;
+}
+function isSmartRunningHubCancelledError(error){
+    return Boolean(error?.smartRunningHubCancelled || error?.runningHubQueueCancelled);
+}
+function smartRunningHubOwnerCancelled(meta={}){
+    return Boolean(
+        (meta.nodeId && smartRunningHubNodeCancelRequests.has(meta.nodeId))
+        || (meta.runKey && smartRunningHubRunCancelRequests.has(meta.runKey))
+    );
+}
+function smartRunningHubNodeHasWork(nodeId){
+    const id = String(nodeId || '');
+    if(!id) return false;
+    return smartRunningHubSubmissions.size > 0 && [...smartRunningHubSubmissions.values()].some(item => item.nodeId === id)
+        || smartRunningHubCapacityQueue.position(item => item.nodeId === id) > 0
+        || smartRunningHubTaskRegistry.list(task => task.nodeId === id).length > 0;
+}
+function smartRunningHubRunHasWork(runKey){
+    const key = String(runKey || '');
+    if(!key) return false;
+    return [...smartRunningHubSubmissions.values()].some(item => item.runKey === key)
+        || smartRunningHubCapacityQueue.position(item => item.runKey === key) > 0
+        || smartRunningHubTaskRegistry.list(task => task.runKey === key).length > 0;
+}
+function smartRunningHubQueueState(meta, state){
+    const node = nodes.find(item => item.id === meta.nodeId);
+    if(!node) return;
+    if(state === 'queued'){
+        node.queued = true;
+        node.running = false;
+        node.pending = 0;
+    } else if(state === 'submitting' || state === 'accepted'){
+        node.queued = false;
+        node.running = true;
+        if(!node.pending) node.pending = 1;
+    } else if(state === 'cancelled'){
+        node.queued = false;
+    }
+    if(!node.runStartedAt) node.runStartedAt = nowMs();
+    node.runTimerHidden = false;
+    syncRunButtonState(node);
+    render();
+}
+function registerSmartRunningHubTask(taskId, meta={}){
+    return smartRunningHubTaskRegistry.register(taskId, {
+        nodeId:String(meta.nodeId || ''),
+        runKey:String(meta.runKey || ''),
+        mode:String(meta.mode || ''),
+        useWallet:Boolean(meta.useWallet),
+    });
+}
+async function cancelSmartRunningHubRemoteTask(task){
+    const response = await fetch('/api/runninghub/cancel', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({taskId:task.taskId, useWallet:Boolean(task.useWallet)})
+    });
+    const data = await response.clone().json().catch(async () => ({detail:await response.text().catch(() => '')}));
+    if(!response.ok || data.success === false) throw runningHubPayloadError('取消', data, 'RunningHub 远程取消失败', {taskId:task.taskId});
+    return data;
+}
+function smartRunningHubCancelWarning(result, notify=true){
+    if(notify && result?.failed) toast('本地已停止，但 RunningHub 官网任务可能仍在运行');
+    return result;
+}
+async function cancelSmartRunningHubNode(nodeId, options={}){
+    const id = String(nodeId || '');
+    if(!id) return {attempted:0, failed:0};
+    smartRunningHubNodeCancelRequests.add(id);
+    smartRunningHubCapacityQueue.cancel(entry => entry.nodeId === id);
+    const node = nodes.find(item => item.id === id);
+    if(node){
+        node.queued = false;
+        node._runningHubStopping = smartRunningHubNodeHasWork(id);
+        syncRunButtonState(node);
+        render();
+    }
+    const result = await smartRunningHubTaskRegistry.cancel(task => task.nodeId === id);
+    return smartRunningHubCancelWarning(result, options.notify !== false);
+}
+async function cancelSmartRunningHubRun(runKey, options={}){
+    const key = String(runKey || '');
+    if(!key) return {attempted:0, failed:0};
+    smartRunningHubRunCancelRequests.add(key);
+    smartRunningHubCapacityQueue.cancel(entry => entry.runKey === key);
+    smartRunningHubTaskRegistry.list(task => task.runKey === key).forEach(task => {
+        const node = nodes.find(item => item.id === task.nodeId);
+        if(node) node._runningHubStopping = true;
+    });
+    render();
+    const result = await smartRunningHubTaskRegistry.cancel(task => task.runKey === key);
+    return smartRunningHubCancelWarning(result, options.notify !== false);
+}
+function wakeSmartRunningHubQueue(){
+    smartRunningHubCapacityQueue.wake();
+}
+function showSmartRunningHubBusyNotice(node){
+    const elapsed = formatRunDuration(nodeRunElapsedMs(node));
+    toast(node?.queued
+        ? `RunningHub 任务排队中，已等待 ${elapsed}`
+        : `RunningHub 任务正在生成，已耗时 ${elapsed}，请勿重复提交`);
+}
+
+async function runRunningHubGeneration(prompt, refs, runSettings=settings, runtime={}){
     const ref = selectedRunningHubRef(runSettings);
     if(!ref) throw new Error(tr('smart.rhNeedConfig'));
     const fields = rhActiveFields(runSettings);
@@ -17290,40 +17432,83 @@ async function runRunningHubGeneration(prompt, refs, runSettings=settings){
     if(mode === 'workflow') runSettings.rhWorkflowId = ref.id;
     else runSettings.rhAppId = ref.id;
     runSettings.rhMode = mode;
-    const submit = await fetch(endpoint, {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(body)
-    }).then(async r => {
-        const data = await r.clone().json().catch(async () => ({detail:await r.text().catch(() => '')}));
-        if(!r.ok || data.success === false) throw runningHubPayloadError('提交', data, tr('smart.rhFailed'), {
-            endpoint,
-            workflowId:body.workflowId || '',
-            webappId:body.webappId || '',
-            nodeInfoList:nodeInfoList.slice(0, 40),
-            hasWorkflow:Boolean(body.workflow)
-        });
-        return data.data || data;
-    });
-    const taskId = submit.taskId;
-    if(!taskId) throw new Error(tr('smart.rhNoTaskId'));
-    runSettings.rhTaskId = taskId;
     const useWallet = runSettings.rhPayment === 'wallet';
-    for(let i = 0; i < 720; i++){
-        await sleep(2500);
-        const data = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}&useWallet=${useWallet ? '1' : '0'}`).then(async r => {
-            const json = await r.clone().json().catch(async () => ({detail:await r.text().catch(() => '')}));
-            if(!r.ok || json.success === false) throw runningHubPayloadError('查询', json, tr('smart.rhFailed'), {taskId});
-            return json.data || json;
+    const meta = {
+        id:`smart-rh-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        nodeId:String(runtime.nodeId || ''),
+        runKey:String(runtime.runKey || ''),
+        mode,
+        useWallet,
+    };
+    if(!meta.runKey && meta.nodeId) smartRunningHubNodeCancelRequests.delete(meta.nodeId);
+    smartRunningHubSubmissions.set(meta.id, meta);
+    let taskId = '';
+    try {
+        const submitOnce = async () => {
+            const response = await fetch(endpoint, {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify(body)
+            });
+            const data = await response.clone().json().catch(async () => ({detail:await response.text().catch(() => '')}));
+            if(!response.ok || data.success === false){
+                const error = runningHubPayloadError('提交', data, tr('smart.rhFailed'), {
+                    endpoint,
+                    workflowId:body.workflowId || '',
+                    webappId:body.webappId || '',
+                    nodeInfoList:nodeInfoList.slice(0, 40),
+                    hasWorkflow:Boolean(body.workflow)
+                });
+                error.payload = data;
+                throw error;
+            }
+            const submit = data.data || data;
+            taskId = String(submit.taskId || '');
+            if(!taskId) throw new Error(tr('smart.rhNoTaskId'));
+            registerSmartRunningHubTask(taskId, meta);
+            if(smartRunningHubOwnerCancelled(meta)){
+                await smartRunningHubTaskRegistry.cancel(task => task.taskId === taskId);
+                throw smartRunningHubCancellationError(meta);
+            }
+            return submit;
+        };
+        const submit = await smartRunningHubCapacityQueue.submit(submitOnce, {
+            ...meta,
+            onState:state => smartRunningHubQueueState(meta, state)
         });
-        if(data.status === 'SUCCESS'){
-            const urls = resultMediaUrls(data.image_items?.length ? data.image_items : (data.urls || []));
-            if(!urls.length) throw new Error(tr('smart.rhOutputsEmpty'));
-            return urls;
+        taskId = String(submit.taskId || taskId || '');
+        if(!taskId) throw new Error(tr('smart.rhNoTaskId'));
+        runSettings.rhTaskId = taskId;
+        for(let i = 0; i < 720; i++){
+            if(smartRunningHubOwnerCancelled(meta)) throw smartRunningHubCancellationError(meta);
+            await sleep(2500);
+            if(smartRunningHubOwnerCancelled(meta)) throw smartRunningHubCancellationError(meta);
+            const data = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}&useWallet=${useWallet ? '1' : '0'}`).then(async r => {
+                const json = await r.clone().json().catch(async () => ({detail:await r.text().catch(() => '')}));
+                if(!r.ok || json.success === false) throw runningHubPayloadError('查询', json, tr('smart.rhFailed'), {taskId});
+                return json.data || json;
+            });
+            if(smartRunningHubOwnerCancelled(meta)) throw smartRunningHubCancellationError(meta);
+            if(data.status === 'SUCCESS'){
+                const urls = resultMediaUrls(data.image_items?.length ? data.image_items : (data.urls || []));
+                if(!urls.length) throw new Error(tr('smart.rhOutputsEmpty'));
+                return urls;
+            }
+            if(data.status === 'FAILED') throw runningHubPayloadError('执行', data, data.failReason || tr('smart.rhFailed'), {taskId});
         }
-        if(data.status === 'FAILED') throw runningHubPayloadError('执行', data, data.failReason || tr('smart.rhFailed'), {taskId});
+        throw new Error(tr('smart.rhTimeout'));
+    } finally {
+        smartRunningHubSubmissions.delete(meta.id);
+        smartRunningHubTaskRegistry.unregister(taskId);
+        wakeSmartRunningHubQueue();
+        const node = nodes.find(item => item.id === meta.nodeId);
+        if(node){
+            node.queued = false;
+            node._runningHubStopping = false;
+        }
+        if(!meta.runKey) smartRunningHubNodeCancelRequests.delete(meta.nodeId);
+        syncRunButtonState(node);
     }
-    throw new Error(tr('smart.rhTimeout'));
 }
 async function runApiVideoGeneration(prompt, refs, runSettings=settings){
     if(!runSettings.videoModel) throw new Error(tr('smart.errNoVideoModel'));
@@ -17698,7 +17883,7 @@ async function runMinimaxRunningHub(node){
     smartMinimaxSetRunningHubParam(runSettings, fields, [/aspect[_\s-]?ratio|\bratio\b|画面比例|比例/], ['115::aspect_ratio'], aspect);
     smartMinimaxSetRunningHubParam(runSettings, fields, [/megapixels?|百万像素/], ['115::megapixels'], Number(seg?.megapixels || node.megapixels || 0.4));
     const refs = smartMinimaxRunRefs(node);
-    const urls = await runRunningHubGeneration(prompt, refs, runSettings);
+    const urls = await runRunningHubGeneration(prompt, refs, runSettings, {nodeId:node.id});
     if(!urls.length) throw new Error(tr('smart.errNoOutVideos'));
     return {urls, kind:mediaKindForUrls(urls, 'video'), runSettings};
 }
@@ -17756,6 +17941,10 @@ async function runMinimaxNode(nodeId){
         toast(`MiniMax segment ${Math.max(1, node.segments.findIndex(item => item.id === seg?.id) + 1)} done`);
         scheduleSave();
     } catch(e) {
+        if(isSmartRunningHubCancelledError(e)){
+            toast('RunningHub 任务已取消');
+            return;
+        }
         const readable = smartMinimaxReadableError(e, smartMinimaxEngine(node));
         const details = e?.smartDetails || {};
         runLog = smartMinimaxRunSnapshot(node, {
@@ -19196,7 +19385,12 @@ if(promptResize){
         };
     });
 }
-runBtn.onclick = runGeneration;
+function handleSmartRunButton(){
+    const node = selectedNode();
+    if(smartRunningHubNodeHasWork(node?.id)) return cancelSmartRunningHubNode(node.id);
+    return runGeneration();
+}
+runBtn.onclick = handleSmartRunButton;
 cascadeRunBtn.onclick = () => {
     const node = selectedNode();
     const loopId = resolveSmartCascadeLoop(node?.id)?.node?.id || '';

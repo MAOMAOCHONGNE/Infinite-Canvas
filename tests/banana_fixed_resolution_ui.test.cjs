@@ -31,6 +31,6 @@ test('smart canvas renders a fixed-only picker and guards stale size events', ()
 });
 
 test('both pages load the cache-busted controllers after the fixed-resolution change', () => {
-    assert.match(classicHtml, /canvas\.js\?v=2026\.08\.\d{2}-custom\.2\.\d+/);
-    assert.match(smartHtml, /smart-canvas\.js\?v=2026\.08\.\d{2}-custom\.2\.\d+/);
+    assert.match(classicHtml, /canvas\.js\?v=2026\.08\.\d{2}-custom\.\d+\.\d+/);
+    assert.match(smartHtml, /smart-canvas\.js\?v=2026\.08\.\d{2}-custom\.\d+\.\d+/);
 });

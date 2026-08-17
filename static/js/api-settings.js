@@ -15,6 +15,23 @@ const rhFreeKeyInput = document.getElementById('rhFreeKeyInput');
 const rhWalletKeyInput = document.getElementById('rhWalletKeyInput');
 const rhFreeKeyHint = document.getElementById('rhFreeKeyHint');
 const rhWalletKeyHint = document.getElementById('rhWalletKeyHint');
+const rhAccountRefreshBtn = document.getElementById('rhAccountRefreshBtn');
+const rhAccountFields = {
+    coin:{
+        state:document.getElementById('rhCoinAccountState'),
+        coins:document.getElementById('rhCoinRemainCoins'),
+        money:document.getElementById('rhCoinRemainMoney'),
+        tasks:document.getElementById('rhCoinTaskCount'),
+        type:document.getElementById('rhCoinApiType'),
+    },
+    wallet:{
+        state:document.getElementById('rhWalletAccountState'),
+        coins:document.getElementById('rhWalletRemainCoins'),
+        money:document.getElementById('rhWalletRemainMoney'),
+        tasks:document.getElementById('rhWalletTaskCount'),
+        type:document.getElementById('rhWalletApiType'),
+    },
+};
 const volcArkKeyHint = document.getElementById('volcArkKeyHint');
 const volcAkInput = document.getElementById('volcAkInput');
 const volcSkInput = document.getElementById('volcSkInput');
@@ -2929,6 +2946,13 @@ function renderEditor(){
         if(rhFreeKeyHint) rhFreeKeyHint.textContent = rhFreeKeyHintText(item);
         if(rhWalletKeyHint) rhWalletKeyHint.textContent = rhWalletKeyHintText(item);
         renderRunningHubCards();
+        queueMicrotask(() => refreshRunningHubAccountStatus(false));
+    } else {
+        rhAccountLoadedSignature = '';
+        rhAccountStatusLoading = false;
+        rhAccountRequestId += 1;
+        rhAccountRefreshBtn?.classList.remove('is-loading');
+        if(rhAccountRefreshBtn) rhAccountRefreshBtn.disabled = false;
     }
     if(isVolcengine){
         item.base_url = item.base_url || VOLCENGINE_DEFAULT_BASE_URL;
@@ -4107,6 +4131,78 @@ function deleteProvider(){
     renderEditor();
     saveProviders();
 }
+let rhAccountLoadedSignature = '';
+let rhAccountStatusLoading = false;
+let rhAccountRequestId = 0;
+function runningHubAccountSignature(item){
+    if(!item || item.id !== 'runninghub') return '';
+    return [
+        item.id,
+        String(item.base_url || ''),
+        item.has_key ? '1' : '0',
+        String(item.key_preview || ''),
+        item.has_wallet_key ? '1' : '0',
+        String(item.wallet_key_preview || ''),
+    ].join('|');
+}
+function renderRunningHubAccountCard(kind, state, data=null, detail=''){
+    const refs = rhAccountFields[kind];
+    if(!refs?.state) return;
+    refs.state.className = `rh-account-state${state === 'ok' ? ' ok' : state === 'error' ? ' bad' : ''}`;
+    refs.state.textContent = state === 'loading'
+        ? '查询中'
+        : state === 'ok'
+        ? '正常'
+        : state === 'missing'
+        ? '未配置'
+        : state === 'error'
+        ? '查询失败'
+        : '未查询';
+    refs.state.title = detail || '';
+    const value = (input, fallback='--') => String(input ?? '').trim() || fallback;
+    refs.coins.textContent = state === 'ok' ? value(data?.remainCoins) : '--';
+    const currency = state === 'ok' ? value(data?.currency, '') : '';
+    refs.money.textContent = state === 'ok' ? `${value(data?.remainMoney)}${currency ? ` ${currency}` : ''}` : '--';
+    refs.tasks.textContent = state === 'ok' ? value(data?.currentTaskCounts) : '--';
+    refs.type.textContent = state === 'ok' ? value(data?.apiType) : '--';
+}
+async function refreshRunningHubAccountStatus(force=false){
+    const item = provider();
+    if(!item || item.id !== 'runninghub') return;
+    const signature = runningHubAccountSignature(item);
+    if(!force && rhAccountLoadedSignature === signature) return;
+    if(rhAccountStatusLoading) return;
+    rhAccountLoadedSignature = signature;
+    rhAccountStatusLoading = true;
+    const requestId = ++rhAccountRequestId;
+    rhAccountRefreshBtn?.classList.add('is-loading');
+    if(rhAccountRefreshBtn) rhAccountRefreshBtn.disabled = true;
+    const requests = [
+        {kind:'coin', configured:Boolean(item.has_key), useWallet:false},
+        {kind:'wallet', configured:Boolean(item.has_wallet_key), useWallet:true},
+    ];
+    requests.forEach(entry => renderRunningHubAccountCard(entry.kind, entry.configured ? 'loading' : 'missing'));
+    const loadOne = async entry => {
+        if(!entry.configured) return;
+        try {
+            const response = await fetch(`/api/runninghub/account-status?useWallet=${entry.useWallet ? '1' : '0'}`, {cache:'no-store'});
+            const payload = await response.json().catch(() => ({}));
+            if(!response.ok || payload.success === false) throw new Error(String(payload.detail || payload.message || '查询失败'));
+            if(requestId === rhAccountRequestId) renderRunningHubAccountCard(entry.kind, 'ok', payload.data || payload);
+        } catch(error) {
+            if(requestId === rhAccountRequestId) renderRunningHubAccountCard(entry.kind, 'error', null, error.message || String(error));
+        }
+    };
+    try {
+        await Promise.all(requests.map(loadOne));
+    } finally {
+        if(requestId === rhAccountRequestId){
+            rhAccountStatusLoading = false;
+            rhAccountRefreshBtn?.classList.remove('is-loading');
+            if(rhAccountRefreshBtn) rhAccountRefreshBtn.disabled = false;
+        }
+    }
+}
 async function saveRhKeyOnly(kind){
     const item = provider();
     if(!item || item.id !== 'runninghub') return;
@@ -4115,7 +4211,11 @@ async function saveRhKeyOnly(kind){
     if(!key){ alert('请输入 Key'); return; }
     syncEditor();
     const ok = await saveProviders();
-    if(ok && input) input.value = '';
+    if(ok){
+        if(input) input.value = '';
+        rhAccountLoadedSignature = '';
+        refreshRunningHubAccountStatus(true);
+    }
 }
 async function clearRhKeyOnly(kind){
     const item = provider();
@@ -4127,6 +4227,8 @@ async function clearRhKeyOnly(kind){
     if(ok){
         if(kind === 'wallet' && rhWalletKeyInput) rhWalletKeyInput.value = '';
         if(kind !== 'wallet' && rhFreeKeyInput) rhFreeKeyInput.value = '';
+        rhAccountLoadedSignature = '';
+        refreshRunningHubAccountStatus(true);
     }
 }
 async function saveVolcengineAssetKeys(){
