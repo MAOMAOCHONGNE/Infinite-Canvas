@@ -6918,7 +6918,9 @@ function renderNode(node){
         && (node.runStatus !== 'failed' || node._cascadeFailed);
     const statusHtml = showStatus ? (() => {
         const label = { queued:'排队中', running:'运行中', done:'完成', partial:'部分完成', failed:'失败' }[node.runStatus] || '';
-        return `<span class="node-run-status ${node.runStatus}"><span class="dot"></span>${escapeHtml(label)}${node._cascadeIdx?' '+node._cascadeIdx:''}</span>`;
+        const queuePosition = node.type === 'rh' && node.runStatus === 'queued' ? runningHubQueuePositionForNode(node.id) : 0;
+        const detail = queuePosition ? ` · ${queuePosition}` : (node._cascadeIdx ? ` ${node._cascadeIdx}` : '');
+        return `<span class="node-run-status ${node.runStatus}"><span class="dot"></span>${escapeHtml(label)}${escapeHtml(detail)}</span>`;
     })() : '';
     el.innerHTML = `<div class="node-head"><span class="node-title">${displayTitle}</span><div style="display:flex;align-items:center;gap:8px">${statusHtml}<button onclick="deleteNodeFromButton('${node.id}', event)" class="text-gray-300 hover:text-red-500"><i data-lucide="x" class="w-4 h-4"></i></button></div></div>`;
     const body = document.createElement('div');
@@ -12634,6 +12636,16 @@ function renderRhBody(node){
         node.model = selectedRef?.id || node.rhModel || node.model || '';
         normalizeApiNodeSizeChoice(node);
     }
+    const canCancelTask = Boolean(node.running && mode !== 'model');
+    const taskStopping = node.runStatus === 'stopping';
+    const runButtonLabel = taskStopping
+        ? tr('canvas.rhStopping')
+        : canCancelTask
+            ? tr('canvas.rhCancel')
+            : node.running
+                ? tr('canvas.rhRunning')
+                : tr('canvas.rhRun');
+    const runButtonDisabled = Boolean(node.running && (!canCancelTask || taskStopping));
     wrap.innerHTML = `
         <div class="rh-top">
             <label class="field rh-webapp-field">
@@ -12664,7 +12676,7 @@ function renderRhBody(node){
         </div>
         <div class="rh-param-list"></div>
         <div class="gen-run-row">
-            <button class="gen-btn rh-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="workflow" class="w-4 h-4"></i>${node.running ? tr('canvas.rhRunning') : tr('canvas.rhRun')}</button>
+            <button class="gen-btn rh-run ${node.running ? 'running' : ''} ${canCancelTask ? 'gen-cascade-stop' : ''}" ${runButtonDisabled ? 'disabled' : ''}><i data-lucide="${canCancelTask ? 'square' : 'workflow'}" class="w-4 h-4"></i>${escapeHtml(runButtonLabel)}</button>
             ${cascadeBtnHtml(node)}
         </div>
         ${retryBarHtml(node)}
@@ -12694,7 +12706,14 @@ function renderRhBody(node){
     renderRhInputs(wrap.querySelector('.rh-input-list'), node, media);
     renderRhParams(wrap.querySelector('.rh-param-list'), node, fields, media);
     if(mode === 'model') bindRhModelControls(wrap, node, media);
-    wrap.querySelector('.rh-run').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
+    wrap.querySelector('.rh-run').onclick = e => {
+        e.stopPropagation();
+        if(node.running && mode !== 'model'){
+            requestRunningHubNodeCancel(node.id);
+            return;
+        }
+        runCanvasGenerate(node.id);
+    };
     bindCascadeButtons(wrap, node.id);
     refreshIcons();
     return wrap;
@@ -12978,7 +12997,7 @@ async function rhFetchAppInfo(nodeId, showAlert=true){
     try {
         const res = await fetch(`/api/runninghub/app-info?webappId=${encodeURIComponent(node.webappId.trim())}`);
         const data = await res.json();
-        if(!res.ok || data.success === false) throw new Error(data.detail || data.error || tr('canvas.rhFailed'));
+        if(!res.ok || data.success === false) throw new Error(apiErrorMessage(data, tr('canvas.rhFailed')));
         node.rhAppInfo = data.data || {};
         node.rhParams = node.rhParams || {};
         (node.rhAppInfo.nodeInfoList || []).forEach(field => {
@@ -12990,7 +13009,7 @@ async function rhFetchAppInfo(nodeId, showAlert=true){
         scheduleSave();
         return true;
     } catch(err) {
-        if(showAlert) alert(err.message || tr('canvas.rhFailed'));
+        if(showAlert) showErrorModal(err.message || tr('canvas.rhFailed'), 'RunningHub');
         return false;
     } finally {
         node.rhFetching = false;
@@ -13010,7 +13029,7 @@ async function rhFetchWorkflowInfo(nodeId, showAlert=true){
         const saved = await ensureRunningHubWorkflow(node.workflowId.trim());
         const res = await fetch(`/api/runninghub/workflow-info?workflowId=${encodeURIComponent(node.workflowId.trim())}`);
         const data = await res.json();
-        if(!res.ok || data.success === false) throw new Error(data.detail || data.error || tr('canvas.rhFailed'));
+        if(!res.ok || data.success === false) throw new Error(apiErrorMessage(data, tr('canvas.rhFailed')));
         const info = data.data || {};
         const savedFields = Array.isArray(saved?.fields) ? saved.fields : [];
         const mergedFields = savedFields.length
@@ -13031,7 +13050,7 @@ async function rhFetchWorkflowInfo(nodeId, showAlert=true){
         scheduleSave();
         return true;
     } catch(err) {
-        if(showAlert) alert(err.message || tr('canvas.rhFailed'));
+        if(showAlert) showErrorModal(err.message || tr('canvas.rhFailed'), 'RunningHub');
         return false;
     } finally {
         node.rhFetching = false;
@@ -13071,7 +13090,7 @@ async function rhUploadValueIfNeeded(value, node=null){
         body:JSON.stringify({url:text, useWallet:rhUseWallet(node)})
     });
     const data = await res.json();
-    if(!res.ok || data.success === false) throw new Error(data.detail || data.error || tr('canvas.rhUploadFailed'));
+    if(!res.ok || data.success === false) throw new Error(apiErrorMessage(data, tr('canvas.rhUploadFailed')));
     return data.data?.fileName || text;
 }
 async function rhBuildNodeInfoList(node, media){
@@ -13094,13 +13113,338 @@ async function rhBuildNodeInfoList(node, media){
     }
     return result;
 }
+function runningHubQueueMaxedPayload(value, depth=0, seen=new Set()){
+    if(value == null || depth > 8) return false;
+    if(typeof value === 'string'){
+        return /(^|[^A-Z0-9_])TASK_QUEUE_MAXED($|[^A-Z0-9_])/i.test(value);
+    }
+    if(typeof value !== 'object') return false;
+    if(seen.has(value)) return false;
+    seen.add(value);
+    if(Array.isArray(value)) return value.some(item => runningHubQueueMaxedPayload(item, depth + 1, seen));
+    return Object.entries(value).some(([key, item]) => (
+        runningHubQueueMaxedPayload(key, depth + 1, seen)
+        || runningHubQueueMaxedPayload(item, depth + 1, seen)
+    ));
+}
+function runningHubQueueCancelledError(message='RunningHub queue cancelled'){
+    const error = new Error(message);
+    error.name = 'RunningHubQueueCancelledError';
+    error.runningHubQueueCancelled = true;
+    return error;
+}
+function isRunningHubQueueCancelledError(error){
+    return Boolean(error?.runningHubQueueCancelled || error?.name === 'RunningHubQueueCancelledError');
+}
+function runningHubTaskCancelledError(message='RunningHub task cancelled'){
+    const error = new Error(message);
+    error.name = 'RunningHubTaskCancelledError';
+    error.runningHubTaskCancelled = true;
+    return error;
+}
+function isRunningHubTaskCancelledError(error){
+    return Boolean(error?.runningHubTaskCancelled || error?.name === 'RunningHubTaskCancelledError');
+}
+const RUNNINGHUB_QUEUE_RETRY_MS = 12000;
+const runningHubSubmitQueue = [];
+let runningHubSubmitQueueWorker = null;
+let runningHubSubmitQueueWake = null;
+function runningHubQueuePositionForNode(nodeId){
+    const index = runningHubSubmitQueue.findIndex(item => item.nodeId === nodeId);
+    return index >= 0 ? index + 1 : 0;
+}
+function runningHubQueueButtonLabel(node){
+    const position = runningHubQueuePositionForNode(node?.id);
+    const base = tr('canvas.rhQueued');
+    if(!position) return base;
+    return tr('canvas.rhQueuePosition').replace('{position}', String(position));
+}
+function runningHubRefreshQueueViews(showNotice=false, extraNodeIds=[]){
+    const ids = new Set((extraNodeIds || []).filter(Boolean));
+    runningHubSubmitQueue.forEach(item => {
+        const node = nodes.find(candidate => candidate.id === item.nodeId);
+        if(!node) return;
+        node.runStatus = 'queued';
+        node.runError = '';
+        ids.add(node.id);
+    });
+    if(ids.size) refreshNodes([...ids]);
+    if(showNotice) setStatus(tr('canvas.rhQueuedNotice'));
+}
+function runningHubWaitForQueueRetry(){
+    return new Promise(resolve => {
+        let settled = false;
+        const finish = () => {
+            if(settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if(runningHubSubmitQueueWake === finish) runningHubSubmitQueueWake = null;
+            resolve();
+        };
+        const timer = setTimeout(finish, RUNNINGHUB_QUEUE_RETRY_MS);
+        runningHubSubmitQueueWake = finish;
+    });
+}
+function wakeRunningHubSubmitQueue(){
+    const wake = runningHubSubmitQueueWake;
+    runningHubSubmitQueueWake = null;
+    if(wake) wake();
+    else if(runningHubSubmitQueue.length) startRunningHubSubmitQueueWorker();
+}
+function runningHubQueueEntryNode(entry){
+    return nodes.find(node => node.id === entry?.nodeId) || null;
+}
+function ensureRunningHubQueueEntryActive(entry){
+    const node = runningHubQueueEntryNode(entry);
+    if(!node) throw runningHubQueueCancelledError();
+    if(entry.cascadeTargetId) ensureCascadeActive(entry.cascadeTargetId);
+    else if(!node.running || runningHubNodeCancelRequests.has(node.id)) throw runningHubQueueCancelledError();
+    return node;
+}
+async function runningHubSubmitAttempt(endpoint, body, options={}){
+    const cascadeTargetId = cascadeTargetIdFromOptions(options);
+    if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
+    if(options.node?.id && runningHubNodeCancelRequests.has(options.node.id)) throw runningHubQueueCancelledError();
+    // 提交请求不能随级联 AbortController 中断，否则上游可能已接单但本地拿不到 taskId。
+    const response = await fetch(endpoint, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(body)
+    });
+    let data = {};
+    try {
+        data = await response.json();
+    } catch(error) {
+        data = {detail:tr('canvas.rhFailed')};
+    }
+    if(!response.ok || data.success === false){
+        const error = new Error(apiErrorMessage(data, tr('canvas.rhFailed')));
+        error.runningHubQueueMaxed = runningHubQueueMaxedPayload(data);
+        error.runningHubPayload = data;
+        throw error;
+    }
+    return trackRunningHubSubmittedTask(data.data || data, {
+        nodeId:options.node?.id || '',
+        cascadeTargetId,
+        mode:options.mode || '',
+        useWallet:Boolean(options.useWallet ?? body?.useWallet),
+    });
+}
+async function runRunningHubSubmitQueue(){
+    while(runningHubSubmitQueue.length){
+        const entry = runningHubSubmitQueue[0];
+        try {
+            ensureRunningHubQueueEntryActive(entry);
+        } catch(error) {
+            runningHubSubmitQueue.shift();
+            runningHubRefreshQueueViews(false, [entry.nodeId]);
+            entry.reject(error);
+            continue;
+        }
+        await runningHubWaitForQueueRetry();
+        if(runningHubSubmitQueue[0] !== entry) continue;
+        try {
+            const node = ensureRunningHubQueueEntryActive(entry);
+            const result = await runningHubSubmitAttempt(entry.endpoint, entry.body, {
+                node,
+                cascadeTargetId:entry.cascadeTargetId,
+                mode:entry.mode,
+                useWallet:entry.useWallet,
+            });
+            if(runningHubSubmitQueue[0] === entry) runningHubSubmitQueue.shift();
+            if(node.runStatus === 'queued') node.runStatus = 'running';
+            runningHubRefreshQueueViews(false, [entry.nodeId]);
+            entry.resolve(result);
+        } catch(error) {
+            if(error?.runningHubQueueMaxed){
+                runningHubRefreshQueueViews();
+                continue;
+            }
+            if(runningHubSubmitQueue[0] === entry) runningHubSubmitQueue.shift();
+            runningHubRefreshQueueViews(false, [entry.nodeId]);
+            entry.reject(error);
+        }
+    }
+}
+function startRunningHubSubmitQueueWorker(){
+    if(runningHubSubmitQueueWorker || !runningHubSubmitQueue.length) return;
+    runningHubSubmitQueueWorker = runRunningHubSubmitQueue()
+        .catch(error => {
+            while(runningHubSubmitQueue.length){
+                const entry = runningHubSubmitQueue.shift();
+                entry.reject(error);
+            }
+        })
+        .finally(() => {
+            runningHubSubmitQueueWorker = null;
+            if(runningHubSubmitQueue.length) startRunningHubSubmitQueueWorker();
+        });
+}
+function enqueueRunningHubSubmit(entry){
+    return new Promise((resolve, reject) => {
+        runningHubSubmitQueue.push({...entry, resolve, reject});
+        runningHubRefreshQueueViews(true);
+        startRunningHubSubmitQueueWorker();
+    });
+}
+async function submitRunningHubWithFallback(endpoint, body, options={}){
+    try {
+        return await runningHubSubmitAttempt(endpoint, body, options);
+    } catch(error) {
+        if(!error?.runningHubQueueMaxed) throw error;
+        const node = options.node;
+        if(!node) throw error;
+        return enqueueRunningHubSubmit({
+            nodeId:node.id,
+            endpoint,
+            body,
+            cascadeTargetId:cascadeTargetIdFromOptions(options),
+            mode:options.mode || '',
+            useWallet:Boolean(options.useWallet ?? body?.useWallet),
+        });
+    }
+}
+function cancelRunningHubQueuedEntries(predicate){
+    const cancelled = [];
+    for(let index = runningHubSubmitQueue.length - 1; index >= 0; index--){
+        if(!predicate(runningHubSubmitQueue[index])) continue;
+        cancelled.push(runningHubSubmitQueue.splice(index, 1)[0]);
+    }
+    cancelled.forEach(entry => entry.reject(runningHubQueueCancelledError()));
+    if(cancelled.length){
+        runningHubRefreshQueueViews(false, cancelled.map(entry => entry.nodeId));
+        wakeRunningHubSubmitQueue();
+    }
+    return cancelled.length;
+}
+function cancelRunningHubQueuedNode(nodeId){
+    return cancelRunningHubQueuedEntries(entry => entry.nodeId === nodeId);
+}
+function cancelRunningHubQueuedCascade(targetId){
+    return cancelRunningHubQueuedEntries(entry => entry.cascadeTargetId === targetId);
+}
+const runningHubNodeCancelRequests = new Set();
+const runningHubActiveTasks = new Map();
+const runningHubCancelPromises = new Map();
+function runningHubCancellationRequested(nodeId, cascadeTargetId=''){
+    if(nodeId && runningHubNodeCancelRequests.has(nodeId)) return true;
+    return Boolean(cascadeTargetId && isCascadeStopping(cascadeTargetId));
+}
+function runningHubCancellationError(nodeId, cascadeTargetId=''){
+    if(cascadeTargetId && isCascadeStopping(cascadeTargetId)) return cascadeAbortError(cascadeStopMessage());
+    return runningHubTaskCancelledError(langIsEn() ? 'RunningHub task cancelled' : 'RunningHub 任务已取消');
+}
+function registerRunningHubActiveTask(taskId, options={}){
+    const id = String(taskId || '').trim();
+    if(!id) return null;
+    const task = {
+        taskId:id,
+        nodeId:String(options.nodeId || ''),
+        cascadeTargetId:String(options.cascadeTargetId || ''),
+        mode:String(options.mode || ''),
+        useWallet:Boolean(options.useWallet),
+    };
+    runningHubActiveTasks.set(id, task);
+    return task;
+}
+function unregisterRunningHubActiveTask(taskId){
+    const id = String(taskId || '').trim();
+    if(id) runningHubActiveTasks.delete(id);
+}
+function runningHubTasksForNode(nodeId){
+    return [...runningHubActiveTasks.values()].filter(task => task.nodeId === nodeId);
+}
+function runningHubTasksForCascade(targetId){
+    return [...runningHubActiveTasks.values()].filter(task => task.cascadeTargetId === targetId);
+}
+function runningHubCancelFailureMessage(error){
+    const detail = error?.message || String(error || '');
+    return langIsEn()
+        ? `Local waiting stopped, but the RunningHub website task may still be running. ${detail}`
+        : `已停止本地等待，但 RunningHub 官网任务可能仍在运行。${detail ? `\n${detail}` : ''}`;
+}
+async function cancelRunningHubRemoteTask(task){
+    const taskId = String(task?.taskId || '').trim();
+    if(!taskId) return {success:true, skipped:true};
+    if(!runningHubCancelPromises.has(taskId)){
+        const promise = (async () => {
+            const response = await fetch('/api/runninghub/cancel', {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({taskId, useWallet:Boolean(task.useWallet)}),
+            });
+            let data = {};
+            try { data = await response.json(); }
+            catch(_) { data = {detail:tr('canvas.rhCancelFailed')}; }
+            if(!response.ok || data.success === false) throw new Error(apiErrorMessage(data, tr('canvas.rhCancelFailed')));
+            return data.data || data;
+        })();
+        runningHubCancelPromises.set(taskId, promise);
+    }
+    return runningHubCancelPromises.get(taskId);
+}
+async function cancelRunningHubTasks(tasks, options={}){
+    const unique = [...new Map((tasks || []).filter(Boolean).map(task => [task.taskId, task])).values()];
+    const results = await Promise.allSettled(unique.map(cancelRunningHubRemoteTask));
+    const failed = results.filter(result => result.status === 'rejected');
+    if(failed.length && options.notify !== false){
+        showErrorModal(runningHubCancelFailureMessage(failed[0].reason), tr('canvas.rhCancelFailed'));
+    }
+    return {cancelled:unique.length - failed.length, failed:failed.length};
+}
+function cancelRunningHubTasksForNode(nodeId, options={}){
+    return cancelRunningHubTasks(runningHubTasksForNode(nodeId), options);
+}
+function cancelRunningHubTasksForCascade(targetId, options={}){
+    return cancelRunningHubTasks(runningHubTasksForCascade(targetId), options);
+}
+async function trackRunningHubSubmittedTask(submit, options={}){
+    const taskId = String(submit?.taskId || '').trim();
+    if(!taskId) return submit;
+    const task = registerRunningHubActiveTask(taskId, options);
+    if(runningHubCancellationRequested(task.nodeId, task.cascadeTargetId)){
+        await cancelRunningHubTasks([task]);
+        unregisterRunningHubActiveTask(taskId);
+        throw runningHubCancellationError(task.nodeId, task.cascadeTargetId);
+    }
+    return submit;
+}
+function ensureRunningHubTaskActive(nodeId, cascadeTargetId=''){
+    if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
+    if(nodeId && runningHubNodeCancelRequests.has(nodeId)) throw runningHubCancellationError(nodeId, cascadeTargetId);
+}
+function requestRunningHubNodeCancel(nodeId, options={}){
+    const node = nodes.find(candidate => candidate.id === nodeId);
+    runningHubNodeCancelRequests.add(nodeId);
+    cancelRunningHubQueuedNode(nodeId);
+    if(node){
+        node.runStatus = 'stopping';
+        node.runError = '';
+        if(options.refresh !== false) refreshNodes([nodeId]);
+    }
+    return cancelRunningHubTasksForNode(nodeId, {notify:options.notify !== false});
+}
+const runningHubRunStartedAt = new Map();
+function showRunningHubBusyNotice(node){
+    if(node?.runStatus === 'queued'){
+        const position = runningHubQueuePositionForNode(node.id);
+        const suffix = position ? `，${tr('canvas.rhQueueAhead').replace('{count}', String(Math.max(0, position - 1)))}` : '';
+        showErrorModal(`${tr('canvas.rhQueuedNotice')}${suffix}`, tr('canvas.rhQueued'));
+        return;
+    }
+    const startedAt = Number(runningHubRunStartedAt.get(node?.id) || nowMs());
+    const elapsed = formatRunDuration(nowMs() - startedAt);
+    showErrorModal(`当前 RunningHub 任务正在生成，已耗时 ${elapsed}，请勿重复提交。`, 'RunningHub 正在运行');
+}
 async function runRhNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
-    if(!node || (node.running && !opts.cascade)) return;
+    if(!node) return;
+    if(node.running && !opts.cascade){ showRunningHubBusyNotice(node); return; }
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     ensureRhNodeSelection(node);
     const mode = rhCurrentKind(node);
     if(mode === 'model') return runRhModelNode(node, opts);
+    runningHubNodeCancelRequests.delete(node.id);
     node.rhRandomValues = {};
     if(mode === 'workflow' && !String(node.workflowId || '').trim()){ alert(tr('canvas.rhNeedWorkflowId')); return; }
     if(mode === 'app' && !String(node.webappId || '').trim()){ alert(tr('canvas.rhNeedWebappId')); return; }
@@ -13119,43 +13463,47 @@ async function runRhNode(nodeId, opts={}){
     const pendingId = uid('p');
     const run = runSnapshot(node, media.prompt || 'RunningHub', media.refs);
     run.taskLabel = 'RunningHub';
+    let activeTaskId = '';
     if(out) out._pending = [...(out._pending || []), makePendingForRun(pendingId, run, node, {refs:media.refs, cascadeTargetId})];
-    if(!opts.cascade) node.running = true;
+    if(!opts.cascade){
+        node.running = true;
+        node.runStatus = 'running';
+        node.runError = '';
+        runningHubRunStartedAt.set(node.id, nowMs());
+    }
     refreshRunNodes(node, out);
     try {
         const nodeInfoList = await rhBuildNodeInfoList(node, media);
         const workflowExtras = mode === 'workflow' ? await rhBuildWorkflowRequestExtras(node, media, nodeInfoList) : {};
         const endpoint = mode === 'workflow' ? '/api/runninghub/workflow-submit' : '/api/runninghub/submit';
-        const body = mode === 'workflow'
-            ? {workflowId:node.workflowId.trim(), nodeInfoList, useWallet:rhUseWallet(node), ...workflowExtras}
-            : {webappId:node.webappId.trim(), nodeInfoList, instanceType:node.instanceType || '', useWallet:rhUseWallet(node)};
-        const submit = await cascadeFetch(endpoint, {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify(body)
-        }, {cascadeTargetId}).then(async r => {
-            const data = await r.json();
-            if(!r.ok || data.success === false) throw new Error(data.detail || data.error || tr('canvas.rhFailed'));
-            return data.data || data;
-        });
-        const taskId = submit.taskId;
-        if(!taskId) throw new Error(tr('canvas.rhNoTaskId'));
         const useWallet = rhUseWallet(node);
-        run.request = {task_id:taskId, webappId:node.webappId, workflowId:node.workflowId, backend:'runninghub', mode, useWallet};
+        const body = mode === 'workflow'
+            ? {workflowId:node.workflowId.trim(), nodeInfoList, useWallet, ...workflowExtras}
+            : {webappId:node.webappId.trim(), nodeInfoList, instanceType:node.instanceType || '', useWallet};
+        const submit = await submitRunningHubWithFallback(endpoint, body, {node, cascadeTargetId, mode, useWallet});
+        activeTaskId = submit.taskId;
+        if(!activeTaskId) throw new Error(tr('canvas.rhNoTaskId'));
+        node.runStatus = 'running';
+        node.runError = '';
+        refreshRunNodes(node, out);
+        run.request = {task_id:activeTaskId, webappId:node.webappId, workflowId:node.workflowId, backend:'runninghub', mode, useWallet};
+        scheduleSave();
         let result = null;
         for(let i = 0; i < 720; i++){
-            if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
+            ensureRunningHubTaskActive(node.id, cascadeTargetId);
             await sleep(2500);
-            const data = await cascadeFetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}&useWallet=${useWallet ? '1' : '0'}`, {}, {cascadeTargetId}).then(async r => {
+            ensureRunningHubTaskActive(node.id, cascadeTargetId);
+            const data = await cascadeFetch(`/api/runninghub/query?taskId=${encodeURIComponent(activeTaskId)}&useWallet=${useWallet ? '1' : '0'}`, {}, {cascadeTargetId}).then(async r => {
                 const json = await r.json();
-                if(!r.ok || json.success === false) throw new Error(json.detail || json.error || tr('canvas.rhFailed'));
+                if(!r.ok || json.success === false) throw new Error(apiErrorMessage(json, tr('canvas.rhFailed')));
                 return json.data || json;
             });
+            ensureRunningHubTaskActive(node.id, cascadeTargetId);
             if(data.status === 'SUCCESS'){
                 result = data;
                 break;
             }
-            if(data.status === 'FAILED') throw new Error(data.failReason || tr('canvas.rhFailed'));
+            if(data.status === 'FAILED') throw new Error(apiErrorMessage({detail:data.failReason}, tr('canvas.rhFailed')));
         }
         if(!result) throw new Error(tr('canvas.rhTimeout'));
         const outputs = result.urls || [];
@@ -13170,6 +13518,13 @@ async function runRhNode(nodeId, opts={}){
         refreshRunNodes(node, out);
         scheduleSave();
     } catch(err) {
+        if(isRunningHubQueueCancelledError(err) || isRunningHubTaskCancelledError(err)){
+            if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
+            node.runStatus = '';
+            node.runError = '';
+            if(opts.cascade) throw cascadeAbortError(cascadeStopMessage());
+            return;
+        }
         const meta = collectRunMeta(out, pendingId);
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
@@ -13181,14 +13536,19 @@ async function runRhNode(nodeId, opts={}){
         node.runError = err.message || String(err);
         refreshRunNodes(node, out);
         if(opts.cascade) throw err;
-        alert(err.message || tr('canvas.rhFailed'));
+        showErrorModal(err.message || tr('canvas.rhFailed'), 'RunningHub');
     } finally {
+        unregisterRunningHubActiveTask(activeTaskId);
+        runningHubNodeCancelRequests.delete(node.id);
         node.running = false;
+        runningHubRunStartedAt.delete(node.id);
+        wakeRunningHubSubmitQueue();
         refreshRunNodes(node, out);
     }
 }
 async function runRhModelNode(node, opts={}){
-    if(!node || (node.running && !opts.cascade)) return;
+    if(!node) return;
+    if(node.running && !opts.cascade){ showRunningHubBusyNotice(node); return; }
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const selectedRef = rhSelectedEntryRef(node);
     const model = selectedRef?.id || node.rhModel || node.model || '';
@@ -13223,8 +13583,8 @@ async function runRhModelNode(node, opts={}){
     const startedAt = nowMs();
     if(!opts.cascade){
         node.running = true;
+        runningHubRunStartedAt.set(node.id, startedAt);
         refreshRunNodes(node, out);
-        setTimeout(() => { node.running = false; refreshRunNodes(node, out); }, 2000);
     }
     try {
         const taskInfos = await Promise.all(Array.from({length:count}, () => createCanvasImageTask(payload, {cascadeTargetId})));
@@ -13285,6 +13645,12 @@ async function runRhModelNode(node, opts={}){
         if(remainingPending.some(p => p.failed && p.recoverTaskId) && !removableIds.length) return;
         if(opts.cascade) throw err;
         showErrorModal(err.message || tr('canvas.generationFailed'), tr('canvas.apiFailed'));
+    } finally {
+        if(!opts.cascade){
+            node.running = false;
+            runningHubRunStartedAt.delete(node.id);
+            refreshRunNodes(node, out);
+        }
     }
 }
 function renderComfySettings(container, node){
@@ -14318,40 +14684,51 @@ async function runMiniMaxRunningHub(node, media, options={}){
     miniMaxApplyRunningHubParams(rhNode, fields, node, media.prompt);
     const nodeInfoList = await miniMaxBuildRunningHubNodeInfoList(rhNode, fields, media);
     const workflowExtras = await miniMaxBuildRunningHubWorkflowExtras(rhNode, fields, media, nodeInfoList);
-    const body = {workflowId, nodeInfoList, useWallet:rhUseWallet(rhNode), ...workflowExtras};
+    const useWallet = rhUseWallet(rhNode);
+    const body = {workflowId, nodeInfoList, useWallet, ...workflowExtras};
     const cascadeTargetId = cascadeTargetIdFromOptions(options);
-    const submit = await cascadeFetch('/api/runninghub/workflow-submit', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(body)
-    }, {cascadeTargetId}).then(async r => {
-        const data = await r.clone().json().catch(async () => ({detail:await r.text().catch(() => '')}));
-        if(!r.ok || data.success === false) throw miniMaxRunningHubPayloadError('提交', data, 'RunningHub 工作流提交失败', {
-            endpoint:'/api/runninghub/workflow-submit',
-            workflowId,
-            nodeInfoList:nodeInfoList.slice(0, 40),
-            hasWorkflow:Boolean(body.workflow)
-        });
-        return data.data || data;
-    });
-    const taskId = submit.taskId;
-    if(!taskId) throw new Error(tr('canvas.rhNoTaskId'));
-    for(let i = 0; i < 720; i++){
-        if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
-        await sleep(2500);
-        const data = await cascadeFetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}&useWallet=${rhUseWallet(rhNode) ? '1' : '0'}`, {}, {cascadeTargetId}).then(async r => {
-            const json = await r.clone().json().catch(async () => ({detail:await r.text().catch(() => '')}));
-            if(!r.ok || json.success === false) throw miniMaxRunningHubPayloadError('查询', json, 'RunningHub 查询失败', {taskId, workflowId});
-            return json.data || json;
-        });
-        if(data.status === 'SUCCESS'){
-            const outputs = resultMediaUrls(data.image_items?.length ? data.image_items : (data.urls || []));
-            if(!outputs.length) throw new Error(tr('canvas.rhOutputsEmpty'));
-            return {outputs, request:{task_id:taskId, workflowId, workflowTitle:runningHubEntryLabel(entry, 'workflow'), backend:'runninghub', mode:'workflow', useWallet:rhUseWallet(rhNode)}};
+    let activeTaskId = '';
+    try {
+        let submit = null;
+        try {
+            submit = await submitRunningHubWithFallback('/api/runninghub/workflow-submit', body, {
+                node,
+                cascadeTargetId,
+                mode:'workflow',
+                useWallet,
+            });
+        } catch(error) {
+            if(isCascadeAbortError(error) || isRunningHubQueueCancelledError(error) || isRunningHubTaskCancelledError(error)) throw error;
+            throw miniMaxRunningHubPayloadError('提交', error?.runningHubPayload || {detail:error?.message || String(error)}, 'RunningHub 工作流提交失败', {
+                endpoint:'/api/runninghub/workflow-submit',
+                workflowId,
+                nodeInfoList:nodeInfoList.slice(0, 40),
+                hasWorkflow:Boolean(body.workflow)
+            });
         }
-        if(data.status === 'FAILED') throw miniMaxRunningHubPayloadError('执行', data, data.failReason || 'RunningHub 执行失败', {taskId, workflowId});
+        activeTaskId = submit.taskId;
+        if(!activeTaskId) throw new Error(tr('canvas.rhNoTaskId'));
+        for(let i = 0; i < 720; i++){
+            ensureRunningHubTaskActive(node.id, cascadeTargetId);
+            await sleep(2500);
+            ensureRunningHubTaskActive(node.id, cascadeTargetId);
+            const data = await cascadeFetch(`/api/runninghub/query?taskId=${encodeURIComponent(activeTaskId)}&useWallet=${useWallet ? '1' : '0'}`, {}, {cascadeTargetId}).then(async r => {
+                const json = await r.clone().json().catch(async () => ({detail:await r.text().catch(() => '')}));
+                if(!r.ok || json.success === false) throw miniMaxRunningHubPayloadError('查询', json, 'RunningHub 查询失败', {taskId:activeTaskId, workflowId});
+                return json.data || json;
+            });
+            ensureRunningHubTaskActive(node.id, cascadeTargetId);
+            if(data.status === 'SUCCESS'){
+                const outputs = resultMediaUrls(data.image_items?.length ? data.image_items : (data.urls || []));
+                if(!outputs.length) throw new Error(tr('canvas.rhOutputsEmpty'));
+                return {outputs, request:{task_id:activeTaskId, workflowId, workflowTitle:runningHubEntryLabel(entry, 'workflow'), backend:'runninghub', mode:'workflow', useWallet}};
+            }
+            if(data.status === 'FAILED') throw miniMaxRunningHubPayloadError('执行', data, data.failReason || 'RunningHub 执行失败', {taskId:activeTaskId, workflowId});
+        }
+        throw new Error(tr('canvas.rhTimeout'));
+    } finally {
+        unregisterRunningHubActiveTask(activeTaskId);
     }
-    throw new Error(tr('canvas.rhTimeout'));
 }
 async function runMiniMaxNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
@@ -14376,6 +14753,7 @@ async function runMiniMaxNode(nodeId, opts={}){
         return;
     }
     const engine = miniMaxEngine(node);
+    if(engine === 'runninghub') runningHubNodeCancelRequests.delete(node.id);
     let out = outputForNode(node, 500);
     const pendingId = uid('p');
     const run = runSnapshot(node, media.prompt, media.refs);
@@ -14423,7 +14801,7 @@ async function runMiniMaxNode(nodeId, opts={}){
         const readable = miniMaxReadableError(err, engine);
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:miniMaxLogError(err, engine)});
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
-        if(isCascadeAbortError(err)){
+        if(isCascadeAbortError(err) || isRunningHubTaskCancelledError(err) || isRunningHubQueueCancelledError(err)){
             if(opts.cascade) throw err;
             return;
         }
@@ -14433,6 +14811,7 @@ async function runMiniMaxNode(nodeId, opts={}){
         if(opts.cascade) throw err;
         showErrorModal(readable, 'MiniMax H3');
     } finally {
+        if(engine === 'runninghub') runningHubNodeCancelRequests.delete(node.id);
         node.running = false;
         refreshRunNodes(node, out);
     }
@@ -14865,6 +15244,9 @@ function requestCascadeStop(targetId, reason=''){
             try { controller.abort(); } catch(_) {}
         });
     }
+    cancelRunningHubQueuedCascade(targetId);
+    void cancelRunningHubTasksForCascade(targetId);
+    wakeRunningHubSubmitQueue();
     refreshNodes(cascadeUiNodeIds(targetId));
 }
 function ensureCascadeActive(targetId, reason=''){
@@ -15684,6 +16066,19 @@ function classicCascadeLoopSettings(plan){
     });
     return settings;
 }
+function resetClassicCascadeLoopRuntimeStates(loopIds=[]){
+    const ids = new Set((loopIds || []).map(id => String(id || '')).filter(Boolean));
+    if(!ids.size) return 0;
+    let reset = 0;
+    nodes.forEach(node => {
+        if(node?.type !== 'loop' || !ids.has(String(node.id))) return;
+        delete node._cascadeProcessedRoundIndexes;
+        delete node._cascadeWaiting;
+        delete node._cascadeRetry;
+        reset += 1;
+    });
+    return reset;
+}
 function checkClassicCascadeLoopImages(loopNode, sourceRefsByNode, startRound, totalRounds){
     if(!loopNode) return true;
     const available = loopPreviewImageRefs(loopNode, {sourceRefsByNode}).length;
@@ -15835,6 +16230,10 @@ async function runNodeCascadeSingleLoop(nodeId, options={}){
     if(!order.length){ alert('没有可运行的生成节点'); return; }
     const ctx = beginCascade(nodeId, order, {serial:true, mode:loop?.mode || 'serial'});
     refreshNodes(cascadeUiNodeIds(nodeId, order));
+    if(scope === 'complete' && loop?.node?.id){
+        resetClassicCascadeLoopRuntimeStates([loop.node.id]);
+        scheduleSave();
+    }
     order.forEach(id => {
         const node = nodes.find(item => item.id === id);
         if(node){
@@ -16000,6 +16399,10 @@ async function runNodeCascade(nodeId, options={}){
 
     const ctx = beginCascade(nodeId, order, {serial:true, mode:'staged-loop'});
     refreshNodes(cascadeUiNodeIds(nodeId, order));
+    if(scope === 'complete'){
+        resetClassicCascadeLoopRuntimeStates(schedule.stages.map(stage => stage.loopId));
+        scheduleSave();
+    }
     order.forEach(id => {
         const node = nodes.find(item => item.id === id);
         if(node){
@@ -16346,6 +16749,13 @@ function removeClassicConnections(shouldRemove){
 function deleteNode(id, event){
     event?.stopPropagation();
     pushUndo();
+    const deletingNode = nodes.find(node => node.id === id);
+    const queuedRunningHub = typeof runningHubQueuePositionForNode === 'function' ? runningHubQueuePositionForNode(id) : 0;
+    const activeRunningHub = typeof runningHubTasksForNode === 'function' ? runningHubTasksForNode(id).length : 0;
+    if(typeof requestRunningHubNodeCancel === 'function' && (deletingNode?.running || queuedRunningHub || activeRunningHub)){
+        void requestRunningHubNodeCancel(id, {refresh:false});
+    }
+    if(typeof cancelRunningHubQueuedNode === 'function') cancelRunningHubQueuedNode(id);
     destroyLTXEditor(nodes.find(n => n.id === id));
     removeClassicConnections(connection => connection.from === id || connection.to === id);
     nodes = nodes.filter(n => n.id !== id);

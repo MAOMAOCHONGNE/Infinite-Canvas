@@ -192,7 +192,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.08.17-custom.2"
+APP_VERSION = "2026.08.17-custom.3"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -3066,7 +3066,7 @@ class AIReference(BaseModel):
     stretch_aspect_ratio: str = ""
 
 class OnlineImageRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    prompt: str = Field(default="", max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
     provider_id: str = "comfly"
     model: str = ""
     size: str = "1024x1024"
@@ -3077,6 +3077,7 @@ class OnlineImageRequest(BaseModel):
     reference_images: List[AIReference] = []
     operation: str = ""
     resolution_type: str = ""
+    runninghub_params: Dict[str, Any] = Field(default_factory=dict)
 
 class MidjourneySubmitRequest(BaseModel):
     provider_id: str = ""
@@ -3152,6 +3153,10 @@ class RunningHubWorkflowSubmitRequest(BaseModel):
     workflowId: str = ""
     nodeInfoList: List[Dict[str, Any]] = []
     workflow: Any = None
+    useWallet: bool = False
+
+class RunningHubCancelRequest(BaseModel):
+    taskId: str = ""
     useWallet: bool = False
 
 class RunningHubUploadAssetRequest(BaseModel):
@@ -11690,6 +11695,88 @@ def runninghub_entry_config_from_model(provider, model):
         "workflowJson": {},
     }
 
+def runninghub_entry_enabled_fields(entry):
+    return [
+        field for field in (entry or {}).get("fields") or []
+        if isinstance(field, dict) and field.get("enabled") is True
+    ]
+
+def runninghub_entry_image_fields(entry):
+    return rh_sort_fields([
+        field for field in runninghub_entry_enabled_fields(entry)
+        if rh_field_kind(field) == "image"
+    ])
+
+def prepare_runninghub_entry_references(entry, references):
+    image_fields = runninghub_entry_image_fields(entry)
+    if not image_fields:
+        return []
+    clean = [
+        ref for ref in (references or [])
+        if isinstance(ref, dict) and str(ref.get("url") or "").strip() and is_image_reference(ref)
+    ]
+    required = len(image_fields)
+    if len(clean) < required:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前 RunningHub 应用需要上传 {required} 张图片，当前只有 {len(clean)} 张",
+        )
+    return clean[:required]
+
+def runninghub_entry_requires_prompt(entry):
+    return any(rh_field_role(field) == "prompt" for field in runninghub_entry_enabled_fields(entry))
+
+def online_image_prompt_required(provider, model):
+    if not is_runninghub_provider(provider):
+        return True
+    entry = runninghub_entry_config_from_model(provider, model)
+    return entry is None or runninghub_entry_requires_prompt(entry)
+
+def runninghub_entry_field_key(field):
+    node_id = str((field or {}).get("nodeId") or "").strip()
+    field_name = str((field or {}).get("fieldName") or "").strip()
+    return f"{node_id}::{field_name}" if node_id and field_name else ""
+
+def runninghub_entry_param_override(field, values):
+    if not isinstance(values, dict):
+        return False, ""
+    role = rh_field_role(field)
+    if role in {"image", "video", "audio", "prompt"}:
+        return False, ""
+    canonical_key = runninghub_entry_field_key(field)
+    field_id = str((field or {}).get("id") or "").strip()
+    key = next((item for item in (canonical_key, field_id) if item and item in values), "")
+    if not key:
+        return False, ""
+    raw = values.get(key)
+    if raw is None or isinstance(raw, (dict, list)):
+        return False, ""
+    if role == "boolean":
+        lowered = str(raw).strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            value = "true"
+        elif lowered in {"0", "false", "no", "off"}:
+            value = "false"
+        else:
+            return False, ""
+    else:
+        value = str(raw).strip()
+    if len(value) > 20000:
+        return False, ""
+    options = runninghub_schema_options(field)
+    if options and value not in options:
+        return False, ""
+    return True, value
+
+def sanitize_runninghub_entry_params(entry, values):
+    result = {}
+    for field in runninghub_entry_enabled_fields(entry):
+        has_override, value = runninghub_entry_param_override(field, values)
+        key = runninghub_entry_field_key(field)
+        if has_override and key:
+            result[key] = value
+    return result
+
 async def runninghub_upload_local_to_filename(client, provider, url, use_wallet=False):
     """把本地/远程素材上传到 RunningHub /task/openapi/upload，返回 fileName（供 nodeInfoList 使用）。"""
     text = str(url or "").strip()
@@ -11721,32 +11808,16 @@ async def runninghub_upload_local_to_filename(client, provider, url, use_wallet=
         return raw["data"]["fileName"]
     raise HTTPException(status_code=502, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传素材失败：{raw}")
 
-async def generate_runninghub_entry_image(prompt, size, model, reference_images, provider, entry):
+async def generate_runninghub_entry_image(prompt, size, model, reference_images, provider, entry, entry_params=None):
     """运行 RunningHub 工作流 / AI 应用（与智能画布一致的运行方式），返回首张图片结果。"""
     kind = entry["kind"]
     entry_id = entry["id"]
-    fields = rh_sort_fields([f for f in (entry.get("fields") or []) if isinstance(f, dict) and f.get("enabled") is True])
+    fields = rh_sort_fields(runninghub_entry_enabled_fields(entry))
     idx_map = rh_field_indexes(fields)
+    reference_images = prepare_runninghub_entry_references(entry, reference_images)
     use_wallet = False
     timeout = httpx.Timeout(connect=20.0, read=1800.0, write=240.0, pool=20.0)
-    aspect = runninghub_aspect_from_size(size, "")
-    resolution = runninghub_resolution_from_size(size, "")
-    width, height = parse_size_pair(size)
-    def requested_size_field_value(field):
-        names = {
-            str(field.get("fieldName") or "").strip().lower(),
-            str(field.get("fieldKey") or "").strip().lower(),
-            str(field.get("label") or "").strip().lower(),
-        }
-        if aspect and names & {"aspectratio", "aspect_ratio", "ratio"}:
-            return runninghub_schema_value(field, aspect)
-        if resolution and "resolution" in names:
-            return runninghub_schema_value(field, resolution)
-        if width and "width" in names:
-            return width
-        if height and "height" in names:
-            return height
-        return None
+    entry_params = sanitize_runninghub_entry_params(entry, entry_params)
     async with httpx.AsyncClient(timeout=timeout) as client:
         uploaded = []
         for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
@@ -11782,12 +11853,12 @@ async def generate_runninghub_entry_image(prompt, size, model, reference_images,
             elif rh_field_role(field) == "prompt":
                 value = prompt_text or rh_default_value(field)
                 node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": value})
+            elif (override := runninghub_entry_param_override(field, entry_params))[0]:
+                node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": override[1]})
             elif kind_f == "number" and field.get("random_enabled") is True:
                 node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": rh_random_field_value(field)})
             else:
-                value = requested_size_field_value(field)
-                if value is None:
-                    value = rh_default_value(field)
+                value = rh_default_value(field)
                 node_info_list.append({"nodeId": node_id, "fieldName": field_name, "fieldValue": value})
 
         api_key = runninghub_api_key(provider, use_wallet=use_wallet)
@@ -11828,10 +11899,10 @@ async def generate_runninghub_entry_image(prompt, size, model, reference_images,
             # 804 运行中 / 813 排队中 / 其他状态继续轮询
         raise HTTPException(status_code=504, detail=f"RunningHub 任务超时：{last_payload}")
 
-async def generate_runninghub_provider_image(prompt, size, model, reference_images=None, provider=None):
+async def generate_runninghub_provider_image(prompt, size, model, reference_images=None, provider=None, entry_params=None):
     entry = runninghub_entry_config_from_model(provider, model)
     if entry:
-        return await generate_runninghub_entry_image(prompt, size, model, reference_images, provider, entry)
+        return await generate_runninghub_entry_image(prompt, size, model, reference_images, provider, entry, entry_params)
     model_def = await runninghub_model_definition(provider, model)
     endpoint = runninghub_task_endpoint(provider, model_def.get("endpoint") or model)
     params = model_def.get("params") if isinstance(model_def.get("params"), list) else []
@@ -11981,7 +12052,7 @@ async def generate_runninghub_video(payload, provider):
         local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
-async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution=""):
+async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution="", runninghub_params=None):
     provider = get_api_provider(provider_id)
     requested_model = str(model or "").strip()
     model = resolve_image_model_for_resolution(provider, requested_model, resolution)
@@ -11996,7 +12067,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
     if is_jimeng_provider(provider):
         return await generate_jimeng_provider_image(prompt, size, model, reference_images, provider)
     if is_runninghub_provider(provider):
-        return await generate_runninghub_provider_image(prompt, size, model, reference_images, provider)
+        return await generate_runninghub_provider_image(prompt, size, model, reference_images, provider, runninghub_params)
     if effective_protocol(provider, requested_model) == "gemini":
         return await generate_gemini_provider_image(prompt, size, model, reference_images, provider)
     if is_volcengine_provider(provider):
@@ -13717,6 +13788,47 @@ async def runninghub_query(taskId: str = "", useWallet: bool = False):
             log_runninghub_error("query-unknown", raw, endpoint=url, taskId=task_id, code=code)
         return {"success": True, "data": {"status": status, "urls": urls, "image_items": image_items, "failReason": runninghub_fail_reason(raw), "code": code, "raw": raw}}
 
+@app.post("/api/runninghub/cancel")
+async def runninghub_cancel(payload: RunningHubCancelRequest):
+    task_id = str(payload.taskId or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="taskId 必填")
+    provider = runninghub_provider()
+    api_key = runninghub_api_key(provider, use_wallet=payload.useWallet)
+    url = runninghub_endpoint_url(provider, "/task/openapi/cancel")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=120.0, write=30.0, pool=20.0)) as client:
+        try:
+            response = await client.post(
+                url,
+                headers=runninghub_app_headers(True, payload.useWallet, provider),
+                json={"apiKey": api_key, "taskId": task_id},
+            )
+            try:
+                raw = response.json()
+            except Exception:
+                raw = {"msg": str(getattr(response, "text", "") or "")[:500]}
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=runninghub_error_detail(f"取消 RunningHub 任务失败：{exc}", endpoint=url, taskId=task_id),
+            ) from exc
+    if response.status_code >= 400:
+        log_runninghub_error("cancel-http", raw, endpoint=url, taskId=task_id, status=response.status_code)
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=runninghub_error_detail(f"RunningHub HTTP {response.status_code}", raw, endpoint=url, taskId=task_id),
+        )
+    code = raw.get("code") if isinstance(raw, dict) else None
+    if code in (0, "0"):
+        return {"success": True, "data": {"status": "cancelled", "taskId": task_id, "code": code}}
+    if code in (807, "807"):
+        return {"success": True, "data": {"status": "not_found", "taskId": task_id, "code": code}}
+    log_runninghub_error("cancel-rejected", raw, endpoint=url, taskId=task_id, code=code)
+    raise HTTPException(
+        status_code=400,
+        detail=runninghub_error_detail(runninghub_fail_reason(raw) or "RunningHub 取消任务失败", raw, endpoint=url, taskId=task_id),
+    )
+
 @app.post("/api/runninghub/upload-asset")
 async def runninghub_upload_asset(payload: RunningHubUploadAssetRequest):
     source_url = rewrite_runninghub_file_url(str(payload.url or "").strip())
@@ -14812,11 +14924,17 @@ async def build_online_image_result(payload: OnlineImageRequest):
     provider = get_api_provider(payload.provider_id)
     default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
     model = selected_model(payload.model, default_model)
+    operation = str(payload.operation or "").strip().lower()
+    runninghub_entry = runninghub_entry_config_from_model(provider, model) if is_runninghub_provider(provider) else None
+    runninghub_params = sanitize_runninghub_entry_params(runninghub_entry, payload.runninghub_params) if runninghub_entry else {}
+    if operation != "upscale" and not str(payload.prompt or "").strip() and online_image_prompt_required(provider, model):
+        raise HTTPException(status_code=400, detail="请输入提示词")
     request_size = snap_size_to_multiple(payload.size, 16)
     refs = [ref.dict() for ref in payload.reference_images if ref.url]
+    if runninghub_entry:
+        refs = prepare_runninghub_entry_references(runninghub_entry, refs)
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
-    operation = str(payload.operation or "").strip().lower()
     effective_model = model if operation == "upscale" else resolve_image_model_for_resolution(provider, model, payload.resolution)
     model_display_name = provider_model_display_name(provider, model)
     if operation == "upscale":
@@ -14831,7 +14949,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         else:
             image_data, raw_item = await generate_ai_image(
                 payload.prompt, request_size, payload.quality, model, image_refs, provider["id"],
-                payload.aspect_ratio, payload.resolution,
+                payload.aspect_ratio, payload.resolution, runninghub_params,
             )
         try:
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
@@ -14877,7 +14995,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "logical_model": model, "model_display_name": model_display_name, "effective_model": effective_model, "resolution": payload.resolution, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs},
+        "params": {"provider_id": provider["id"], "model": model, "logical_model": model, "model_display_name": model_display_name, "effective_model": effective_model, "resolution": payload.resolution, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "runninghub_params": runninghub_params},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)
@@ -19556,7 +19674,7 @@ async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
             canvas["viewport"] = payload.viewport
         else:
             canvas["viewport"] = canvas.get("viewport") or {"x": 0, "y": 0, "scale": 1}
-        canvas["logs"] = payload.logs[-500:]
+        canvas["logs"] = payload.logs[:500]
         canvas["settings"] = payload.settings or {}
     canvas = mutate_canvas_latest(canvas_id, apply_payload)
     await manager.broadcast_canvas_updated(canvas_id, int(canvas.get("updated_at") or now_ms()), payload.client_id)

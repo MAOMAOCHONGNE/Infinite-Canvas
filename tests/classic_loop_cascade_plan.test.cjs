@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const ROOT = path.resolve(__dirname, '..');
 const HELPER_PATH = path.join(ROOT, 'static', 'js', 'classic-cascade-plan.js');
@@ -739,6 +740,64 @@ test('classic controller runs preprocessing once and then awaits every loop stag
     assert.ok(runBlock.indexOf('await runOneCascadePass(schedule.onceOrder') < runBlock.indexOf('for(const stage of schedule.stages)'));
     assert.ok(runBlock.indexOf('cascadeFreshSourceRefsByNode(completedOrder)') < runBlock.indexOf('fitLoopRoundsToAvailableImages'));
     assert.ok(runBlock.indexOf('fitLoopRoundsToAvailableImages') < runBlock.indexOf('await runClassicCascadeLoopStage'));
+});
+
+test('complete workflow resets persisted loop runtime state before preprocessing', () => {
+    const source = fs.readFileSync(CANVAS_PATH, 'utf8');
+    const helperBlock = sourceBlock(source, 'function resetClassicCascadeLoopRuntimeStates', 'function checkClassicCascadeLoopImages');
+    const singleBlock = sourceBlock(source, 'async function runNodeCascadeSingleLoop', 'async function runNodeCascade(nodeId, options={})');
+    const stagedBlock = sourceBlock(source, 'async function runNodeCascade(nodeId, options={})', 'async function runOneCascadePass');
+    const retryBlock = sourceBlock(source, 'async function retryFailedLoopRounds', 'function removeClassicConnections');
+
+    assert.match(helperBlock, /delete node\._cascadeProcessedRoundIndexes/);
+    assert.match(helperBlock, /delete node\._cascadeWaiting/);
+    assert.match(helperBlock, /delete node\._cascadeRetry/);
+    assert.match(singleBlock, /scope === 'complete'/);
+    assert.match(singleBlock, /resetClassicCascadeLoopRuntimeStates\(\[loop\.node\.id\]\)/);
+    assert.match(stagedBlock, /scope === 'complete'/);
+    assert.match(stagedBlock, /resetClassicCascadeLoopRuntimeStates\(schedule\.stages\.map\(stage => stage\.loopId\)\)/);
+    assert.ok(!retryBlock.includes('resetClassicCascadeLoopRuntimeStates('), 'failed-round retry must preserve loop runtime state');
+    assert.ok(singleBlock.indexOf('resetClassicCascadeLoopRuntimeStates') < singleBlock.indexOf('if(schedule.onceOrder.length)'));
+    assert.ok(stagedBlock.indexOf('resetClassicCascadeLoopRuntimeStates') < stagedBlock.indexOf('if(schedule.onceOrder.length)'));
+});
+
+test('two complete runs with two images and three rounds each run two rounds and skip only one', () => {
+    const planner = loadPlanner();
+    const source = fs.readFileSync(CANVAS_PATH, 'utf8');
+    const helperBlock = sourceBlock(source, 'function resetClassicCascadeLoopRuntimeStates', 'function checkClassicCascadeLoopImages');
+    const loop = {
+        id:'loop',
+        type:'loop',
+        _cascadeProcessedRoundIndexes:[1, 2],
+        _cascadeWaiting:{count:3},
+        _cascadeRetry:{failedRoundIndexes:[1]},
+    };
+    const sandbox = {nodes:[loop]};
+    vm.runInNewContext(`${helperBlock}\nthis.resetLoopState = resetClassicCascadeLoopRuntimeStates;`, sandbox);
+    const rounds = [1, 2, 3].map(index => ({index}));
+    const refs = [{url:'first.png'}, {url:'second.png'}];
+    const completeRun = () => {
+        sandbox.resetLoopState(['loop']);
+        const imageFit = planner.fitLoopRoundsToAvailableImages({
+            enabled:true,
+            available:refs.length,
+            startRound:1,
+            totalRounds:rounds.length,
+            batchSize:1,
+        });
+        const selected = rounds
+            .slice(0, imageFit.runnableRounds)
+            .filter(round => !(loop._cascadeProcessedRoundIndexes || []).includes(round.index));
+        loop._cascadeProcessedRoundIndexes = selected.map(round => round.index);
+        return {submitted:selected.map(round => round.index), skipped:rounds.length - selected.length};
+    };
+
+    assert.deepEqual(completeRun(), {submitted:[1, 2], skipped:1});
+    loop._cascadeWaiting = {count:1};
+    loop._cascadeRetry = {failedRoundIndexes:[2]};
+    assert.deepEqual(completeRun(), {submitted:[1, 2], skipped:1});
+    assert.equal(loop._cascadeWaiting, undefined);
+    assert.equal(loop._cascadeRetry, undefined);
 });
 
 test('classic controller tolerates failed loop rounds and trims only unavailable downstream rounds', () => {

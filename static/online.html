@@ -19,7 +19,7 @@
     <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.17-custom.2.1785863220"></script>
     <script src="/static/vendor/js/lucide.js?v=2026.08.17-custom.2.1785863219"></script>
     <script src="/static/js/theme.js?v=2026.08.17-custom.2.1785863206"></script>
-    <script src="/static/js/i18n.js?v=2026.08.17-custom.2.1786671034"></script>
+    <script src="/static/js/i18n.js?v=2026.08.17-custom.2.1786958929"></script>
     <script src="/static/js/image-preview.js?v=2026.08.17-custom.2.1785863203"></script>
     <script src="/static/js/history-bulk-manager.js?v=2026.08.17-custom.2.1785863197"></script>
     <style>
@@ -31,9 +31,18 @@
         .nano-input:focus { border-color:#000; box-shadow:0 0 0 1px #000; }
         .upload-item { background:var(--card); border:1px dashed #e2e8f0; transition:all .4s var(--easing); position:relative; overflow:hidden; }
         .upload-item:hover,.upload-item.drag-over { border-color:#000; transform:translateY(-2px); }
+        .upload-item.is-uploading { border-color:#94a3b8; cursor:wait; }
+        .upload-item.is-error { border-color:#ef4444; }
+        .upload-item.is-locked { opacity:.72; cursor:not-allowed; transform:none; }
         .preview-img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; animation:fadeIn .5s var(--easing); }
+        .reference-slot-label { position:absolute; left:8px; right:8px; bottom:8px; z-index:12; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border-radius:8px; background:rgba(15,23,42,.76); color:#fff; padding:4px 7px; font-size:8px; font-weight:800; text-align:center; }
+        .reference-slot-state { position:absolute; inset:0; z-index:11; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; background:rgba(255,255,255,.86); color:#334155; padding:10px; text-align:center; font-size:9px; font-weight:800; }
+        .reference-slot-state.error { color:#b91c1c; }
+        .reference-spinner { width:18px; height:18px; border:2px solid #cbd5e1; border-top-color:#0f172a; border-radius:999px; animation:spin .8s linear infinite; }
         .glass-btn { background:#111827; transition:all .3s var(--easing); }
         .glass-btn:hover { background:#000; transform:translateY(-1px); box-shadow:0 12px 24px rgba(0,0,0,.1); }
+        .glass-btn.is-running { background:#334155; cursor:progress; }
+        .glass-btn.is-running:hover { background:#334155; transform:none; box-shadow:0 8px 18px rgba(15,23,42,.12); }
         .result-frame { background:#fff; border-radius:32px; border:1px solid #f1f5f9; box-shadow:0 2px 15px rgba(0,0,0,.02); }
         .tool-panel { background:#fff; border:1px solid #edf0f3; border-radius:24px; padding:12px; display:flex; flex-direction:column; gap:10px; }
         .model-pill { background:#f8fafc; border:1px solid #edf2f7; border-radius:999px; padding:3px; display:grid; grid-template-columns:1fr 1fr; gap:2px; }
@@ -54,14 +63,33 @@
         .size-pair.with-fit { grid-template-columns:1fr 1fr auto; align-items:center; }
         .size-fit-btn { height:34px; border:1px solid #edf2f7; border-radius:14px; background:#fff; color:#111827; padding:0 10px; font-size:10px; font-weight:800; white-space:nowrap; }
         .size-fit-btn:disabled { opacity:.45; cursor:not-allowed; }
+        .rh-params-panel { display:flex; flex-direction:column; gap:8px; }
+        .rh-params-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px; }
+        .rh-param-field { min-width:0; display:flex; flex-direction:column; gap:5px; }
+        .rh-param-field.wide { grid-column:1 / -1; }
+        .rh-param-label { display:flex; align-items:center; justify-content:space-between; gap:8px; min-width:0; color:#64748b; font-size:9px; font-weight:700; }
+        .rh-param-label > span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .rh-param-value { color:#111827; font-variant-numeric:tabular-nums; }
+        .rh-param-check { min-height:34px; border:1px solid #edf2f7; border-radius:14px; background:#f8fafc; display:flex; align-items:center; gap:8px; padding:0 10px; color:#111827; font-size:10px; font-weight:700; cursor:pointer; }
+        .rh-param-check input { width:14px; height:14px; accent-color:#111827; }
+        .rh-param-range { width:100%; accent-color:#111827; }
         .mode-badge { font-size:9px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:#0f172a; background:#eef2ff; border:1px solid #e0e7ff; padding:2px 8px; border-radius:999px; }
         .masonry-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:20px; }
         @media (min-width:768px){ .masonry-grid{ grid-template-columns:repeat(4,1fr); } }
-        @media (max-width:640px){ .size-row{ grid-template-columns:1fr; } }
+        @media (max-width:640px){
+            .size-row,.rh-params-grid{ grid-template-columns:1fr; }
+            .rh-param-field.wide{ grid-column:auto; }
+        }
         .masonry-item { aspect-ratio:1/1; border-radius:24px; overflow:hidden; background:#fff; border:1px solid #f1f5f9; transition:all .5s var(--easing); }
         .masonry-item:hover { transform:translateY(-6px); box-shadow:0 20px 40px rgba(0,0,0,.08); }
         .gallery-lightbox { background:rgba(255,255,255,.99); backdrop-filter:blur(22px) saturate(1.05); }
+        .studio-notice-stack { position:fixed; top:24px; right:24px; z-index:80; width:min(360px, calc(100vw - 32px)); display:flex; flex-direction:column; gap:10px; pointer-events:none; }
+        .studio-notice { border:1px solid #e2e8f0; border-left:4px solid #0f172a; border-radius:14px; background:rgba(255,255,255,.97); color:#0f172a; box-shadow:0 18px 45px rgba(15,23,42,.14); padding:12px 14px; font-size:12px; line-height:1.55; animation:noticeIn .2s ease-out; }
+        .studio-notice.error { border-left-color:#dc2626; color:#991b1b; }
+        @media (max-width:640px){ .studio-notice-stack{ top:100px; left:16px; right:16px; width:auto; } }
         @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+        @keyframes spin { to{transform:rotate(360deg)} }
+        @keyframes noticeIn { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:none} }
     </style>
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.17-custom.2.1785863189">
     <style>
@@ -86,7 +114,7 @@
 
         <main class="grid grid-cols-1 lg:grid-cols-12 gap-12">
             <div class="lg:col-span-5 space-y-8">
-                <section class="space-y-4">
+                <section id="promptSection" class="space-y-4">
                     <div class="flex items-center gap-2 text-gray-400">
                         <i data-lucide="terminal" class="w-3.5 h-3.5"></i>
                         <span class="text-[10px] font-black uppercase tracking-widest">Prompt</span>
@@ -94,28 +122,12 @@
                     <textarea id="promptInput" rows="5" class="nano-input w-full p-6 rounded-3xl text-sm outline-none resize-none placeholder-gray-300" placeholder="输入想生成或编辑的画面..." data-i18n-placeholder="online.promptPlaceholder"></textarea>
                 </section>
 
-                <section class="space-y-4">
+                <section id="referenceSection" class="space-y-4">
                     <div class="flex items-center gap-2 text-gray-400">
                         <i data-lucide="images" class="w-3.5 h-3.5"></i>
                         <span class="text-[10px] font-black uppercase tracking-widest" data-i18n="online.referenceImages">Reference Images</span>
                     </div>
-                    <div class="grid grid-cols-3 gap-4">
-                        <div id="drop-zone-1" onclick="document.getElementById('file1').click()" class="upload-item group aspect-square rounded-2xl flex flex-col items-center justify-center cursor-pointer">
-                            <input type="file" id="file1" accept="image/*" class="hidden" onchange="handleFile(this.files[0],1)">
-                            <i data-lucide="plus" class="w-5 h-5 text-gray-300 group-hover:text-black"></i><span class="text-[9px] mt-2 font-bold text-gray-400 uppercase">Main</span>
-                            <img id="prev1" class="preview-img hidden"><button id="del1" onclick="clearSlot(1,event)" class="hidden absolute top-2 right-2 w-6 h-6 bg-white/90 rounded-full shadow-sm z-10">×</button>
-                        </div>
-                        <div id="drop-zone-2" onclick="document.getElementById('file2').click()" class="upload-item group aspect-square rounded-2xl flex flex-col items-center justify-center cursor-pointer">
-                            <input type="file" id="file2" accept="image/*" class="hidden" onchange="handleFile(this.files[0],2)">
-                            <i data-lucide="plus" class="w-5 h-5 text-gray-300 group-hover:text-black"></i><span class="text-[9px] mt-2 font-bold text-gray-400 uppercase">Aux A</span>
-                            <img id="prev2" class="preview-img hidden"><button id="del2" onclick="clearSlot(2,event)" class="hidden absolute top-2 right-2 w-6 h-6 bg-white/90 rounded-full shadow-sm z-10">×</button>
-                        </div>
-                        <div id="drop-zone-3" onclick="document.getElementById('file3').click()" class="upload-item group aspect-square rounded-2xl flex flex-col items-center justify-center cursor-pointer">
-                            <input type="file" id="file3" accept="image/*" class="hidden" onchange="handleFile(this.files[0],3)">
-                            <i data-lucide="plus" class="w-5 h-5 text-gray-300 group-hover:text-black"></i><span class="text-[9px] mt-2 font-bold text-gray-400 uppercase">Aux B</span>
-                            <img id="prev3" class="preview-img hidden"><button id="del3" onclick="clearSlot(3,event)" class="hidden absolute top-2 right-2 w-6 h-6 bg-white/90 rounded-full shadow-sm z-10">×</button>
-                        </div>
-                    </div>
+                    <div id="referenceGrid" class="grid grid-cols-3 gap-4"></div>
                 </section>
 
                 <div class="tool-panel">
@@ -150,54 +162,63 @@
                             </select>
                         </label>
                     </div>
-                    <div class="control-label mt-1">
-                        <i data-lucide="ruler" class="w-3.5 h-3.5"></i>
-                        <span data-i18n="online.size">Size</span>
+                    <div id="runningHubParamsPanel" class="rh-params-panel hidden">
+                        <div class="control-label mt-1">
+                            <i data-lucide="settings-2" class="w-3.5 h-3.5"></i>
+                            <span data-i18n="online.rhParameters">应用参数</span>
+                        </div>
+                        <div id="runningHubParamsGrid" class="rh-params-grid"></div>
                     </div>
-                    <div class="size-row">
-                        <label id="resolutionField" class="size-field">
-                            <select id="resolutionSelect" class="size-select" onchange="setResolution(this.value)">
-                                <option value="1k" selected>1K</option>
-                                <option value="2k">2K</option>
-                                <option value="4k">4K</option>
-                                <option value="custom" data-i18n="online.customSize">自定义尺寸</option>
-                            </select>
-                            <span class="size-pair with-fit">
-                                <input id="sizeCustomWidth" class="size-custom" type="number" min="64" step="64" placeholder="宽度" data-i18n-placeholder="online.width" oninput="setCustomSize()">
-                                <input id="sizeCustomHeight" class="size-custom" type="number" min="64" step="64" placeholder="高度" data-i18n-placeholder="online.height" oninput="setCustomSize()">
-                                <button id="fitImageSizeBtn" class="size-fit-btn" type="button" onclick="fitCustomSizeToImage(event)">适配图片</button>
-                            </span>
-                        </label>
-                        <label id="ratioField" class="size-field">
-                            <select id="ratioSelect" class="size-select" onchange="setRatio(this.value)">
-                                <option value="" data-i18n="online.emptyRatio">比例为空</option>
-                                <option value="square" selected data-i18n="online.square">1:1 方图</option>
-                                <option value="portrait" data-i18n="online.portrait">2:3 竖图</option>
-                                <option value="landscape" data-i18n="online.landscape">3:2 横图</option>
-                                <option value="portrait43">3:4 竖图</option>
-                                <option value="landscape43">4:3 横图</option>
-                                <option value="story" data-i18n="online.story">9:16 竖屏</option>
-                                <option value="wide" data-i18n="online.wide">16:9 宽屏</option>
-                                <option value="custom" data-i18n="online.customRatio">自定义比例</option>
-                            </select>
-                            <span class="size-pair">
-                                <input id="ratioCustomWidth" class="size-custom" type="number" min="1" step="1" placeholder="宽" data-i18n-placeholder="online.ratioWidth" oninput="setCustomRatio()">
-                                <input id="ratioCustomHeight" class="size-custom" type="number" min="1" step="1" placeholder="高" data-i18n-placeholder="online.ratioHeight" oninput="setCustomRatio()">
-                            </span>
-                        </label>
+                    <div id="sizeControls">
+                        <div class="control-label mt-1">
+                            <i data-lucide="ruler" class="w-3.5 h-3.5"></i>
+                            <span data-i18n="online.size">Size</span>
+                        </div>
+                        <div class="size-row mt-2">
+                            <label id="resolutionField" class="size-field">
+                                <select id="resolutionSelect" class="size-select" onchange="setResolution(this.value)">
+                                    <option value="1k" selected>1K</option>
+                                    <option value="2k">2K</option>
+                                    <option value="4k">4K</option>
+                                    <option value="custom" data-i18n="online.customSize">自定义尺寸</option>
+                                </select>
+                                <span class="size-pair with-fit">
+                                    <input id="sizeCustomWidth" class="size-custom" type="number" min="64" step="64" placeholder="宽度" data-i18n-placeholder="online.width" oninput="setCustomSize()">
+                                    <input id="sizeCustomHeight" class="size-custom" type="number" min="64" step="64" placeholder="高度" data-i18n-placeholder="online.height" oninput="setCustomSize()">
+                                    <button id="fitImageSizeBtn" class="size-fit-btn" type="button" onclick="fitCustomSizeToImage(event)">适配图片</button>
+                                </span>
+                            </label>
+                            <label id="ratioField" class="size-field">
+                                <select id="ratioSelect" class="size-select" onchange="setRatio(this.value)">
+                                    <option value="" data-i18n="online.emptyRatio">比例为空</option>
+                                    <option value="square" selected data-i18n="online.square">1:1 方图</option>
+                                    <option value="portrait" data-i18n="online.portrait">2:3 竖图</option>
+                                    <option value="landscape" data-i18n="online.landscape">3:2 横图</option>
+                                    <option value="portrait43">3:4 竖图</option>
+                                    <option value="landscape43">4:3 横图</option>
+                                    <option value="story" data-i18n="online.story">9:16 竖屏</option>
+                                    <option value="wide" data-i18n="online.wide">16:9 宽屏</option>
+                                    <option value="custom" data-i18n="online.customRatio">自定义比例</option>
+                                </select>
+                                <span class="size-pair">
+                                    <input id="ratioCustomWidth" class="size-custom" type="number" min="1" step="1" placeholder="宽" data-i18n-placeholder="online.ratioWidth" oninput="setCustomRatio()">
+                                    <input id="ratioCustomHeight" class="size-custom" type="number" min="1" step="1" placeholder="高" data-i18n-placeholder="online.ratioHeight" oninput="setCustomRatio()">
+                                </span>
+                            </label>
+                        </div>
                     </div>
                 </div>
 
                 <button id="genBtn" onclick="submitImage()" class="glass-btn w-full py-5 text-white rounded-3xl font-bold flex items-center justify-center gap-3 shadow-lg">
                     <i data-lucide="zap" class="w-4 h-4 text-yellow-400"></i>
-                    <span class="tracking-[0.3em] text-[11px] uppercase" data-i18n="online.generate">Generate</span>
+                    <span id="genBtnLabel" class="tracking-[0.3em] text-[11px] uppercase" data-i18n="online.generate">Generate</span>
                 </button>
             </div>
 
             <div class="lg:col-span-7">
                 <div id="resultBox" class="result-frame min-h-[500px] lg:h-full flex items-center justify-center relative overflow-hidden">
                     <div id="placeholder" class="text-center space-y-4 opacity-20"><i data-lucide="layout" class="w-12 h-12 mx-auto stroke-[1px]"></i><p class="text-[10px] font-black tracking-[0.5em] uppercase" data-i18n="online.canvasReady">Canvas Ready</p></div>
-                    <div id="loader" class="hidden text-center space-y-4"><div class="w-8 h-8 border-2 border-black border-t-transparent rounded-full animate-spin mx-auto"></div><p class="text-[10px] font-black tracking-[0.5em] uppercase" data-i18n="online.generating">Generating</p></div>
+                    <div id="loader" class="hidden text-center space-y-4"><div class="w-8 h-8 border-2 border-black border-t-transparent rounded-full animate-spin mx-auto"></div><p id="loaderStatus" class="text-[10px] font-black tracking-[0.35em] uppercase" data-i18n="online.generating">Generating</p></div>
                     <img id="outputImg" class="hidden w-full h-full object-contain p-8 cursor-zoom-in" onclick="zoomImage()">
                     <a id="downloadBtn" href="#" download class="hidden absolute top-8 right-8 w-12 h-12 bg-white/90 shadow-2xl rounded-2xl flex items-center justify-center hover:bg-black hover:text-white"><i data-lucide="download" class="w-4 h-4"></i></a>
                 </div>
@@ -210,6 +231,8 @@
             <div id="loadMoreTrigger" class="py-20 text-center text-gray-300 text-[10px] font-bold uppercase tracking-widest cursor-pointer hover:text-black">Load More Archive</div>
         </section>
     </div>
+
+    <div id="noticeStack" class="studio-notice-stack" aria-live="polite"></div>
 
     <div id="lightbox" onclick="handleOutsideClick(event)" class="hidden fixed inset-0 z-50 gallery-lightbox flex flex-col items-center justify-center p-8">
         <button onclick="closeLightbox()" class="absolute top-10 right-10 text-gray-400 hover:text-black"><i data-lucide="x" class="w-8 h-8"></i></button>
@@ -241,6 +264,8 @@
             document.title = tr('online.title');
             const loader = document.getElementById('loadMoreTrigger');
             if(loader && !isLoading) loader.innerText = tr('online.loadMore');
+            renderReferenceInputs();
+            updateGenerationStatus();
         }
         window.addEventListener('message', event => {
             if(event.data?.type === 'studio-lang') applyLanguage(event.data.lang);
@@ -251,8 +276,8 @@
             document.title = tr('online.title');
             updateAdaptivePanel();
         });
-        let refs = {1:null,2:null,3:null};
-        let refDims = {1:null,2:null,3:null};
+        const referenceStatesByContext = {};
+        const generationState = {running:false, startedAt:0, timer:null};
         let provider = 'comfly';
         let selectedModel = 'gpt-image-2';
         let apiProviders = [];
@@ -265,6 +290,7 @@
         let quality = 'auto';
         let outputCount = 1;
         let models = {gpt:'gpt-image-2', nano:'nano-banana-pro'};
+        let runningHubParamsByModel = {};
         let allHistory = [], currentIndex = 0, currentResult = null, currentLightboxData = null, isLoading = false;
         const PAGE_SIZE = 24;
         const SIZE_OPTIONS = {
@@ -336,10 +362,259 @@
             const p = providerById(id) || {};
             const collect = (list, kind) => (list || [])
                 .filter(e => e && e.enabled !== false && e.hidden !== true)
-                .map(e => ({ kind, id: runningHubEntryId(e, kind), title: String(e.title || e.note || '').trim() }))
+                .map(e => ({ kind, id: runningHubEntryId(e, kind), title: String(e.title || e.note || '').trim(), entry:e }))
                 .filter(e => e.id);
-            const models = uniqueModels(p.image_models || []).map(model => ({kind:'model', id:model, title:model}));
+            const models = uniqueModels(p.image_models || []).map(model => ({kind:'model', id:model, title:model, entry:null}));
             return [...models, ...collect(p.rh_workflows, 'workflow'), ...collect(p.rh_apps, 'app')];
+        }
+        function runningHubFieldKind(field){
+            const type = String(field?.fieldType || '').trim().toUpperCase();
+            if(type === 'IMAGE') return 'image';
+            if(type === 'VIDEO') return 'video';
+            if(type === 'AUDIO') return 'audio';
+            if(type === 'SLIDER') return 'slider';
+            if(['NUMBER','FLOAT','INTEGER','INT'].includes(type)) return 'number';
+            if(['BOOLEAN','BOOL'].includes(type)) return 'boolean';
+            const text = `${field?.fieldName || ''} ${field?.fieldValue || ''}`.toLowerCase();
+            if(/\b(image|img|mask|photo|picture)\b/.test(text) || /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(text)) return 'image';
+            if(/\b(video|movie|mp4)\b/.test(text) || /\.(mp4|webm|mov|m4v|mkv)(\?|$)/i.test(text)) return 'video';
+            if(/\b(audio|sound|music|voice)\b/.test(text) || /\.(mp3|wav|ogg|m4a|flac|aac)(\?|$)/i.test(text)) return 'audio';
+            return 'text';
+        }
+        function runningHubFieldRole(field){
+            const kind = runningHubFieldKind(field);
+            if(kind !== 'text') return kind;
+            const text = `${field?.fieldName || ''} ${field?.label || ''} ${field?.group || ''}`.toLowerCase();
+            return /prompt|positive|negative|text|caption|description|关键词|提示词|正向|负向/.test(text) ? 'prompt' : 'text';
+        }
+        function runningHubFieldOptions(field){
+            const candidates = [field?.fieldData, field?.options, field?.list, field?.values, field?.enum, field?.choices, field?.items, field?.selectOptions, field?.dropdown];
+            for(const candidate of candidates){
+                if(!Array.isArray(candidate) || !candidate.length) continue;
+                if(candidate.every(item => ['string','number'].includes(typeof item))) return candidate.map(String);
+                if(candidate.every(item => item && typeof item === 'object' && ('value' in item || 'label' in item || 'name' in item))){
+                    return candidate.map(item => item.value ?? item.label ?? item.name).filter(value => value !== undefined && value !== null).map(String);
+                }
+            }
+            return [];
+        }
+        function runningHubDefaultValue(field){
+            let value = field?.fieldValue;
+            if(Array.isArray(value)) value = value[0];
+            return value === undefined || value === null || typeof value === 'object' ? '' : String(value);
+        }
+        function runningHubFieldKey(field){
+            const nodeId = String(field?.nodeId || '').trim();
+            const fieldName = String(field?.fieldName || '').trim();
+            return nodeId && fieldName ? `${nodeId}::${fieldName}` : '';
+        }
+        function runningHubImageFields(entry){
+            return (entry?.fields || [])
+                .filter(field => field && field.enabled === true && runningHubFieldKind(field) === 'image')
+                .slice()
+                .sort((a, b) => {
+                    const orderA = Number(a?.imageOrder);
+                    const orderB = Number(b?.imageOrder);
+                    const safeA = Number.isFinite(orderA) && orderA > 0 ? orderA : Number.MAX_SAFE_INTEGER;
+                    const safeB = Number.isFinite(orderB) && orderB > 0 ? orderB : Number.MAX_SAFE_INTEGER;
+                    if(safeA !== safeB) return safeA - safeB;
+                    const nodeCompare = String(a?.nodeId || '').localeCompare(String(b?.nodeId || ''), undefined, {numeric:true});
+                    return nodeCompare || String(a?.fieldName || '').localeCompare(String(b?.fieldName || ''), undefined, {numeric:true});
+                });
+        }
+        function runningHubParamFields(entry){
+            return (entry?.fields || []).filter(field => field && field.enabled === true && !['image','video','audio','prompt'].includes(runningHubFieldRole(field)));
+        }
+        function runningHubPromptRequired(entry){
+            if(!entry) return true;
+            return (entry.fields || []).some(field => field && field.enabled === true && runningHubFieldRole(field) === 'prompt');
+        }
+        function currentRunningHubEntry(){
+            if(!isRunningHubProvider(provider)) return null;
+            const selected = runningHubEntries(provider).find(item => {
+                const key = item.kind === 'model' ? item.id : `${item.kind}:${item.id}`;
+                return key === selectedModel;
+            });
+            return selected?.entry || null;
+        }
+        function referenceContextKey(){
+            return `${provider || ''}::${selectedModel || ''}`;
+        }
+        function referenceDescriptors(){
+            const entry = currentRunningHubEntry();
+            if(!entry){
+                return [
+                    {key:'generic:1', label:tr('online.referenceMain'), required:false},
+                    {key:'generic:2', label:tr('online.referenceAuxA'), required:false},
+                    {key:'generic:3', label:tr('online.referenceAuxB'), required:false},
+                ];
+            }
+            const fields = runningHubImageFields(entry);
+            const rawLabels = fields.map(field => String(field?.label || field?.note || field?.fieldName || '').trim());
+            const labelCounts = rawLabels.reduce((counts, label) => {
+                const key = label.toLowerCase();
+                counts[key] = (counts[key] || 0) + 1;
+                return counts;
+            }, {});
+            return fields.map((field, index) => {
+                const raw = rawLabels[index];
+                const repeated = raw && labelCounts[raw.toLowerCase()] > 1;
+                const generic = !raw || /^(image|img|picture|photo)$/i.test(raw);
+                const fallback = tr('online.imageSlot').replace('{index}', String(index + 1));
+                return {
+                    key:runningHubFieldKey(field) || `image:${index + 1}`,
+                    label:generic || repeated ? fallback : raw,
+                    required:true,
+                    field,
+                };
+            });
+        }
+        function referenceState(contextKey=referenceContextKey()){
+            if(!referenceStatesByContext[contextKey]) referenceStatesByContext[contextKey] = {slots:{}};
+            return referenceStatesByContext[contextKey];
+        }
+        function referenceSlotState(descriptor, contextKey=referenceContextKey()){
+            const state = referenceState(contextKey);
+            if(!state.slots[descriptor.key]){
+                state.slots[descriptor.key] = {reference:null, preview:'', dimension:null, uploading:false, error:'', uploadVersion:0};
+            }
+            return state.slots[descriptor.key];
+        }
+        function currentReferencePayload(){
+            const contextKey = referenceContextKey();
+            return referenceDescriptors().map(descriptor => referenceSlotState(descriptor, contextKey).reference).filter(Boolean);
+        }
+        function referenceUploadsPending(){
+            const contextKey = referenceContextKey();
+            return referenceDescriptors().some(descriptor => referenceSlotState(descriptor, contextKey).uploading);
+        }
+        function missingRequiredReferenceCount(){
+            const contextKey = referenceContextKey();
+            return referenceDescriptors().filter(descriptor => descriptor.required && !referenceSlotState(descriptor, contextKey).reference).length;
+        }
+        function renderReferenceInputs(){
+            const section = document.getElementById('referenceSection');
+            const grid = document.getElementById('referenceGrid');
+            if(!section || !grid) return;
+            const descriptors = referenceDescriptors();
+            section.classList.toggle('hidden', descriptors.length === 0);
+            if(!descriptors.length){
+                grid.innerHTML = '';
+                return;
+            }
+            const contextKey = referenceContextKey();
+            grid.innerHTML = descriptors.map((descriptor, index) => {
+                const slot = referenceSlotState(descriptor, contextKey);
+                const preview = slot.preview || slot.reference?.url || '';
+                const locked = generationState.running;
+                const stateHtml = slot.uploading
+                    ? `<div class="reference-slot-state"><span class="reference-spinner"></span><span>${escapeHtml(tr('online.uploadingImage'))}</span></div>`
+                    : slot.error
+                        ? `<div class="reference-slot-state error" title="${escapeHtml(slot.error)}"><i data-lucide="circle-alert" class="w-5 h-5"></i><span>${escapeHtml(tr('online.uploadFailed'))}</span></div>`
+                        : '';
+                return `<div class="upload-item group aspect-square rounded-2xl flex flex-col items-center justify-center ${slot.uploading ? 'is-uploading' : ''} ${slot.error ? 'is-error' : ''} ${locked ? 'is-locked' : 'cursor-pointer'}" data-reference-slot="${index}">
+                    <input type="file" accept="image/*" class="hidden" data-reference-file="${index}">
+                    <i data-lucide="plus" class="w-5 h-5 text-gray-300 group-hover:text-black"></i>
+                    ${preview ? `<img src="${escapeHtml(preview)}" class="preview-img" alt="">` : ''}
+                    ${preview || slot.error ? `<button type="button" data-reference-clear="${index}" class="absolute top-2 right-2 w-6 h-6 bg-white/90 rounded-full shadow-sm z-[13]">×</button>` : ''}
+                    ${stateHtml}
+                    <span class="reference-slot-label">${escapeHtml(descriptor.label)}</span>
+                </div>`;
+            }).join('');
+            grid.querySelectorAll('[data-reference-slot]').forEach(zone => {
+                const index = Number(zone.dataset.referenceSlot);
+                const fileInput = zone.querySelector('[data-reference-file]');
+                zone.onclick = event => {
+                    if(event.target.closest('[data-reference-clear]')) return;
+                    if(generationState.running){ showRunningNotice(); return; }
+                    fileInput?.click();
+                };
+                zone.ondragover = event => { if(!generationState.running){ event.preventDefault(); zone.classList.add('drag-over'); } };
+                zone.ondragleave = () => zone.classList.remove('drag-over');
+                zone.ondrop = event => {
+                    event.preventDefault();
+                    zone.classList.remove('drag-over');
+                    if(generationState.running){ showRunningNotice(); return; }
+                    handleFile(event.dataTransfer?.files?.[0], index);
+                };
+                if(fileInput){
+                    fileInput.disabled = generationState.running;
+                    fileInput.onchange = () => {
+                        const file = fileInput.files?.[0];
+                        fileInput.value = '';
+                        handleFile(file, index);
+                    };
+                }
+            });
+            grid.querySelectorAll('[data-reference-clear]').forEach(button => {
+                button.onclick = event => clearReferenceSlot(Number(button.dataset.referenceClear), event);
+            });
+            lucide.createIcons();
+        }
+        function currentRunningHubParamState(){
+            if(!currentRunningHubEntry()) return {};
+            runningHubParamsByModel[selectedModel] = runningHubParamsByModel[selectedModel] || {};
+            return runningHubParamsByModel[selectedModel];
+        }
+        function runningHubParamValue(field){
+            const key = runningHubFieldKey(field);
+            const state = currentRunningHubParamState();
+            return key && Object.prototype.hasOwnProperty.call(state, key) ? state[key] : runningHubDefaultValue(field);
+        }
+        function collectRunningHubParams(){
+            return currentRunningHubEntry() ? {...currentRunningHubParamState()} : {};
+        }
+        function renderRunningHubParams(entry){
+            const panel = document.getElementById('runningHubParamsPanel');
+            const container = document.getElementById('runningHubParamsGrid');
+            if(!panel || !container) return;
+            const fields = runningHubParamFields(entry);
+            panel.classList.toggle('hidden', !entry || !fields.length);
+            if(!entry || !fields.length){
+                container.innerHTML = '';
+                return;
+            }
+            container.innerHTML = fields.map((field, index) => {
+                const key = runningHubFieldKey(field);
+                const role = runningHubFieldRole(field);
+                const label = field.label || field.note || field.fieldName || `Field ${index + 1}`;
+                const value = runningHubParamValue(field);
+                const options = runningHubFieldOptions(field);
+                const wide = role === 'text' && (String(label).length > 18 || String(value).length > 28);
+                const labelHtml = `<span>${escapeHtml(label)}</span>`;
+                const disabled = generationState.running ? ' disabled' : '';
+                if(role === 'boolean'){
+                    const checked = String(value).toLowerCase() === 'true';
+                    return `<label class="rh-param-field ${wide ? 'wide' : ''}"><span class="rh-param-check"><input type="checkbox" data-rh-param="${escapeHtml(key)}" ${checked ? 'checked' : ''}${disabled}><span>${escapeHtml(label)}</span></span></label>`;
+                }
+                if(role === 'slider'){
+                    const min = Number.isFinite(Number(field.min)) ? Number(field.min) : 0;
+                    const max = Number.isFinite(Number(field.max)) && Number(field.max) > min ? Number(field.max) : 1;
+                    const step = Number.isFinite(Number(field.step)) && Number(field.step) > 0 ? Number(field.step) : 0.01;
+                    const numericValue = Number.isFinite(Number(value)) ? Number(value) : min;
+                    return `<label class="rh-param-field ${wide ? 'wide' : ''}"><span class="rh-param-label">${labelHtml}<span class="rh-param-value">${escapeHtml(String(numericValue))}</span></span><input class="rh-param-range" type="range" data-rh-param="${escapeHtml(key)}" min="${escapeHtml(String(min))}" max="${escapeHtml(String(max))}" step="${escapeHtml(String(step))}" value="${escapeHtml(String(numericValue))}"${disabled}></label>`;
+                }
+                if(options.length){
+                    return `<label class="rh-param-field ${wide ? 'wide' : ''}"><span class="rh-param-label">${labelHtml}</span><select class="size-select" data-rh-param="${escapeHtml(key)}"${disabled}>${options.map(option => `<option value="${escapeHtml(option)}" ${String(option) === String(value) ? 'selected' : ''}>${escapeHtml(option)}</option>`).join('')}</select></label>`;
+                }
+                const type = role === 'number' ? 'number' : 'text';
+                const limits = role === 'number'
+                    ? `${field.min !== '' && field.min !== undefined ? ` min="${escapeHtml(String(field.min))}"` : ''}${field.max !== '' && field.max !== undefined ? ` max="${escapeHtml(String(field.max))}"` : ''}${field.step !== '' && field.step !== undefined ? ` step="${escapeHtml(String(field.step))}"` : ''}`
+                    : '';
+                return `<label class="rh-param-field ${wide ? 'wide' : ''}"><span class="rh-param-label">${labelHtml}</span><input class="size-select" type="${type}" data-rh-param="${escapeHtml(key)}" value="${escapeHtml(value)}"${limits}${disabled}></label>`;
+            }).join('');
+            container.querySelectorAll('[data-rh-param]').forEach(control => {
+                const sync = () => {
+                    const key = control.dataset.rhParam;
+                    const state = currentRunningHubParamState();
+                    state[key] = control.type === 'checkbox' ? String(control.checked) : control.value;
+                    const display = control.closest('.rh-param-field')?.querySelector('.rh-param-value');
+                    if(display) display.textContent = control.value;
+                };
+                control.oninput = sync;
+                control.onchange = sync;
+            });
+            lucide.createIcons();
         }
         function isRunningHubProvider(id){ return providerProtocol(id) === 'runninghub'; }
         function renderProviderControls(){
@@ -393,6 +668,7 @@
         const QUALITY_PROTOCOLS = new Set(['api','apimart']);
         function updateAdaptivePanel(){
             const proto = providerProtocol(provider);
+            const runningHubEntry = currentRunningHubEntry();
             const badge = document.getElementById('providerModeBadge');
             if(badge){
                 badge.textContent = tr(PROTOCOL_BADGE[proto] || 'online.modeApi');
@@ -408,6 +684,12 @@
             if(cf) cf.style.display = (proto === 'runninghub') ? 'none' : '';
             const cs = document.getElementById('countSelect');
             if(cs) cs.value = String(outputCount);
+            const promptSection = document.getElementById('promptSection');
+            if(promptSection) promptSection.classList.toggle('hidden', Boolean(runningHubEntry) && !runningHubPromptRequired(runningHubEntry));
+            const sizeControls = document.getElementById('sizeControls');
+            if(sizeControls) sizeControls.classList.toggle('hidden', Boolean(runningHubEntry));
+            renderRunningHubParams(runningHubEntry);
+            renderReferenceInputs();
         }
         function setQuality(next){ quality = next || 'auto'; }
         function setCount(next){ outputCount = Math.max(1, Math.min(4, parseInt(next, 10) || 1)); }
@@ -448,14 +730,86 @@
         document.addEventListener('visibilitychange', () => { if(!document.hidden) scheduleProviderRefresh(); });
 
         function setProvider(next){
+            if(generationState.running){ showRunningNotice(); return; }
             provider = next;
             selectedModel = providerModels(provider)[0] || selectedModel;
             renderProviderControls();
         }
         function setModel(next){
+            if(generationState.running){ showRunningNotice(); return; }
             selectedModel = next;
+            updateAdaptivePanel();
         }
         function escapeHtml(str){ return String(str || '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s])); }
+        function apiErrorMessage(data, fallback='请求失败'){
+            if(!data) return fallback;
+            if(typeof data === 'string') return data || fallback;
+            const detail = data.detail ?? data.error ?? data.message ?? data.msg;
+            if(typeof detail === 'string') return detail || fallback;
+            if(Array.isArray(detail)){
+                const messages = detail.map(item => typeof item === 'string' ? item : (item?.msg || item?.message || JSON.stringify(item))).filter(Boolean);
+                return messages.join('\n') || fallback;
+            }
+            if(detail && typeof detail === 'object') return detail.message || detail.msg || detail.error || JSON.stringify(detail);
+            try { return JSON.stringify(data); } catch(e) { return fallback; }
+        }
+        async function responseErrorMessage(response, fallback='请求失败'){
+            try { return apiErrorMessage(await response.clone().json(), fallback); }
+            catch(e){
+                try { return (await response.clone().text()).trim() || fallback; }
+                catch(_e){ return fallback; }
+            }
+        }
+        function showNotice(message, type='info', duration=4800){
+            const stack = document.getElementById('noticeStack');
+            if(!stack){ alert(message); return; }
+            const notice = document.createElement('div');
+            notice.className = `studio-notice ${type === 'error' ? 'error' : ''}`;
+            notice.textContent = String(message || '');
+            stack.appendChild(notice);
+            setTimeout(() => notice.remove(), duration);
+        }
+        function formatElapsed(ms){
+            const total = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+            const hours = Math.floor(total / 3600);
+            const minutes = Math.floor((total % 3600) / 60);
+            const seconds = total % 60;
+            const pair = value => String(value).padStart(2, '0');
+            return hours ? `${pair(hours)}:${pair(minutes)}:${pair(seconds)}` : `${pair(minutes)}:${pair(seconds)}`;
+        }
+        function runningElapsed(){ return formatElapsed(Date.now() - Number(generationState.startedAt || Date.now())); }
+        function showRunningNotice(){
+            showNotice(tr('online.alreadyGenerating').replace('{time}', runningElapsed()));
+        }
+        function updateGenerationStatus(){
+            const elapsed = runningElapsed();
+            const label = document.getElementById('genBtnLabel');
+            const loaderStatus = document.getElementById('loaderStatus');
+            if(label) label.textContent = generationState.running ? `${tr('online.generating')} ${elapsed}` : tr('online.generate');
+            if(loaderStatus) loaderStatus.textContent = generationState.running ? `${tr('online.generating')} · ${elapsed}` : tr('online.generating');
+        }
+        function setGenerationControlsLocked(locked){
+            ['promptInput','providerSelect','modelSelect','qualitySelect','countSelect','resolutionSelect','ratioSelect','sizeCustomWidth','sizeCustomHeight','ratioCustomWidth','ratioCustomHeight','fitImageSizeBtn']
+                .forEach(id => { const control = document.getElementById(id); if(control) control.disabled = Boolean(locked); });
+            document.querySelectorAll('[data-rh-param]').forEach(control => { control.disabled = Boolean(locked); });
+            renderReferenceInputs();
+            if(!locked) updateSizeUI();
+        }
+        function setGenerationRunning(running){
+            generationState.running = Boolean(running);
+            const button = document.getElementById('genBtn');
+            if(button){
+                button.classList.toggle('is-running', generationState.running);
+                button.setAttribute('aria-busy', generationState.running ? 'true' : 'false');
+            }
+            if(generationState.timer){ clearInterval(generationState.timer); generationState.timer = null; }
+            if(generationState.running){
+                generationState.startedAt = Date.now();
+                generationState.timer = setInterval(updateGenerationStatus, 1000);
+            }
+            updateGenerationStatus();
+            setGenerationControlsLocked(generationState.running);
+        }
 
         function parseSizeValue(value){
             const match = String(value || '').trim().match(/^(\d+)\s*[xX*]\s*(\d+)$/);
@@ -480,7 +834,8 @@
             });
         }
         function firstReferenceDimension(){
-            return [1,2,3].map(id => refDims[id]).find(dim => dim?.width && dim?.height) || null;
+            const contextKey = referenceContextKey();
+            return referenceDescriptors().map(descriptor => referenceSlotState(descriptor, contextKey).dimension).find(dim => dim?.width && dim?.height) || null;
         }
 
         function setRatio(next, preferredSize = ''){
@@ -577,62 +932,134 @@
             return match[0];
         }
 
-        [1,2,3].forEach(id => {
-            const zone = document.getElementById(`drop-zone-${id}`);
-            zone.ondragover = e => { e.preventDefault(); zone.classList.add('drag-over'); };
-            zone.ondragleave = () => zone.classList.remove('drag-over');
-            zone.ondrop = e => { e.preventDefault(); zone.classList.remove('drag-over'); handleFile(e.dataTransfer.files[0], id); };
-        });
         window.addEventListener('paste', e => {
             const item = [...(e.clipboardData?.items || [])].find(x => x.kind === 'file' && x.type.startsWith('image/'));
-            if (item) handleFile(item.getAsFile(), firstEmptySlot());
+            if(!item) return;
+            if(generationState.running){ showRunningNotice(); return; }
+            const index = firstEmptySlot();
+            if(index < 0){ showNotice(tr('online.noImageSlot')); return; }
+            handleFile(item.getAsFile(), index);
         });
-        function firstEmptySlot(){ return [1,2,3].find(id => !refs[id]) || 1; }
+        function firstEmptySlot(){
+            const contextKey = referenceContextKey();
+            return referenceDescriptors().findIndex(descriptor => !referenceSlotState(descriptor, contextKey).reference && !referenceSlotState(descriptor, contextKey).uploading);
+        }
+        function fileDataUrl(file){
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(reader.error || new Error(tr('online.uploadFailed')));
+                reader.readAsDataURL(file);
+            });
+        }
 
         async function handleFile(file, index){
-            if(!file) return;
-            const reader = new FileReader();
-            reader.onload = e => {
-                const prev = document.getElementById(`prev${index}`);
-                prev.src = e.target.result; prev.classList.remove('hidden');
-                document.getElementById(`del${index}`).classList.remove('hidden');
-                getImageDimensions(e.target.result).then(dim => {
-                    refDims[index] = dim;
-                    updateSizeUI();
-                }).catch(() => {});
-            };
-            reader.readAsDataURL(file);
-            const form = new FormData();
-            form.append('files', file);
-            const data = await fetch('/api/ai/upload', {method:'POST', body:form}).then(r=>r.json());
-            refs[index] = data.files[0];
+            if(!file || generationState.running) return;
+            const descriptors = referenceDescriptors();
+            const descriptor = descriptors[index];
+            if(!descriptor){ showNotice(tr('online.noImageSlot')); return; }
+            const contextKey = referenceContextKey();
+            const slot = referenceSlotState(descriptor, contextKey);
+            const uploadVersion = Number(slot.uploadVersion || 0) + 1;
+            slot.uploadVersion = uploadVersion;
+            slot.reference = null;
+            slot.dimension = null;
+            slot.error = '';
+            slot.uploading = true;
+            renderReferenceInputs();
+            try {
+                const preview = await fileDataUrl(file);
+                if(slot.uploadVersion !== uploadVersion) return;
+                slot.preview = preview;
+                if(referenceContextKey() === contextKey) renderReferenceInputs();
+                try {
+                    slot.dimension = await getImageDimensions(preview);
+                    if(referenceContextKey() === contextKey) updateSizeUI();
+                } catch(e) {}
+                const form = new FormData();
+                form.append('files', file);
+                const response = await fetch('/api/ai/upload', {method:'POST', body:form});
+                if(!response.ok) throw new Error(await responseErrorMessage(response, tr('online.uploadFailed')));
+                const data = await response.json();
+                const uploaded = data.files?.[0];
+                if(!uploaded?.url) throw new Error(apiErrorMessage(data, tr('online.uploadFailed')));
+                if(slot.uploadVersion !== uploadVersion) return;
+                slot.reference = uploaded;
+                slot.error = '';
+            } catch(err) {
+                if(slot.uploadVersion !== uploadVersion) return;
+                slot.reference = null;
+                slot.error = err.message || tr('online.uploadFailed');
+                showNotice(slot.error, 'error');
+            } finally {
+                if(slot.uploadVersion === uploadVersion){
+                    slot.uploading = false;
+                    if(referenceContextKey() === contextKey){
+                        renderReferenceInputs();
+                        updateSizeUI();
+                    }
+                }
+            }
         }
-        function clearSlot(index, ev){
-            if(ev) ev.stopPropagation();
-            refs[index] = null;
-            refDims[index] = null;
-            document.getElementById(`prev${index}`).src = '';
-            document.getElementById(`prev${index}`).classList.add('hidden');
-            document.getElementById(`del${index}`).classList.add('hidden');
+        function clearReferenceSlot(index, event){
+            if(event) event.stopPropagation();
+            if(generationState.running){ showRunningNotice(); return; }
+            const descriptor = referenceDescriptors()[index];
+            if(!descriptor) return;
+            const slot = referenceSlotState(descriptor);
+            slot.uploadVersion = Number(slot.uploadVersion || 0) + 1;
+            slot.reference = null;
+            slot.preview = '';
+            slot.dimension = null;
+            slot.uploading = false;
+            slot.error = '';
+            renderReferenceInputs();
+            updateSizeUI();
+        }
+        function clearCurrentReferences(){
+            const contextKey = referenceContextKey();
+            referenceDescriptors().forEach(descriptor => {
+                const slot = referenceSlotState(descriptor, contextKey);
+                slot.uploadVersion = Number(slot.uploadVersion || 0) + 1;
+                slot.reference = null;
+                slot.preview = '';
+                slot.dimension = null;
+                slot.uploading = false;
+                slot.error = '';
+            });
+            renderReferenceInputs();
+            updateSizeUI();
         }
 
         async function submitImage(){
+            if(generationState.running){ showRunningNotice(); return; }
             const prompt = document.getElementById('promptInput').value.trim();
-            if(!prompt){ alert(tr('online.promptRequired')); return; }
-            const btn = document.getElementById('genBtn'), loader = document.getElementById('loader'), placeholder = document.getElementById('placeholder'), out = document.getElementById('outputImg'), dl = document.getElementById('downloadBtn');
-            btn.disabled = true; placeholder.classList.add('hidden'); out.classList.add('hidden'); dl.classList.add('hidden'); loader.classList.remove('hidden');
+            if(!prompt && runningHubPromptRequired(currentRunningHubEntry())){ showNotice(tr('online.promptRequired'), 'error'); return; }
+            if(referenceUploadsPending()){ showNotice(tr('online.imagesUploading')); return; }
+            const missing = missingRequiredReferenceCount();
+            if(missing){
+                showNotice(tr('online.imagesRequired').replace('{count}', String(referenceDescriptors().length)), 'error');
+                return;
+            }
+            const loader = document.getElementById('loader'), placeholder = document.getElementById('placeholder'), out = document.getElementById('outputImg'), dl = document.getElementById('downloadBtn');
+            setGenerationRunning(true);
+            placeholder.classList.add('hidden'); out.classList.add('hidden'); dl.classList.add('hidden'); loader.classList.remove('hidden');
             try {
-                const reqBody = { prompt, provider_id:provider, model:selectedModel, size:currentSize(), n:outputCount, reference_images:Object.values(refs).filter(Boolean) };
+                const reqBody = { prompt, provider_id:provider, model:selectedModel, size:currentSize(), n:outputCount, reference_images:currentReferencePayload() };
                 if(QUALITY_PROTOCOLS.has(providerProtocol(provider))) reqBody.quality = quality;
-                const result = await fetch('/api/online-image', {
+                if(currentRunningHubEntry()) reqBody.runninghub_params = collectRunningHubParams();
+                const response = await fetch('/api/online-image', {
                     method:'POST', headers:{'Content-Type':'application/json'},
                     body:JSON.stringify(reqBody)
-                }).then(async r => { if(!r.ok) throw new Error((await r.json()).detail || '生成失败'); return r.json(); });
+                });
+                if(!response.ok) throw new Error(await responseErrorMessage(response, tr('online.generationFailed')));
+                const result = await response.json();
                 currentResult = result; out.src = result.images[0]; out.classList.remove('hidden'); dl.href = result.images[0]; dl.classList.remove('hidden'); renderImageCard(result, true);
+                showNotice(tr('online.generatedIn').replace('{time}', runningElapsed()));
             } catch(err) {
-                alert(err.message || 'Generation failed'); placeholder.classList.remove('hidden');
+                showNotice(err.message || tr('online.generationFailed'), 'error'); placeholder.classList.remove('hidden');
             } finally {
-                loader.classList.add('hidden'); btn.disabled = false;
+                loader.classList.add('hidden'); setGenerationRunning(false);
             }
         }
 
@@ -707,15 +1134,22 @@
         function applySameStyle(){
             if(!currentLightboxData) return;
             document.getElementById('promptInput').value = currentLightboxData.prompt || '';
-            [1,2,3].forEach(id => clearSlot(id));
-            (currentLightboxData.params?.reference_images || []).slice(0,3).forEach((ref,i) => {
-                refs[i+1] = ref; const prev = document.getElementById(`prev${i+1}`);
-                prev.src = ref.url; prev.classList.remove('hidden'); document.getElementById(`del${i+1}`).classList.remove('hidden');
-                getImageDimensions(ref.url).then(dim => {
-                    refDims[i+1] = dim;
-                    updateSizeUI();
+            clearCurrentReferences();
+            const contextKey = referenceContextKey();
+            const descriptors = referenceDescriptors();
+            (currentLightboxData.params?.reference_images || []).slice(0, descriptors.length).forEach((ref, index) => {
+                const descriptor = descriptors[index];
+                const slot = referenceSlotState(descriptor, contextKey);
+                slot.reference = ref;
+                slot.preview = ref?.url || '';
+                slot.error = '';
+                slot.uploading = false;
+                if(ref?.url) getImageDimensions(ref.url).then(dim => {
+                    slot.dimension = dim;
+                    if(referenceContextKey() === contextKey) updateSizeUI();
                 }).catch(() => {});
             });
+            renderReferenceInputs();
             const size = currentLightboxData.params?.size || '1024x1024';
             const matchedRatio = Object.keys(SIZE_OPTIONS).find(key => SIZE_OPTIONS[key].some(([value]) => value === size)) || 'square';
             const matchedRes = SIZE_OPTIONS[matchedRatio]?.find(([value]) => value === size)?.[1];

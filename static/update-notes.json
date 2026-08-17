@@ -1,10 +1,10 @@
 {
-  "version": "2026.08.17-custom.2",
+  "version": "2026.08.17-custom.3",
   "updated_at": "2026-08-17T00:00:00+08:00",
   "items": [
     {
       "type": "fix",
-      "text": "新增更新下载进度显示"
+      "text": "修复 RunningHub 任务取消、排队与画布日志问题"
     }
   ]
 }
