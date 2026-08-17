@@ -192,7 +192,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.08.12-custom.1"
+APP_VERSION = "2026.08.17-custom.2"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -344,6 +344,31 @@ LOAD_LOCK = Lock()
 RUNNINGHUB_WORKFLOW_LOCK = Lock()
 NEXT_TASK_ID = 1
 UPDATE_LOCK = Lock()
+UPDATE_PROGRESS_LOCK = Lock()
+UPDATE_PROGRESS = {
+    "running": False,
+    "phase": "idle",
+    "source": "",
+    "source_label": "",
+    "current_file": "",
+    "current_index": 0,
+    "completed_files": 0,
+    "total_files": 0,
+    "downloaded_bytes": 0,
+    "total_bytes": 0,
+    "current_file_bytes": 0,
+    "current_file_total": 0,
+    "speed_bps": 0,
+    "elapsed_seconds": 0,
+    "eta_seconds": None,
+    "error": "",
+    "updated_at": 0,
+}
+UPDATE_FILE_SIZE_HINTS: Dict[str, int] = {}
+UPDATE_PROGRESS_STARTED_AT = 0.0
+UPDATE_DOWNLOAD_STARTED_AT = 0.0
+UPDATE_PROGRESS_FILES: List[str] = []
+UPDATE_DOWNLOADED_BY_FILE: Dict[str, int] = {}
 JIMENG_LOGIN_SESSION = {
     "proc": None,
     "stdout": "",
@@ -2148,6 +2173,82 @@ def update_allowed_file(path: str) -> bool:
     }
     return path in root_files or path.startswith("static/")
 
+def _set_update_progress(**changes: Any) -> Dict[str, Any]:
+    global UPDATE_PROGRESS
+    with UPDATE_PROGRESS_LOCK:
+        UPDATE_PROGRESS.update(changes)
+        if UPDATE_PROGRESS_STARTED_AT:
+            UPDATE_PROGRESS["elapsed_seconds"] = max(0.0, time.monotonic() - UPDATE_PROGRESS_STARTED_AT)
+        downloaded = float(UPDATE_PROGRESS.get("downloaded_bytes") or 0)
+        total = float(UPDATE_PROGRESS.get("total_bytes") or 0)
+        download_elapsed = max(0.0, time.monotonic() - UPDATE_DOWNLOAD_STARTED_AT) if UPDATE_DOWNLOAD_STARTED_AT else 0.0
+        speed = downloaded / download_elapsed if download_elapsed > 0 else 0.0
+        UPDATE_PROGRESS["speed_bps"] = round(speed, 1)
+        UPDATE_PROGRESS["eta_seconds"] = (round((total - downloaded) / speed, 1)
+            if total > downloaded and speed > 0 else None)
+        UPDATE_PROGRESS["updated_at"] = time.time()
+        return dict(UPDATE_PROGRESS)
+
+def _begin_update_progress(source: str = "") -> None:
+    global UPDATE_PROGRESS_STARTED_AT, UPDATE_PROGRESS_FILES, UPDATE_DOWNLOADED_BY_FILE
+    UPDATE_PROGRESS_STARTED_AT = time.monotonic()
+    UPDATE_PROGRESS_FILES = []
+    UPDATE_DOWNLOADED_BY_FILE = {}
+    _set_update_progress(running=True, phase="listing", source=source,
+                         source_label=UPDATE_SOURCE_LABELS.get(source, source),
+                         current_file="", current_index=0, completed_files=0, total_files=0,
+                         downloaded_bytes=0, total_bytes=0, current_file_bytes=0,
+                         current_file_total=0, speed_bps=0, elapsed_seconds=0,
+                         eta_seconds=None, error="")
+
+def _finish_update_progress(phase: str, error: str = "") -> None:
+    _set_update_progress(running=False, phase=phase, error=str(error or ""), current_file="")
+
+def _reset_update_download_attempt(source: str) -> None:
+    global UPDATE_PROGRESS_FILES, UPDATE_DOWNLOADED_BY_FILE, UPDATE_DOWNLOAD_STARTED_AT
+    UPDATE_PROGRESS_FILES = []
+    UPDATE_DOWNLOADED_BY_FILE = {}
+    UPDATE_FILE_SIZE_HINTS.clear()
+    UPDATE_DOWNLOAD_STARTED_AT = time.monotonic()
+    _set_update_progress(phase="listing", source=source,
+                         source_label=UPDATE_SOURCE_LABELS.get(source, source),
+                         current_file="", current_index=0, completed_files=0, total_files=0,
+                         downloaded_bytes=0, total_bytes=0, current_file_bytes=0,
+                         current_file_total=0, eta_seconds=None, error="")
+
+def _record_update_download(rel: str, received: int, total: int, index: int = 0,
+                            total_files: int = 0, files: Optional[List[str]] = None) -> None:
+    global UPDATE_PROGRESS_FILES, UPDATE_DOWNLOADED_BY_FILE
+    if rel == "__list__":
+        UPDATE_PROGRESS_FILES = list(files or [])
+        UPDATE_DOWNLOADED_BY_FILE = {}
+    elif rel:
+        UPDATE_DOWNLOADED_BY_FILE[rel] = max(0, int(received or 0))
+        if total and not UPDATE_FILE_SIZE_HINTS.get(rel):
+            UPDATE_FILE_SIZE_HINTS[rel] = max(0, int(total))
+    known_sizes = [int(UPDATE_FILE_SIZE_HINTS.get(path) or 0) for path in UPDATE_PROGRESS_FILES]
+    known_total = sum(known_sizes) if known_sizes and all(size > 0 for size in known_sizes) else 0
+    completed_files = sum(
+        1 for path in UPDATE_PROGRESS_FILES
+        if int(UPDATE_FILE_SIZE_HINTS.get(path) or 0) > 0
+        and int(UPDATE_DOWNLOADED_BY_FILE.get(path) or 0) >= int(UPDATE_FILE_SIZE_HINTS.get(path) or 0)
+    )
+    _set_update_progress(phase="downloading", current_file="" if rel == "__list__" else rel,
+                         current_index=max(0, int(index or 0)),
+                         completed_files=completed_files,
+                         total_files=max(len(UPDATE_PROGRESS_FILES), int(total_files or 0)),
+                         downloaded_bytes=sum(UPDATE_DOWNLOADED_BY_FILE.values()),
+                         total_bytes=known_total, current_file_bytes=max(0, int(received or 0)),
+                         current_file_total=max(0, int(total or 0)))
+
+@app.get("/api/update-progress")
+def update_progress():
+    with UPDATE_PROGRESS_LOCK:
+        snapshot = dict(UPDATE_PROGRESS)
+    if UPDATE_PROGRESS_STARTED_AT and snapshot.get("running"):
+        snapshot["elapsed_seconds"] = max(0.0, time.monotonic() - UPDATE_PROGRESS_STARTED_AT)
+    return JSONResponse(snapshot, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"})
+
 # 缓存 GitHub Tree API 响应（含 ETag），减少 60 次/h 限流压力
 GITHUB_TREE_CACHE: Dict[str, Any] = {"etag": "", "data": None, "expires_at": 0.0}
 
@@ -2194,16 +2295,47 @@ def github_json(url: str, use_etag_cache: bool = False):
             return GITHUB_TREE_CACHE["data"]
         raise
 
-def github_bytes(url: str) -> bytes:
-    resp = github_get(url, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=60)
-    return resp.content
+def streamed_update_bytes(url: str, rel: str = "", progress: Optional[Any] = None) -> bytes:
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Infinite-Canvas-Updater"},
+                            timeout=60, stream=True, proxies=urllib.request.getproxies() or None)
+    except requests.RequestException as exc:
+        raise urllib.error.URLError(str(exc)) from exc
+    if resp.status_code >= 400:
+        resp.close()
+        raise urllib.error.HTTPError(url, resp.status_code, resp.reason, resp.headers, None)
+    try:
+        total = int(resp.headers.get("Content-Length") or 0)
+        received = 0
+        chunks = []
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            received += len(chunk)
+            if progress:
+                progress(rel, received, total)
+        if progress:
+            progress(rel, received, total or received)
+        return b"".join(chunks)
+    finally:
+        resp.close()
 
-def download_github_update_files(files: List[str], staging_root: str) -> None:
+def github_bytes(url: str, rel: str = "", progress: Optional[Any] = None) -> bytes:
+    return streamed_update_bytes(url, rel=rel, progress=progress)
+
+def download_github_update_files(files: List[str], staging_root: str, progress: Optional[Any] = None) -> None:
     staging_root_abs = os.path.abspath(staging_root)
-    for rel in files:
+    clean_files = list(files or [])
+    if progress:
+        progress("__list__", 0, 0, 0, len(clean_files), clean_files)
+    for index, rel in enumerate(clean_files, start=1):
         safe_update_target(rel)
         raw_url = f"{GITHUB_RAW_ROOT}/{urllib.parse.quote(rel, safe='/')}"
-        data = github_bytes(raw_url)
+        def on_chunk(name, received, total):
+            if progress:
+                progress(name, received, total, index, len(clean_files))
+        data = github_bytes(raw_url, rel=rel, progress=on_chunk) if progress else github_bytes(raw_url)
         stage_path = os.path.abspath(os.path.join(staging_root_abs, *rel.split("/")))
         if os.path.commonpath([staging_root_abs, stage_path]) != staging_root_abs:
             raise ValueError(f"更新暂存路径不安全：{rel}")
@@ -2222,17 +2354,23 @@ def modelscope_update_file_list() -> List[str]:
             continue
         path = str(entry.get("Path") or "").replace("\\", "/")
         if update_allowed_file(path):
+            try:
+                size = int(entry.get("Size") or entry.get("size") or 0)
+                if size > 0:
+                    UPDATE_FILE_SIZE_HINTS[path] = size
+            except (TypeError, ValueError):
+                pass
             files.append(path)
     return sorted(set(files))
 
-def modelscope_file_bytes(rel: str) -> bytes:
+def modelscope_file_bytes(rel: str, progress: Optional[Any] = None) -> bytes:
     safe_update_target(rel)
     url = MODELSCOPE_FILE_API_ROOT + urllib.parse.quote(rel, safe="/")
-    resp = github_get(url, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=60)
-    return resp.content
+    return streamed_update_bytes(url, rel=rel, progress=progress)
 
-def download_modelscope_update_files(staging_root: str) -> List[str]:
-    files = modelscope_update_file_list()
+def download_modelscope_update_files(staging_root: str, progress: Optional[Any] = None,
+                                      files: Optional[List[str]] = None) -> List[str]:
+    files = list(files or modelscope_update_file_list())
     if not files:
         raise RuntimeError("ModelScope 未返回任何允许更新的文件")
     if "main.py" not in files or "VERSION" not in files:
@@ -2240,9 +2378,14 @@ def download_modelscope_update_files(staging_root: str) -> List[str]:
     if not any(path.startswith("static/") for path in files):
         raise RuntimeError("ModelScope 未返回 static 文件，已取消更新")
     staging_root_abs = os.path.abspath(staging_root)
-    for rel in files:
+    if progress:
+        progress("__list__", 0, 0, 0, len(files), files)
+    for index, rel in enumerate(files, start=1):
         safe_update_target(rel)
-        data = modelscope_file_bytes(rel)
+        def on_chunk(name, received, total):
+            if progress:
+                progress(name, received, total, index, len(files))
+        data = modelscope_file_bytes(rel, progress=on_chunk) if progress else modelscope_file_bytes(rel)
         stage_path = os.path.abspath(os.path.join(staging_root_abs, *rel.split("/")))
         if os.path.commonpath([staging_root_abs, stage_path]) != staging_root_abs:
             raise ValueError(f"更新暂存路径不安全：{rel}")
@@ -2357,6 +2500,12 @@ def github_update_file_list() -> Tuple[List[str], List[str], List[str]]:
     for entry in entries:
         path = str(entry.get("path") or "").replace("\\", "/")
         if entry.get("type") == "blob" and update_allowed_file(path):
+            try:
+                size = int(entry.get("size") or 0)
+                if size > 0:
+                    UPDATE_FILE_SIZE_HINTS[path] = size
+            except (TypeError, ValueError):
+                pass
             if path.startswith("static/"):
                 static_files.append(path)
             else:
@@ -2406,13 +2555,14 @@ def normalize_update_source(value: str) -> str:
         return "github"
     return source
 
-def stage_update_from_source(source: str, staging_root: str) -> Tuple[List[str], List[str], List[str]]:
+def stage_update_from_source(source: str, staging_root: str, progress: Optional[Any] = None) -> Tuple[List[str], List[str], List[str]]:
     """下载指定源的更新文件到 staging，返回 (root_files, static_files, files)。失败抛异常。"""
     if source == "modelscope":
-        download_modelscope_update_files(staging_root)
+        files = modelscope_update_file_list()
+        download_modelscope_update_files(staging_root, progress=progress, files=files)
         return staged_update_file_list(staging_root)
     root_files, static_files, files = github_update_file_list()
-    download_github_update_files(files, staging_root)
+    download_github_update_files(files, staging_root, progress=progress)
     return root_files, static_files, files
 
 def validate_staged_update(staging_root: str, root_files: List[str], static_files: List[str]) -> None:
@@ -2568,6 +2718,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         raise HTTPException(status_code=409, detail="正在更新中，请稍后再试")
     staging_root = ""
     requested_source = normalize_update_source(req.source)
+    _begin_update_progress(requested_source)
     # 只在两个用户自有源之间兜底，绝不回退到原作者仓库。
     source_order = [requested_source]
     if req.fallback:
@@ -2583,6 +2734,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         download_errors: List[str] = []
         fallback_used = False
         for idx, candidate in enumerate(source_order):
+            _reset_update_download_attempt(candidate)
             attempt_staging = os.path.join(
                 DATA_DIR, "update_staging",
                 f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{candidate}",
@@ -2592,7 +2744,9 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             label = UPDATE_SOURCE_LABELS.get(candidate, candidate)
             print(f"[update] 尝试下载源 [{idx + 1}/{len(source_order)}] {label}（{candidate}）→ {attempt_staging}")
             try:
-                root_files, static_files, files = stage_update_from_source(candidate, attempt_staging)
+                root_files, static_files, files = stage_update_from_source(
+                    candidate, attempt_staging, progress=_record_update_download
+                )
                 source = candidate
                 staging_root = attempt_staging
                 fallback_used = idx > 0
@@ -2609,6 +2763,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             print(f"[update] 所有下载源均失败 → {detail}")
             raise HTTPException(status_code=502, detail=f"所有下载源均失败 → {detail}")
 
+        _set_update_progress(phase="validating", current_file="")
         validate_staged_update(staging_root, root_files, static_files)
 
         new_version = ""
@@ -2626,6 +2781,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         except Exception:
             update_notes = {}
         # A restore point must be complete before any live file is replaced.
+        _set_update_progress(phase="backing_up", current_file="")
         backup_root = next_update_backup_dir()
         backup_manifest = create_update_backup(
             backup_root,
@@ -2638,6 +2794,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         )
         updated = []
 
+        _set_update_progress(phase="replacing", current_file="static/")
         staged_static_dir = os.path.join(staging_root, "static")
         if not os.path.isdir(staged_static_dir):
             raise RuntimeError("更新源的 static 暂存目录不存在，已取消更新")
@@ -2658,6 +2815,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         replaced_root_files = []
         try:
             for rel in root_files:
+                _set_update_progress(current_file=rel)
                 target = safe_update_target(rel)
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 temp_path = f"{target}.update_tmp"
@@ -2683,8 +2841,10 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
 
         restart_scheduled = False
         if req.auto_restart and updated:
+            _set_update_progress(phase="restarting", current_file="")
             restart_scheduled = schedule_self_restart(req.restart_delay)
         pruned_backups = prune_update_backups({os.path.basename(backup_root)})
+        _finish_update_progress("complete")
         return {
             "ok": True,
             "source": source,
@@ -2702,9 +2862,11 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             "restart_required": True,
             "restart_scheduled": restart_scheduled,
         }
-    except HTTPException:
+    except HTTPException as exc:
+        _finish_update_progress("failed", str(exc.detail))
         raise
     except Exception as exc:
+        _finish_update_progress("failed", str(exc))
         raise HTTPException(status_code=500, detail=f"更新失败：{exc}") from exc
     finally:
         if staging_root and os.path.isdir(staging_root):

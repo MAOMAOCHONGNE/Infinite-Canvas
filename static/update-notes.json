@@ -1,10 +1,10 @@
 {
-  "version": "2026.08.17-custom.1",
+  "version": "2026.08.17-custom.2",
   "updated_at": "2026-08-17T00:00:00+08:00",
   "items": [
     {
       "type": "fix",
-      "text": "修复BUG"
+      "text": "新增更新下载进度显示"
     }
   ]
 }

@@ -23,11 +23,11 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.12-custom.2.1785863220"></script>
-    <script src="/static/js/theme.js?v=2026.08.12-custom.2.1785863206"></script>
-    <script src="/static/js/i18n.js?v=2026.08.12-custom.2.1786671034"></script>
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.17-custom.2.1785863220"></script>
+    <script src="/static/js/theme.js?v=2026.08.17-custom.2.1785863206"></script>
+    <script src="/static/js/i18n.js?v=2026.08.17-custom.2.1786671034"></script>
     <style>
-        @import url('/static/vendor/css/fonts.css?v=2026.08.12-custom.2.1785863213');
+        @import url('/static/vendor/css/fonts.css?v=2026.08.17-custom.2.1785863213');
 
         /* 本地 Tailwind 工具类兜底：CDN 慢/未就绪时也能立刻给图标尺寸，避免首屏左侧栏空白 */
         .w-1\.5 { width: 0.375rem; }
@@ -1038,6 +1038,19 @@
         .update-modal-summary.ok .update-modal-dot { background:#22c55e; }
         .update-modal-summary.warn .update-modal-dot { background:#f59e0b; }
         .update-modal-summary.fail .update-modal-dot { background:#ef4444; }
+        .update-progress-panel { margin-top:12px; padding:12px; border:1px solid #dbeafe; border-radius:8px; background:#f8fbff; }
+        .update-progress-top { display:flex; align-items:center; justify-content:space-between; gap:10px; color:#334155; font-size:11px; font-weight:800; }
+        .update-progress-percent { color:#0f766e; font-variant-numeric:tabular-nums; }
+        .update-progress-track { height:8px; margin:9px 0 10px; overflow:hidden; border-radius:99px; background:#e2e8f0; }
+        .update-progress-bar { width:0%; height:100%; border-radius:inherit; background:#14b8a6; transition:width .25s ease; }
+        .update-progress-details { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px 14px; color:#64748b; font-size:11px; line-height:1.45; }
+        .update-progress-details strong { color:#334155; font-weight:850; }
+        .update-progress-file { grid-column:1 / -1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#475569; }
+        #project-update-modal.is-updating .update-source-list,
+        #project-update-modal.is-updating #project-update-notes,
+        #project-update-modal.is-updating #connectivity-test-btn,
+        #project-update-modal.is-updating #project-update-rollback-btn { display:none !important; }
+        @media (max-width:640px) { .update-progress-details { grid-template-columns:1fr; } .update-progress-file { grid-column:1; } }
 
         /* qianse70 定制版只有一个可信更新源。 */
         #project-update-modal .studio-modal-panel { width:min(880px, 100%); max-height:min(840px, calc(100vh - 48px)); }
@@ -1261,6 +1274,23 @@
             border-color:#25262b;
             color:#9aa6b8;
         }
+
+        html.theme-dark .update-progress-panel,
+        body.theme-dark .update-progress-panel {
+            background:#0c0d10;
+            border-color:#253746;
+        }
+
+        html.theme-dark .update-progress-track,
+        body.theme-dark .update-progress-track { background:#252a32; }
+
+        html.theme-dark .update-progress-top,
+        body.theme-dark .update-progress-top,
+        html.theme-dark .update-progress-file,
+        body.theme-dark .update-progress-file { color:#cbd5e1; }
+
+        html.theme-dark .update-progress-details,
+        body.theme-dark .update-progress-details { color:#94a3b8; }
 
         html.theme-dark .update-notes-box,
         body.theme-dark .update-notes-box {
@@ -1664,16 +1694,16 @@
         </script>
 
         <main class="stage">
-            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.08.12-custom.2.1786698066" class="active" scrolling="yes"></iframe>
-            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.08.12-custom.2.1786698066" scrolling="yes"></iframe>
-            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.08.12-custom.2.1786698066" scrolling="yes"></iframe>
-            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.08.12-custom.2.1786698066" scrolling="yes"></iframe>
-            <iframe id="frame-online" data-src="/static/online.html?v=2026.08.12-custom.2.1786698066" scrolling="yes"></iframe>
-            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.08.12-custom.2.1786698066" scrolling="yes"></iframe>
-            <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.08.12-custom.2.1786698066" scrolling="yes"></iframe>
-            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.12-custom.2.1786897786" scrolling="yes"></iframe>
-            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.12-custom.2.1786698066" scrolling="yes"></iframe>
-        <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.12-custom.2.1786897786" scrolling="yes"></iframe>
+            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.08.17-custom.2.1786901419" class="active" scrolling="yes"></iframe>
+            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.08.17-custom.2.1786930487" scrolling="yes"></iframe>
+            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.08.17-custom.2.1786901419" scrolling="yes"></iframe>
+            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.08.17-custom.2.1786930487" scrolling="yes"></iframe>
+            <iframe id="frame-online" data-src="/static/online.html?v=2026.08.17-custom.2.1786901419" scrolling="yes"></iframe>
+            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.08.17-custom.2.1786930487" scrolling="yes"></iframe>
+            <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.08.17-custom.2.1786930487" scrolling="yes"></iframe>
+            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.17-custom.2.1786930487" scrolling="yes"></iframe>
+            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.17-custom.2.1786930487" scrolling="yes"></iframe>
+        <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.17-custom.2.1786930487" scrolling="yes"></iframe>
 
         </main>
     </div>
@@ -1741,6 +1771,18 @@
                         <span id="project-update-summary-text"></span>
                     </div>
                 </div>
+                <div id="project-update-progress-panel" class="update-progress-panel" hidden>
+                    <div class="update-progress-top"><span id="project-update-progress-phase">准备更新</span><span id="project-update-progress-percent" class="update-progress-percent">0%</span></div>
+                    <div class="update-progress-track"><div id="project-update-progress-bar" class="update-progress-bar"></div></div>
+                    <div class="update-progress-details">
+                        <div id="project-update-progress-files">文件：正在统计</div>
+                        <div id="project-update-progress-size">大小：正在统计</div>
+                        <div id="project-update-progress-speed">速度：计算中</div>
+                        <div id="project-update-progress-time">已用：0 秒</div>
+                        <div id="project-update-progress-eta">预计剩余：计算中</div>
+                        <div id="project-update-progress-file" class="update-progress-file">当前文件：等待开始</div>
+                    </div>
+                </div>
             </div>
             <div class="studio-modal-actions">
                 <button id="connectivity-test-btn" class="studio-modal-btn" type="button" onclick="runUpdateConnectivityTest()">
@@ -1790,7 +1832,6 @@
         let appInfo = { version:'', edition:'qianse70', update_channel:'my-custom', repo_url:PROJECT_URL, version_url:'https://raw.githubusercontent.com/MAOMAOCHONGNE/Infinite-Canvas/my-custom/VERSION' };
         let updateConnectivityResult = null;
         let projectUpdateRunning = false;
-        let projectUpdateAbort = null;  // 当前更新请求的 AbortController，便于用户中途取消
         const savedUpdateSource = localStorage.getItem('studio_update_source');
         let updateSource = ['github', 'modelscope'].includes(savedUpdateSource) ? savedUpdateSource : 'github';
         let projectUpdateNotes = null;
@@ -2417,7 +2458,7 @@
                 `This updates main.py, VERSION, and static files from ${sourceName}. A backup is created first, then the backend restarts automatically. Current ${versionLabel(localVersion)}, latest ${versionLabel(remoteVersion || localVersion)}.`
             );
             if(testText) testText.textContent = updateConnectivityResult ? updateUiText('重新测试', 'Retest') : updateUiText('测试连通性', 'Test connectivity');
-            if(cancelText) cancelText.textContent = updateUiText('取消', 'Cancel');
+            if(cancelText) cancelText.textContent = updateUiText('关闭', 'Close');
             if(confirmText && !projectUpdateRunning) confirmText.textContent = updateUiText('开始更新', 'Start update');
             if(closeBtn) {
                 closeBtn.title = updateUiText('关闭', 'Close');
@@ -2468,6 +2509,11 @@
         function openProjectUpdateModal() {
             const modal = document.getElementById('project-update-modal');
             if(!modal) return;
+            if(!projectUpdateRunning) {
+                modal.classList.remove('is-updating');
+                const progressPanel = document.getElementById('project-update-progress-panel');
+                if(progressPanel) progressPanel.hidden = true;
+            }
             updateConnectivityResult = null;
             refreshProjectUpdateModalText();
             modal.hidden = false;
@@ -2475,10 +2521,7 @@
         }
 
         function closeProjectUpdateModal() {
-            // 更新进行中允许关闭：中止在途请求并恢复 UI，避免「卡在更新中、无法关闭」
-            if(projectUpdateRunning) {
-                try { projectUpdateAbort?.abort(); } catch(e) {}
-            }
+            // 更新由后端继续执行；关闭弹窗只隐藏界面，避免误点导致 staging 被打断。
             const modal = document.getElementById('project-update-modal');
             if(modal) modal.hidden = true;
         }
@@ -2622,6 +2665,82 @@
             }
         }
 
+        let projectUpdateProgressTimer = null;
+        function formatUpdateBytes(value) {
+            const bytes = Number(value || 0);
+            if(!bytes) return '0 B';
+            const units = ['B','KB','MB','GB'];
+            const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+            return `${(bytes / Math.pow(1024, index)).toFixed(index ? 1 : 0)} ${units[index]}`;
+        }
+        function formatUpdateDuration(value) {
+            const seconds = Math.max(0, Math.round(Number(value || 0)));
+            if(seconds < 60) return `${seconds} 秒`;
+            const minutes = Math.floor(seconds / 60);
+            const rest = seconds % 60;
+            return `${minutes} 分 ${rest} 秒`;
+        }
+        function updateProgressPhaseLabel(phase, isEn) {
+            const labels = { listing:isEn?'Listing files':'正在统计文件', downloading:isEn?'Downloading':'正在下载', validating:isEn?'Validating':'正在校验', backing_up:isEn?'Creating backup':'正在创建备份', replacing:isEn?'Replacing files':'正在替换文件', restarting:isEn?'Restarting backend':'正在重启后端', complete:isEn?'Complete':'更新完成', failed:isEn?'Failed':'更新失败' };
+            return labels[phase] || (isEn ? 'Preparing update' : '准备更新');
+        }
+        function renderUpdateProgress(data) {
+            const panel = document.getElementById('project-update-progress-panel');
+            if(!panel || !data) return;
+            const showProgress = data.running || ['complete','failed'].includes(data.phase);
+            panel.hidden = !showProgress;
+            document.getElementById('project-update-modal')?.classList.toggle('is-updating', showProgress);
+            const totalFiles = Number(data.total_files || 0);
+            const completedFiles = Math.min(totalFiles || 0, Number(data.completed_files || 0));
+            const totalBytes = Number(data.total_bytes || 0);
+            const downloadedBytes = Number(data.downloaded_bytes || 0);
+            const currentFileBytes = Number(data.current_file_bytes || 0);
+            const currentFileTotal = Number(data.current_file_total || 0);
+            const currentFraction = currentFileTotal && currentFileBytes < currentFileTotal ? currentFileBytes / currentFileTotal : 0;
+            const filePercent = totalFiles ? ((completedFiles + currentFraction) / totalFiles) * 100 : 0;
+            const bytePercent = totalBytes ? (downloadedBytes / totalBytes) * 100 : filePercent;
+            const percent = Math.max(0, Math.min(100, data.phase === 'complete' ? 100 : bytePercent));
+            const isEn = window.StudioI18n?.lang?.() === 'en';
+            const phase = document.getElementById('project-update-progress-phase');
+            const pct = document.getElementById('project-update-progress-percent');
+            const bar = document.getElementById('project-update-progress-bar');
+            const files = document.getElementById('project-update-progress-files');
+            const size = document.getElementById('project-update-progress-size');
+            const speed = document.getElementById('project-update-progress-speed');
+            const elapsed = document.getElementById('project-update-progress-time');
+            const eta = document.getElementById('project-update-progress-eta');
+            const current = document.getElementById('project-update-progress-file');
+            if(phase) {
+                const sourceSuffix = data.source_label && ['listing','downloading'].includes(data.phase) ? ` · ${data.source_label}` : '';
+                phase.textContent = `${updateProgressPhaseLabel(data.phase, isEn)}${sourceSuffix}`;
+            }
+            if(pct) pct.textContent = `${Math.round(percent)}%`;
+            if(bar) bar.style.width = `${percent}%`;
+            if(files) files.textContent = isEn ? `Downloaded: ${completedFiles} / ${totalFiles || '?'}` : `已下载文件：${completedFiles} / ${totalFiles || '统计中'}`;
+            if(size) size.textContent = isEn ? `Size: ${formatUpdateBytes(downloadedBytes)} / ${totalBytes ? formatUpdateBytes(totalBytes) : 'calculating'}` : `下载大小：${formatUpdateBytes(downloadedBytes)} / ${totalBytes ? formatUpdateBytes(totalBytes) : '计算中'}`;
+            if(speed) speed.textContent = isEn ? `Speed: ${data.speed_bps ? `${formatUpdateBytes(data.speed_bps)}/s` : 'calculating'}` : `速度：${data.speed_bps ? `${formatUpdateBytes(data.speed_bps)}/秒` : '计算中'}`;
+            if(elapsed) elapsed.textContent = isEn ? `Elapsed: ${formatUpdateDuration(data.elapsed_seconds)}` : `已用：${formatUpdateDuration(data.elapsed_seconds)}`;
+            if(eta) eta.textContent = isEn ? `Remaining: ${data.eta_seconds != null ? formatUpdateDuration(data.eta_seconds) : 'calculating'}` : `预计剩余：${data.eta_seconds != null ? formatUpdateDuration(data.eta_seconds) : '计算中'}`;
+            if(current) current.textContent = isEn ? `Current file: ${data.current_file || 'waiting'}` : `当前文件：${data.current_file || '等待开始'}`;
+        }
+        async function pollProjectUpdateProgress() {
+            try {
+                const res = await fetch('/api/update-progress', {cache:'no-store'});
+                if(!res.ok) return;
+                const data = await res.json();
+                renderUpdateProgress(data);
+                if(!data.running && ['complete','failed'].includes(data.phase)) stopProjectUpdateProgressPolling();
+            } catch(e) {}
+        }
+        function startProjectUpdateProgressPolling() {
+            stopProjectUpdateProgressPolling();
+            pollProjectUpdateProgress();
+            projectUpdateProgressTimer = setInterval(pollProjectUpdateProgress, 700);
+        }
+        function stopProjectUpdateProgressPolling() {
+            if(projectUpdateProgressTimer) { clearInterval(projectUpdateProgressTimer); projectUpdateProgressTimer = null; }
+        }
+
         async function confirmProjectUpdate() {
             const isEn = window.StudioI18n?.lang?.() === 'en';
             const btn = document.getElementById('update-now-btn');
@@ -2637,10 +2756,11 @@
             if(text) text.textContent = isEn ? 'Updating...' : '更新中...';
             if(confirmText) confirmText.textContent = isEn ? 'Updating...' : '更新中...';
             const sourceName = updateSourceLabel();
+            startProjectUpdateProgressPolling();
             setUpdateSummary('warn', isEn ? 'Updating' : '正在更新', isEn ? `Downloading files from ${sourceName} and creating a local backup.` : `正在从 ${sourceName} 下载文件，并创建本地备份。`);
             // 客户端兜底超时：即使后端异常挂起，UI 也能恢复，不会永远停在「更新中」
             const ac = new AbortController();
-            const killer = setTimeout(() => ac.abort(), 300000);
+            const killer = setTimeout(() => ac.abort(), 1800000);
             try {
                 const res = await fetch('/api/update-from-github', {
                     method:'POST',
@@ -2651,6 +2771,7 @@
                 const data = await res.json().catch(() => ({}));
                 if(!res.ok) throw new Error(data.detail || (isEn ? 'Update failed' : '更新失败'));
                 if(data.update_notes) setProjectUpdateNotes(data.update_notes);
+                await pollProjectUpdateProgress();
                 const restarting = data.restart_scheduled;
                 const usedLabel = data.source_label || updateSourceLabel(data.source);
                 const fallbackNote = data.fallback_used
@@ -2678,8 +2799,10 @@
                     ? (isEn ? 'Update timed out. Check your network, then retry.' : '更新超时。请检查网络后重试。')
                     : describeNetworkError(e, isEn);
                 setUpdateSummary('fail', isEn ? 'Update failed' : '更新失败', msg);
+                await pollProjectUpdateProgress();
             } finally {
                 clearTimeout(killer);
+                stopProjectUpdateProgressPolling();
                 projectUpdateRunning = false;
                 if(btn) btn.disabled = false;
                 if(confirmBtn) confirmBtn.disabled = false;
@@ -2806,7 +2929,7 @@
             }
         }
     </script>
-    <script src="/static/js/global-prompt-library.js?v=2026.08.12-custom.2.1786676777"></script>
+    <script src="/static/js/global-prompt-library.js?v=2026.08.17-custom.2.1786676777"></script>
 </body>
 
 </html>

@@ -90,7 +90,7 @@ test('custom version and update notes form one release identity', () => {
     const main = fs.readFileSync(MAIN_PATH, 'utf8');
     assert.match(version, /^\d{4}\.\d{2}\.\d{2}-custom\.\d+$/);
     assert.equal(notes.version, version);
-    assert.deepEqual(notes.items, [{ type: 'fix', text: '修复BUG' }]);
+    assert.deepEqual(notes.items, [{ type: 'fix', text: '新增更新下载进度显示' }]);
     assert.match(main, /"edition":\s*CUSTOM_MAINTAINER/);
     assert.match(main, /"update_channel":\s*CUSTOM_UPDATE_BRANCH/);
     assert.match(main, /"upstream_repo_url":\s*UPSTREAM_REPO_URL/);
