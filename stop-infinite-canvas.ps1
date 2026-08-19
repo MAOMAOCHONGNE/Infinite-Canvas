@@ -1,6 +1,9 @@
 param(
     [ValidateRange(1, 65535)]
-    [int]$Port = 3000
+    [int]$Port = 3000,
+    [switch]$ForcePortOwner,
+    [ValidateRange(1, 10)]
+    [int]$MaxAttempts = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -85,6 +88,51 @@ $listenerIds = @(Get-PortListeners)
 if ($listenerIds.Count -eq 0) {
     Write-Host ("服务未运行：{0} 端口当前没有被占用。" -f $Port) -ForegroundColor Yellow
     exit 0
+}
+
+if ($ForcePortOwner) {
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $listenerIds = @(Get-PortListeners)
+        if ($listenerIds.Count -eq 0) {
+            Write-Host ("处理成功：{0} 端口已经释放。" -f $Port) -ForegroundColor Green
+            exit 0
+        }
+
+        Write-Host ("检测到 {0} 端口被占用，正在清理（第 {1}/{2} 轮）..." -f $Port, $attempt, $MaxAttempts) -ForegroundColor Yellow
+        foreach ($processId in $listenerIds) {
+            $processInfo = Get-ProcessInfo ([int]$processId)
+            if (-not $processInfo) {
+                Write-Host ("PID {0} 已经退出，等待端口状态更新。" -f $processId) -ForegroundColor Yellow
+                continue
+            }
+
+            $processName = if ($processInfo.Name) { [string]$processInfo.Name } else { "未知程序" }
+            $processPath = if ($processInfo.ExecutablePath) { [string]$processInfo.ExecutablePath } else { "路径不可用" }
+            Write-Host ("程序：{0}" -f $processName)
+            Write-Host ("PID： {0}" -f $processId)
+            Write-Host ("路径：{0}" -f $processPath)
+            [void](Stop-ExactProcess $processInfo "占用端口的程序")
+        }
+
+        Start-Sleep -Milliseconds 700
+    }
+
+    $remaining = @(Get-PortListeners)
+    if ($remaining.Count -eq 0) {
+        Write-Host ("处理成功：{0} 端口已经释放。" -f $Port) -ForegroundColor Green
+        exit 0
+    }
+
+    Write-Host ""
+    Write-Host ("清理失败：{0} 端口仍被占用。" -f $Port) -ForegroundColor Red
+    foreach ($processId in $remaining) {
+        $processInfo = Get-ProcessInfo ([int]$processId)
+        $processName = if ($processInfo -and $processInfo.Name) { [string]$processInfo.Name } else { "未知程序" }
+        $processPath = if ($processInfo -and $processInfo.ExecutablePath) { [string]$processInfo.ExecutablePath } else { "路径不可用" }
+        Write-Host ("程序：{0}，PID：{1}，路径：{2}" -f $processName, $processId, $processPath) -ForegroundColor Yellow
+    }
+    Write-Host "请使用管理员身份重新运行启动服务。" -ForegroundColor Yellow
+    exit 1
 }
 
 $ownProcesses = @()

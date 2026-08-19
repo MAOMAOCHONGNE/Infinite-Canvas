@@ -91,8 +91,9 @@ test('custom version and update notes form one release identity', () => {
     assert.match(version, /^\d{4}\.\d{2}\.\d{2}-custom\.\d+$/);
     assert.equal(notes.version, version);
     assert.deepEqual(notes.items, [
-        { type: 'fix', text: '完善 RunningHub 跨页面排队、远程取消与任务状态控制' },
-        { type: 'fix', text: '完善版本管理、备份导入刷新及 Windows 启停脚本' }
+        { type: 'fix', text: '优化普通画布 LLM 长文本工作台、分段总览与节点高度分配' },
+        { type: 'fix', text: '完善普通画布 API 图片引用删除、缩略图与提示词区域布局' },
+        { type: 'fix', text: '迁移 FastAPI 生命周期并优化 Windows 启停脚本' }
     ]);
     assert.match(main, /"edition":\s*CUSTOM_MAINTAINER/);
     assert.match(main, /"update_channel":\s*CUSTOM_UPDATE_BRANCH/);

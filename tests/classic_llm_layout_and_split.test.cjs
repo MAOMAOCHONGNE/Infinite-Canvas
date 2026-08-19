@@ -23,6 +23,7 @@ test('new classic LLM nodes default to LLM mode with output splitting disabled',
     assert.match(block, /mode\s*:\s*['"]node['"]/);
     assert.match(block, /llmOutputSplitEnabled\s*:\s*false/);
     assert.match(block, /llmOutputSeparator\s*:\s*['"]----['"]/);
+    assert.match(block, /llmOutputHeight\s*:\s*110/);
 });
 
 test('classic LLM output split helpers preserve raw output and normalize downstream text', () => {
@@ -70,6 +71,11 @@ test('classic LLM layout follows mode, input, output, split, model, and action o
     assert.match(nodeBlock, /data-prompt-template-open/);
     assert.match(nodeBlock, /data-lucide="library"/);
     assert.match(nodeBlock, /data-lucide="copy"/);
+    assert.match(nodeBlock, /data-llm-expand="input"/);
+    assert.match(nodeBlock, /data-llm-expand="output"/);
+    assert.match(nodeBlock, /data-llm-expand="segments"/);
+    assert.match(nodeBlock, /data-llm-expand="system"/);
+    assert.match(nodeBlock, /data-lucide="maximize-2"/);
     assert.match(nodeBlock, /data-lucide="split"/);
     assert.match(nodeBlock, /data-lucide="\$\{node\.showSystem \? 'toggle-right' : 'toggle-left'\}"/);
     assert.match(nodeBlock, /data-lucide="play"/);
@@ -183,4 +189,33 @@ test('classic LLM redesign has scoped styles, localized labels, and cache busts'
     assert.match(css, /\.llm-bottom-actions \.llm-run\s*\{[^}]*width:auto/s);
     assert.match(html, /canvas\.css\?v=[^"']+/);
     assert.match(html, /canvas\.js\?v=[^"']+/);
+});
+
+test('classic LLM prompt workspace has a large editor, remembered sizing, and split-aware node growth', () => {
+    const source = fs.readFileSync(SOURCE_PATH, 'utf8');
+    const css = fs.readFileSync(CSS_PATH, 'utf8');
+    const html = fs.readFileSync(HTML_PATH, 'utf8');
+    const block = sourceBlock(source, 'const CLASSIC_LLM_PROMPT_WORKSPACE_SIZE_KEY', 'function renderLLMBody');
+
+    assert.match(html, /id="llmPromptWorkspaceModal"/);
+    assert.match(html, /id="llmPromptWorkspaceEditor"/);
+    assert.match(html, /id="llmPromptWorkspaceSegments"/);
+    assert.match(css, /\.llm-prompt-workspace-panel\s*\{[^}]*width:700px;[^}]*height:700px;/s);
+    assert.match(css, /\.llm-prompt-workspace-editor/);
+    assert.match(css, /\.llm-prompt-workspace-segment-index/);
+    assert.match(css, /\.node\.sized\.llm-node \.llm-output-wrap\s*\{[^}]*min-height:0;/s);
+    assert.match(css, /\.llm-expand-btn/);
+    assert.match(block, /classic_llm_prompt_workspace_size_v1/);
+    assert.match(block, /classic_llm_prompt_workspace_font_v1/);
+    assert.match(block, /CLASSIC_LLM_PROMPT_WORKSPACE_FONTS/);
+    assert.match(block, /\{id:'segments', label:'分段结果'\}/);
+    assert.match(block, /openLLMPromptWorkspace/);
+    assert.match(block, /closeLLMPromptWorkspace/);
+    assert.match(block, /classicLLMNodePaneHeights/);
+    assert.match(block, /rawOutputHeight && rawOutputHeight !== 150 \? rawOutputHeight : 110/);
+    assert.match(block, /outputHeight:splitEnabled \? outputBase : outputBase \+ userExtraHeight/);
+    assert.match(block, /segmentsHeight:splitEnabled \? segmentsBase \+ userExtraHeight : segmentsBase/);
+    assert.match(block, /classicLLMPromptWorkspaceSegmentsHtml/);
+    assert.match(block, /llmInputText\(node\)[\s\S]*readonly:Boolean\(connectedInput\)/);
+    assert.match(source, /syncClassicLLMNodePaneHeights\(resizeNode\.node,\s*el\)/);
 });

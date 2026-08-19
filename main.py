@@ -30,6 +30,7 @@ import html
 import ipaddress
 import socket
 import xml.etree.ElementTree as ET
+from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
 import httpx
@@ -79,7 +80,12 @@ class QuietAccessLogFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(QuietAccessLogFilter())
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await run_startup_initialization()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -192,7 +198,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.08.18-custom.1"
+APP_VERSION = "2026.08.19-custom.1"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -207,8 +213,7 @@ MODELSCOPE_VERSION_URL = MODELSCOPE_FILE_API_ROOT + "VERSION"
 MODELSCOPE_UPDATE_NOTES_URL = MODELSCOPE_FILE_API_ROOT + "static/update-notes.json"
 MODELSCOPE_TREE_URL = "https://www.modelscope.cn/api/v1/studio/qisese70/Infinite-Canvas/repo/files?Revision=master&Recursive=true"
 
-@app.on_event("startup")
-async def startup_event():
+async def run_startup_initialization():
     global GLOBAL_LOOP
     GLOBAL_LOOP = asyncio.get_running_loop()
     sync_static_html_versions()

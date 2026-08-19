@@ -361,6 +361,12 @@ function revealCanvasAssetControls(){
 revealCanvasAssetControls();
 const logModal = document.getElementById('logModal');
 const logList = document.getElementById('logList');
+const llmPromptWorkspaceModal = document.getElementById('llmPromptWorkspaceModal');
+const llmPromptWorkspacePanel = document.getElementById('llmPromptWorkspacePanel');
+const llmPromptWorkspaceTabs = document.getElementById('llmPromptWorkspaceTabs');
+const llmPromptWorkspaceFont = document.getElementById('llmPromptWorkspaceFont');
+const llmPromptWorkspaceEditor = document.getElementById('llmPromptWorkspaceEditor');
+const llmPromptWorkspaceSegments = document.getElementById('llmPromptWorkspaceSegments');
 const canvasShortcutController = window.CanvasShortcutsHelp?.mountShortcutHelp({
     modal:canvasShortcutModal,
     toggle:canvasShortcutToggle,
@@ -2952,7 +2958,7 @@ function addLLMNode(point){
         llmOutputSplitEnabled:false,
         llmOutputSeparator:'----',
         llmInputHeight:110,
-        llmOutputHeight:150,
+        llmOutputHeight:110,
         running:false
     });
 }
@@ -8240,6 +8246,98 @@ function classicImageMentionActiveRefs(node, mode='api'){
         CANVAS_REFERENCE_IMAGE_MAX
     );
 }
+function classicApiReferenceItems(node, sourceList=[]){
+    if(!node) return [];
+    const sources = Array.isArray(sourceList) ? sourceList : [];
+    const incoming = connections.filter(connection => connection.to === node.id);
+    const entries = [];
+    const byUrl = new Map();
+    const addReference = (ref, source=null, connectionIds=[]) => {
+        const url = String(ref?.url || '').trim();
+        if(!url) return null;
+        let entry = byUrl.get(url);
+        if(!entry){
+            if(entries.length >= CANVAS_REFERENCE_IMAGE_MAX) return null;
+            entry = {url, ref:{...ref, url, kind:'image'}, sources:[], connectionIds:new Set(), mention:null};
+            byUrl.set(url, entry);
+            entries.push(entry);
+        }
+        if(source && !entry.sources.some(item => item.id === source.id)) entry.sources.push(source);
+        connectionIds.forEach(id => { if(id) entry.connectionIds.add(id); });
+        return entry;
+    };
+    sources.forEach(source => {
+        const sourceNodeIds = new Set([
+            source?.groupId,
+            ...(source?.refs || []).map(ref => ref?.nodeId),
+        ].filter(Boolean).map(String));
+        const connectionIds = incoming.filter(connection => {
+            const from = String(connection.from || '');
+            const sourceId = String(source?.id || '');
+            return sourceNodeIds.has(from) || sourceId === from || sourceId.startsWith(`${from}:`);
+        }).map(connection => connection.id);
+        imageRefsOnly(source?.refs || []).forEach(ref => addReference(ref, source, connectionIds));
+    });
+    classicImageMentionActiveRefs(node, 'api').forEach(mention => {
+        const entry = addReference(mention);
+        if(entry) entry.mention = mention;
+    });
+    const sourceUseCounts = new Map();
+    entries.forEach(entry => entry.sources.forEach(source => sourceUseCounts.set(source.id, (sourceUseCounts.get(source.id) || 0) + 1)));
+    return entries.map((entry, index) => {
+        const sourceIds = entry.sources.map(source => source.id);
+        const reorderable = sourceIds.length === 1 && sourceUseCounts.get(sourceIds[0]) === 1;
+        const source = entry.sources[0] || null;
+        return {
+            id:`api-reference-${node.id}-${index}`,
+            reorderId:reorderable ? sourceIds[0] : '',
+            reorderable,
+            label:source?.label || entry.ref.name || outputImageName(entry.url) || `图片${index + 1}`,
+            preview:entry.ref.thumbnail || entry.url,
+            refs:[entry.ref],
+            referenceUrl:entry.url,
+            sourceIds,
+            connectionIds:[...entry.connectionIds],
+            mention:entry.mention,
+            hasMention:Boolean(entry.mention),
+        };
+    });
+}
+function removeClassicImageMentionRecord(node, mode='api', mention=null){
+    if(!node || !mention || !CLASSIC_IMAGE_MENTION_TOOLS) return false;
+    const fields = classicImageMentionFields(mode);
+    const records = CLASSIC_IMAGE_MENTION_TOOLS.normalizeMentions(node[fields.mentions]);
+    const target = records.find(item => item.id === mention.id)
+        || records.find(item => item.url === mention.url);
+    if(!target) return false;
+    const result = CLASSIC_IMAGE_MENTION_TOOLS.removeMention({
+        text:node[fields.text],
+        mentions:records,
+        mention:target,
+    });
+    node[fields.text] = result.text;
+    node[fields.mentions] = result.mentions;
+    return true;
+}
+function removeClassicApiReference(node, reference){
+    if(!node || !reference) return {mentionRemoved:false, connectionIds:[]};
+    const requestedConnectionIds = new Set(reference.connectionIds || []);
+    const matchingConnections = connections.filter(connection => connection.to === node.id && requestedConnectionIds.has(connection.id));
+    const records = CLASSIC_IMAGE_MENTION_TOOLS?.normalizeMentions(node.localPromptMentions) || [];
+    const mention = reference.hasMention
+        ? (records.find(item => item.id === reference.mention?.id) || records.find(item => item.url === reference.referenceUrl))
+        : null;
+    if(!mention && !matchingConnections.length) return {mentionRemoved:false, connectionIds:[]};
+    pushUndo();
+    const mentionRemoved = mention ? removeClassicImageMentionRecord(node, 'api', mention) : false;
+    const removedConnections = matchingConnections.length
+        ? removeClassicConnections(connection => connection.to === node.id && requestedConnectionIds.has(connection.id))
+        : [];
+    if(removedConnections.length) syncGeneratorInputs();
+    render();
+    scheduleSave();
+    return {mentionRemoved, connectionIds:removedConnections.map(connection => connection.id)};
+}
 function classicImageMentionAssetRefs(){
     const refs = [];
     canvasAssetSourceLibraries().forEach(library => {
@@ -8583,6 +8681,45 @@ function bindClassicImageMentionEditor(input, chips, node, mode='api'){
     input.title = input.title || '输入 @ 选择参考图片';
     if(inline) renderClassicInlineMentionEditor(input, node, mode);
     else renderClassicImageMentionChips(chips, node, mode, input);
+    input.addEventListener('mousedown', event => {
+        if(!event.target.closest?.('[data-classic-inline-mention-remove]')) return;
+        event.preventDefault();
+        event.stopPropagation();
+    }, true);
+    input.addEventListener('click', event => {
+        const button = event.target.closest?.('[data-classic-inline-mention-remove]');
+        const token = button?.closest?.('.classic-inline-mention-token');
+        if(!button || !token || !input.contains(token)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const fields = classicImageMentionFields(mode);
+        const mentions = CLASSIC_IMAGE_MENTION_TOOLS.normalizeMentions(node[fields.mentions]);
+        const mention = mentions.find(item => item.id === token.dataset.mentionId)
+            || mentions.find(item => item.url === token.dataset.url);
+        if(!mention) return;
+        const matchingTokens = [...input.querySelectorAll('.classic-inline-mention-token')].filter(item => {
+            if(mention.id && item.dataset.mentionId) return item.dataset.mentionId === mention.id;
+            return item.dataset.url === mention.url && item.dataset.marker === (mention.marker || mention.name);
+        });
+        const occurrenceIndex = matchingTokens.indexOf(token);
+        if(occurrenceIndex < 0) return;
+        const result = CLASSIC_IMAGE_MENTION_TOOLS.removeMentionOccurrence({
+            text:node[fields.text],
+            mentions,
+            mention,
+            occurrenceIndex,
+        });
+        if(!result.removed) return;
+        pushUndo();
+        node[fields.text] = result.text;
+        node[fields.mentions] = result.mentions;
+        const preview = ensureClassicInlineMentionPreview();
+        preview.hidden = true;
+        preview.querySelector('img')?.removeAttribute('src');
+        if(mode === 'api') refreshNodes([node.id]);
+        else renderClassicInlineMentionEditor(input, node, mode);
+        scheduleSave();
+    }, true);
     input.addEventListener('input', () => {
         const fields = classicImageMentionFields(mode);
         const text = inline ? classicInlineMentionText(input) : input.value;
@@ -8590,6 +8727,7 @@ function bindClassicImageMentionEditor(input, chips, node, mode='api'){
         node[fields.mentions] = CLASSIC_IMAGE_MENTION_TOOLS.pruneMentions(text, node[fields.mentions]);
         if(!inline) renderClassicImageMentionChips(chips, node, mode, input);
         if(inline) classicInlineMentionSelectionOffsets(input);
+        if(inline && mode === 'api') scheduleGeneratorInputSync();
         const mentionQuery = classicImageMentionQueryAtCaret(input);
         if(mentionQuery) openClassicImageMentionPicker(node, mode, input, chips, mentionQuery.query);
         else if(classicImageMentionState?.inputEl === input) closeClassicImageMentionPicker();
@@ -8605,6 +8743,7 @@ function bindClassicImageMentionEditor(input, chips, node, mode='api'){
             document.execCommand('insertText', false, text);
         });
         input.addEventListener('mouseover', event => {
+            if(event.target.closest?.('.classic-inline-mention-remove')) return;
             const token = event.target.closest?.('.classic-inline-mention-token');
             if(!token) return;
             const preview = ensureClassicInlineMentionPreview();
@@ -9989,6 +10128,314 @@ function setClassicLLMSystemPromptEnabled(node, enabled){
     node.showSystem = nextEnabled;
     return true;
 }
+const CLASSIC_LLM_PROMPT_WORKSPACE_SIZE_KEY = 'classic_llm_prompt_workspace_size_v1';
+const CLASSIC_LLM_PROMPT_WORKSPACE_FONT_KEY = 'classic_llm_prompt_workspace_font_v1';
+const CLASSIC_LLM_PROMPT_WORKSPACE_DEFAULT_SIZE = {w:700, h:700};
+const CLASSIC_LLM_PROMPT_WORKSPACE_PANES = [
+    {id:'input', label:'输入提示词'},
+    {id:'output', label:'输出结果'},
+    {id:'segments', label:'分段结果'},
+    {id:'system', label:'系统提示词'},
+];
+const CLASSIC_LLM_PROMPT_WORKSPACE_FONTS = [
+    {id:'small', label:'小', className:'font-small'},
+    {id:'medium', label:'中', className:'font-medium'},
+    {id:'large', label:'大', className:'font-large'},
+    {id:'xlarge', label:'特大', className:'font-xlarge'},
+];
+let llmPromptWorkspaceState = null;
+let llmPromptWorkspaceSaveTimer = null;
+let llmPromptWorkspaceDragState = null;
+let llmPromptWorkspaceResizeState = null;
+function classicLLMNodePaneHeights(node){
+    const inputHeight = Math.max(70, Math.round(Number(node?.llmInputHeight) || 110));
+    const rawOutputHeight = Math.round(Number(node?.llmOutputHeight) || 0);
+    const outputBase = Math.max(70, rawOutputHeight && rawOutputHeight !== 150 ? rawOutputHeight : 110);
+    const segmentsBase = 92;
+    const defaultHeight = Math.max(360, Math.round(Number(defaultNodeSize('llm')?.h) || 590));
+    const systemAutoHeight = node?.showSystem ? CLASSIC_LLM_SYSTEM_PROMPT_HEIGHT_DELTA : 0;
+    const mediaAutoHeight = Math.max(0, Math.round(Number(node?.llmMediaAutoExpanded) || 0));
+    const currentHeight = Math.max(defaultHeight, Math.round(Number(node?.h) || defaultHeight + systemAutoHeight + mediaAutoHeight));
+    const userExtraHeight = Math.max(0, currentHeight - defaultHeight - systemAutoHeight - mediaAutoHeight);
+    const splitEnabled = node?.llmOutputSplitEnabled === true;
+    return {
+        inputHeight,
+        outputHeight:splitEnabled ? outputBase : outputBase + userExtraHeight,
+        segmentsHeight:splitEnabled ? segmentsBase + userExtraHeight : segmentsBase,
+    };
+}
+function syncClassicLLMNodePaneHeights(node, el=canvasNodeElement(node?.id)){
+    if(!node || node.type !== 'llm' || !el) return;
+    const {inputHeight, outputHeight, segmentsHeight} = classicLLMNodePaneHeights(node);
+    const inputEl = el.querySelector('.llm-input-output');
+    const outputEl = el.querySelector('.llm-output-wrap');
+    const segmentsEl = el.querySelector('.llm-output-segments');
+    if(inputEl){
+        inputEl.style.height = `${inputHeight}px`;
+        inputEl.style.flexBasis = `${inputHeight}px`;
+    }
+    if(outputEl){
+        outputEl.style.height = `${outputHeight}px`;
+        outputEl.style.flexBasis = `${outputHeight}px`;
+    }
+    if(segmentsEl){
+        segmentsEl.style.height = `${segmentsHeight}px`;
+        segmentsEl.style.flexBasis = `${segmentsHeight}px`;
+    }
+}
+function classicLLMPromptWorkspaceFontSize(){
+    try {
+        const value = localStorage.getItem(CLASSIC_LLM_PROMPT_WORKSPACE_FONT_KEY);
+        return CLASSIC_LLM_PROMPT_WORKSPACE_FONTS.some(item => item.id === value) ? value : 'medium';
+    } catch(e) {
+        return 'medium';
+    }
+}
+function setClassicLLMPromptWorkspaceFontSize(size){
+    const id = CLASSIC_LLM_PROMPT_WORKSPACE_FONTS.some(item => item.id === size) ? size : 'medium';
+    try { localStorage.setItem(CLASSIC_LLM_PROMPT_WORKSPACE_FONT_KEY, id); } catch(e) {}
+    if(llmPromptWorkspacePanel){
+        CLASSIC_LLM_PROMPT_WORKSPACE_FONTS.forEach(item => llmPromptWorkspacePanel.classList.remove(item.className));
+        llmPromptWorkspacePanel.classList.add(CLASSIC_LLM_PROMPT_WORKSPACE_FONTS.find(item => item.id === id)?.className || 'font-medium');
+    }
+    llmPromptWorkspaceFont?.querySelectorAll('button').forEach(btn => btn.classList.toggle('active', btn.dataset.fontSize === id));
+}
+function classicLLMPromptWorkspaceSafeSize(size={}){
+    const viewportW = Math.max(320, Number(window.innerWidth) || 1024);
+    const viewportH = Math.max(260, Number(window.innerHeight) || 768);
+    const maxW = Math.max(320, viewportW - 24);
+    const maxH = Math.max(260, viewportH - 24);
+    const minW = Math.min(480, maxW);
+    const minH = Math.min(360, maxH);
+    const w = Math.max(minW, Math.min(maxW, Math.round(Number(size.w) || CLASSIC_LLM_PROMPT_WORKSPACE_DEFAULT_SIZE.w)));
+    const h = Math.max(minH, Math.min(maxH, Math.round(Number(size.h) || CLASSIC_LLM_PROMPT_WORKSPACE_DEFAULT_SIZE.h)));
+    return {w, h, minW, minH, maxW, maxH};
+}
+function classicLLMPromptWorkspaceSavedSize(){
+    try {
+        return classicLLMPromptWorkspaceSafeSize(JSON.parse(localStorage.getItem(CLASSIC_LLM_PROMPT_WORKSPACE_SIZE_KEY) || '{}'));
+    } catch(e) {
+        return classicLLMPromptWorkspaceSafeSize(CLASSIC_LLM_PROMPT_WORKSPACE_DEFAULT_SIZE);
+    }
+}
+function saveClassicLLMPromptWorkspaceSize(){
+    if(!llmPromptWorkspacePanel) return;
+    const rect = llmPromptWorkspacePanel.getBoundingClientRect();
+    const size = classicLLMPromptWorkspaceSafeSize({w:rect.width, h:rect.height});
+    try { localStorage.setItem(CLASSIC_LLM_PROMPT_WORKSPACE_SIZE_KEY, JSON.stringify({w:size.w, h:size.h})); } catch(e) {}
+}
+function placeClassicLLMPromptWorkspacePanel(size=classicLLMPromptWorkspaceSavedSize()){
+    if(!llmPromptWorkspacePanel) return;
+    const safe = classicLLMPromptWorkspaceSafeSize(size);
+    const left = Math.max(12, Math.round(((Number(window.innerWidth) || safe.w) - safe.w) / 2));
+    const top = Math.max(12, Math.round(((Number(window.innerHeight) || safe.h) - safe.h) / 2));
+    llmPromptWorkspacePanel.style.width = `${safe.w}px`;
+    llmPromptWorkspacePanel.style.height = `${safe.h}px`;
+    llmPromptWorkspacePanel.style.left = `${left}px`;
+    llmPromptWorkspacePanel.style.top = `${top}px`;
+}
+function classicLLMPromptWorkspaceNode(){
+    return nodes.find(node => node.id === llmPromptWorkspaceState?.nodeId && node.type === 'llm') || null;
+}
+function classicLLMPromptWorkspaceSegmentsHtml(node){
+    if(node?.llmOutputSplitEnabled !== true){
+        return `<div class="llm-prompt-workspace-segments-empty">当前未开启分隔符</div>`;
+    }
+    const items = classicLLMOutputItems(node);
+    if(!items.length){
+        return `<div class="llm-prompt-workspace-segments-empty">暂无分段结果</div>`;
+    }
+    return items.map((item, index) => `
+        <div class="llm-prompt-workspace-segment">
+            <div class="llm-prompt-workspace-segment-index">${index + 1}</div>
+            <div class="llm-prompt-workspace-segment-text">${escapeHtml(item)}</div>
+        </div>
+    `).join('');
+}
+function classicLLMPromptWorkspacePaneInfo(node, pane){
+    const connectedInput = llmInputText(node);
+    if(pane === 'segments'){
+        const count = node?.llmOutputSplitEnabled === true ? classicLLMOutputItems(node).length : 0;
+        return {
+            label:count ? `分段结果 · 共 ${count} 段` : '分段结果',
+            value:'',
+            placeholder:'',
+            readonly:true,
+            segments:true,
+        };
+    }
+    if(pane === 'output'){
+        return {
+            label:'输出结果',
+            value:classicLLMOutputText(node) || '',
+            placeholder:'输出结果为空',
+            readonly:true,
+        };
+    }
+    if(pane === 'system'){
+        return {
+            label:'系统提示词',
+            value:node?.systemPrompt || '',
+            placeholder:tr('canvas.systemPrompt'),
+            readonly:false,
+        };
+    }
+    return {
+        label:'输入提示词',
+        value:connectedInput || node?.userInput || '',
+        placeholder:connectedInput ? '输入来自上游节点' : (langIsEn() ? 'Type input, or connect a Prompt node...' : '直接输入，或连接提示词节点...'),
+        readonly:Boolean(connectedInput),
+    };
+}
+function updateRenderedLLMNodePromptFields(node){
+    const el = canvasNodeElement(node?.id);
+    if(!el) return;
+    const connectedInput = llmInputText(node);
+    const inputEl = el.querySelector('.llm-input-output');
+    if(inputEl && !connectedInput) inputEl.value = node.userInput || '';
+    const sysEl = el.querySelector('.llm-system');
+    if(sysEl) sysEl.value = node.systemPrompt || '';
+    const outputEl = el.querySelector('.llm-result-output');
+    if(outputEl){
+        const matching = classicLLMOutputText(node);
+        outputEl.textContent = matching || (classicLLMHasAnyResult(node) ? tr('canvas.llmNoResultForInput') : tr('canvas.llmOutputEmpty'));
+    }
+    refreshClassicLLMOutputSegmentsUi(el, node);
+}
+function scheduleLLMPromptWorkspaceSave(node){
+    clearTimeout(llmPromptWorkspaceSaveTimer);
+    llmPromptWorkspaceSaveTimer = setTimeout(() => {
+        scheduleSave();
+        updateRenderedLLMNodePromptFields(node);
+    }, 300);
+}
+function renderLLMPromptWorkspace(){
+    if(!llmPromptWorkspaceModal || !llmPromptWorkspacePanel || !llmPromptWorkspaceTabs || !llmPromptWorkspaceFont || !llmPromptWorkspaceEditor) return;
+    const node = classicLLMPromptWorkspaceNode();
+    if(!node){ closeLLMPromptWorkspace(); return; }
+    const pane = CLASSIC_LLM_PROMPT_WORKSPACE_PANES.some(item => item.id === llmPromptWorkspaceState?.pane)
+        ? llmPromptWorkspaceState.pane
+        : 'input';
+    const info = classicLLMPromptWorkspacePaneInfo(node, pane);
+    llmPromptWorkspaceTabs.innerHTML = CLASSIC_LLM_PROMPT_WORKSPACE_PANES.map(item => `<button type="button" data-llm-workspace-pane="${item.id}" class="${item.id === pane ? 'active' : ''}">${escapeHtml(item.label)}</button>`).join('');
+    llmPromptWorkspaceFont.innerHTML = CLASSIC_LLM_PROMPT_WORKSPACE_FONTS.map(item => `<button type="button" data-font-size="${item.id}">${escapeHtml(item.label)}</button>`).join('');
+    const showSegments = Boolean(info.segments);
+    llmPromptWorkspaceEditor.hidden = showSegments;
+    if(llmPromptWorkspaceSegments){
+        llmPromptWorkspaceSegments.hidden = !showSegments;
+        llmPromptWorkspaceSegments.innerHTML = showSegments ? classicLLMPromptWorkspaceSegmentsHtml(node) : '';
+    }
+    llmPromptWorkspaceEditor.value = info.value;
+    llmPromptWorkspaceEditor.placeholder = info.placeholder || '';
+    llmPromptWorkspaceEditor.readOnly = Boolean(info.readonly);
+    llmPromptWorkspaceEditor.dataset.pane = pane;
+    const title = document.getElementById('llmPromptWorkspaceTitle');
+    if(title) title.textContent = `提示词工作台 · ${info.label}`;
+    llmPromptWorkspaceTabs.querySelectorAll('[data-llm-workspace-pane]').forEach(btn => {
+        btn.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+            llmPromptWorkspaceState.pane = btn.dataset.llmWorkspacePane || 'input';
+            renderLLMPromptWorkspace();
+        };
+    });
+    llmPromptWorkspaceFont.querySelectorAll('[data-font-size]').forEach(btn => {
+        btn.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+            setClassicLLMPromptWorkspaceFontSize(btn.dataset.fontSize);
+        };
+    });
+    setClassicLLMPromptWorkspaceFontSize(classicLLMPromptWorkspaceFontSize());
+    llmPromptWorkspaceEditor.oninput = event => {
+        if(showSegments) return;
+        if(pane === 'output') return;
+        if(pane === 'input' && llmInputText(node)) return;
+        if(pane === 'system') node.systemPrompt = event.target.value;
+        else node.userInput = event.target.value;
+        updateRenderedLLMNodePromptFields(node);
+        scheduleLLMPromptWorkspaceSave(node);
+    };
+    refreshIcons();
+}
+function openLLMPromptWorkspace(nodeId, pane='input', event=null){
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const node = nodes.find(item => item.id === nodeId && item.type === 'llm');
+    if(!node || !llmPromptWorkspaceModal || !llmPromptWorkspacePanel) return;
+    llmPromptWorkspaceState = {nodeId:node.id, pane:CLASSIC_LLM_PROMPT_WORKSPACE_PANES.some(item => item.id === pane) ? pane : 'input'};
+    placeClassicLLMPromptWorkspacePanel();
+    llmPromptWorkspaceModal.classList.add('open');
+    renderLLMPromptWorkspace();
+    requestAnimationFrame(() => {
+        if(!llmPromptWorkspaceEditor?.hidden && !llmPromptWorkspaceEditor?.readOnly) llmPromptWorkspaceEditor?.focus();
+    });
+}
+function closeLLMPromptWorkspace(){
+    if(!llmPromptWorkspaceModal) return;
+    if(llmPromptWorkspaceModal.classList.contains('open')) saveClassicLLMPromptWorkspaceSize();
+    llmPromptWorkspaceModal.classList.remove('open');
+    llmPromptWorkspaceState = null;
+}
+function clampLLMPromptWorkspacePanelPosition(left, top, width, height){
+    const viewportW = Math.max(320, Number(window.innerWidth) || 1024);
+    const viewportH = Math.max(260, Number(window.innerHeight) || 768);
+    return {
+        left:Math.max(8, Math.min(Math.max(8, viewportW - width - 8), Math.round(left))),
+        top:Math.max(8, Math.min(Math.max(8, viewportH - height - 8), Math.round(top))),
+    };
+}
+function startLLMPromptWorkspaceDrag(event){
+    if(!llmPromptWorkspacePanel || event.button !== 0 || event.target.closest('button,textarea')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = llmPromptWorkspacePanel.getBoundingClientRect();
+    llmPromptWorkspaceDragState = {sx:event.clientX, sy:event.clientY, left:rect.left, top:rect.top, width:rect.width, height:rect.height};
+    window.addEventListener('mousemove', onLLMPromptWorkspaceDrag);
+    window.addEventListener('mouseup', endLLMPromptWorkspaceChromeDrag);
+}
+function onLLMPromptWorkspaceDrag(event){
+    if(!llmPromptWorkspaceDragState || !llmPromptWorkspacePanel) return;
+    const next = clampLLMPromptWorkspacePanelPosition(
+        llmPromptWorkspaceDragState.left + event.clientX - llmPromptWorkspaceDragState.sx,
+        llmPromptWorkspaceDragState.top + event.clientY - llmPromptWorkspaceDragState.sy,
+        llmPromptWorkspaceDragState.width,
+        llmPromptWorkspaceDragState.height,
+    );
+    llmPromptWorkspacePanel.style.left = `${next.left}px`;
+    llmPromptWorkspacePanel.style.top = `${next.top}px`;
+}
+function startLLMPromptWorkspaceResize(event){
+    if(!llmPromptWorkspacePanel || event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = llmPromptWorkspacePanel.getBoundingClientRect();
+    llmPromptWorkspaceResizeState = {sx:event.clientX, sy:event.clientY, w:rect.width, h:rect.height, left:rect.left, top:rect.top};
+    window.addEventListener('mousemove', onLLMPromptWorkspaceResize);
+    window.addEventListener('mouseup', endLLMPromptWorkspaceChromeDrag);
+}
+function onLLMPromptWorkspaceResize(event){
+    if(!llmPromptWorkspaceResizeState || !llmPromptWorkspacePanel) return;
+    const next = classicLLMPromptWorkspaceSafeSize({
+        w:llmPromptWorkspaceResizeState.w + event.clientX - llmPromptWorkspaceResizeState.sx,
+        h:llmPromptWorkspaceResizeState.h + event.clientY - llmPromptWorkspaceResizeState.sy,
+    });
+    llmPromptWorkspacePanel.style.width = `${next.w}px`;
+    llmPromptWorkspacePanel.style.height = `${next.h}px`;
+    const pos = clampLLMPromptWorkspacePanelPosition(llmPromptWorkspaceResizeState.left, llmPromptWorkspaceResizeState.top, next.w, next.h);
+    llmPromptWorkspacePanel.style.left = `${pos.left}px`;
+    llmPromptWorkspacePanel.style.top = `${pos.top}px`;
+}
+function endLLMPromptWorkspaceChromeDrag(){
+    if(llmPromptWorkspaceResizeState) saveClassicLLMPromptWorkspaceSize();
+    llmPromptWorkspaceDragState = null;
+    llmPromptWorkspaceResizeState = null;
+    window.removeEventListener('mousemove', onLLMPromptWorkspaceDrag);
+    window.removeEventListener('mousemove', onLLMPromptWorkspaceResize);
+    window.removeEventListener('mouseup', endLLMPromptWorkspaceChromeDrag);
+}
+llmPromptWorkspacePanel?.querySelector('[data-llm-workspace-drag]')?.addEventListener('mousedown', startLLMPromptWorkspaceDrag);
+llmPromptWorkspacePanel?.querySelector('[data-llm-workspace-resize]')?.addEventListener('mousedown', startLLMPromptWorkspaceResize);
 function renderLLMBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'llm-body';
@@ -10066,8 +10513,7 @@ function renderLLMNodePane(container, node){
     const connectedInput = llmInputText(node);
     const isReadonly = connectedInput.length > 0;
     const inputValue = connectedInput || node.userInput || '';
-    const inputHeight = Math.max(70, node.llmInputHeight || 110);
-    const outputHeight = Math.max(70, node.llmOutputHeight || 150);
+    const {inputHeight, outputHeight, segmentsHeight} = classicLLMNodePaneHeights(node);
     const inputPlaceholder = langIsEn() ? 'Type input, or connect a Prompt node…' : '直接输入，或连接提示词节点…';
     const outputText = classicLLMOutputText(node);
     const outputDisplay = outputText || (classicLLMHasAnyResult(node) ? tr('canvas.llmNoResultForInput') : tr('canvas.llmOutputEmpty'));
@@ -10079,22 +10525,25 @@ function renderLLMNodePane(container, node){
     container.innerHTML = `
         <div class="llm-pane-label-row llm-input-head">
             <div class="llm-pane-label">${escapeHtml(tr('canvas.llmInputLabel'))}${isReadonly ? ` <span class="llm-connected-label">${escapeHtml(tr('canvas.llmConnectedInput'))}</span>` : ''}</div>
-            <button class="prompt-template-btn llm-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-prompt-template-node-id="${escapeAttr(node.id)}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(templateTitle)}" ${isReadonly ? 'disabled' : ''}><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>
+            <div class="llm-input-head-actions">
+                <button class="prompt-template-btn llm-template-btn ${templateActive ? 'active' : ''}" type="button" data-prompt-template-open data-prompt-template-node-id="${escapeAttr(node.id)}" aria-pressed="${templateActive ? 'true' : 'false'}" title="${escapeAttr(templateTitle)}" ${isReadonly ? 'disabled' : ''}><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>
+                <button class="llm-copy-btn llm-expand-btn" type="button" data-llm-expand="input" title="放大查看"><i data-lucide="maximize-2"></i></button>
+            </div>
         </div>
         <textarea class="llm-input-area llm-input-output" style="height:${inputHeight}px; flex:0 0 ${inputHeight}px;" ${isReadonly ? 'readonly' : ''} placeholder="${inputPlaceholder}">${escapeHtml(inputValue)}</textarea>
         <div class="classic-image-mention-chips empty" data-classic-image-mention-chips data-mention-mode="llm"></div>
         <div class="llm-pane-label-row llm-output-head">
             <div class="llm-pane-label">${escapeHtml(tr('canvas.llmOutputLabel'))}</div>
-            <div class="llm-output-head-actions"><button class="llm-copy-btn llm-output-copy" type="button" title="${escapeAttr(tr('canvas.copy'))}"><i data-lucide="copy"></i></button></div>
+            <div class="llm-output-head-actions"><button class="llm-copy-btn llm-output-copy" type="button" title="${escapeAttr(tr('canvas.copy'))}"><i data-lucide="copy"></i></button><button class="llm-copy-btn llm-expand-btn" type="button" data-llm-expand="output" title="放大查看"><i data-lucide="maximize-2"></i></button></div>
         </div>
         <div class="llm-output-wrap" style="height:${outputHeight}px; flex:0 0 ${outputHeight}px;">
             <div class="llm-output llm-result-output">${escapeHtml(outputDisplay)}</div>
         </div>
         <div class="llm-output-split-tools">
             <button class="prompt-template-btn llm-output-split-toggle ${splitEnabled ? 'active' : ''}" type="button" data-llm-output-split aria-pressed="${splitEnabled ? 'true' : 'false'}" title="${escapeAttr(tr('canvas.llmOutputSeparator'))}"><i data-lucide="split"></i><span>${escapeHtml(tr('canvas.llmOutputSeparator'))}</span></button>
-            ${splitEnabled ? `<label class="llm-output-separator"><span>${escapeHtml(tr('canvas.llmSeparatorValue'))}</span><input data-llm-output-separator value="${escapeAttr(separator)}" spellcheck="false"></label><span class="llm-output-segment-count">${escapeHtml(classicLLMOutputSegmentCountText(node))}</span>` : ''}
+            ${splitEnabled ? `<label class="llm-output-separator"><span>${escapeHtml(tr('canvas.llmSeparatorValue'))}</span><input data-llm-output-separator value="${escapeAttr(separator)}" spellcheck="false"></label><span class="llm-output-segment-count">${escapeHtml(classicLLMOutputSegmentCountText(node))}</span><button class="llm-copy-btn llm-expand-btn llm-segments-expand" type="button" data-llm-expand="segments" title="放大查看全部分段"><i data-lucide="maximize-2"></i></button>` : ''}
         </div>
-        ${splitEnabled ? `<div class="llm-output-segments">${classicLLMOutputSegmentItemsHtml(node)}</div>` : ''}
+        ${splitEnabled ? `<div class="llm-output-segments" style="height:${segmentsHeight}px; flex:0 0 ${segmentsHeight}px;">${classicLLMOutputSegmentItemsHtml(node)}</div>` : ''}
         <div class="llm-model-row">
             <select class="select-lite llm-provider-select" aria-label="${escapeAttr(tr('canvas.apiProvider'))}">${chatProviderOptions(node.llmProvider)}</select>
             <select class="select-lite llm-model" aria-label="${escapeAttr(tr('canvas.model'))}">${chatModelOptions(node.model, node.llmProvider)}</select>
@@ -10103,7 +10552,7 @@ function renderLLMNodePane(container, node){
             <button class="llm-sys-toggle ${node.showSystem ? 'active' : ''}" type="button"><i data-lucide="${node.showSystem ? 'toggle-right' : 'toggle-left'}"></i><span>${escapeHtml(tr(node.showSystem ? 'canvas.llmSystemDisable' : 'canvas.llmSystemEnable'))}</span></button>
             <button class="llm-run ${node.running ? 'running' : ''}" ${node.running ? 'disabled' : ''}><i data-lucide="play"></i><span>${escapeHtml(node.running ? tr('canvas.running') : tr('canvas.llmRun'))}</span></button>
         </div>
-        ${node.showSystem ? `<textarea class="llm-system" placeholder="${escapeAttr(tr('canvas.systemPrompt'))}">${escapeHtml(node.systemPrompt || '')}</textarea>` : ''}
+        ${node.showSystem ? `<div class="llm-system-wrap"><button class="llm-copy-btn llm-expand-btn llm-system-expand" type="button" data-llm-expand="system" title="放大查看"><i data-lucide="maximize-2"></i></button><textarea class="llm-system" placeholder="${escapeAttr(tr('canvas.systemPrompt'))}">${escapeHtml(node.systemPrompt || '')}</textarea></div>` : ''}
         ${cascade ? `<div class="llm-cascade-row">${cascade}</div>` : ''}
         ${retryBarHtml(node)}
     `;
@@ -10131,6 +10580,10 @@ function renderLLMNodePane(container, node){
             openPromptTemplateModal(node.id);
         };
     }
+    container.querySelectorAll('[data-llm-expand]').forEach(btn => {
+        btn.onmousedown = e => e.stopPropagation();
+        btn.onclick = e => openLLMPromptWorkspace(node.id, btn.dataset.llmExpand || 'input', e);
+    });
     const splitToggle = container.querySelector('[data-llm-output-split]');
     splitToggle.onclick = e => {
         e.preventDefault();
@@ -10548,6 +11001,11 @@ function refreshClassicLLMOutputSegmentsUi(container, node){
     const segments = container?.querySelector('.llm-output-segments');
     if(count) count.textContent = classicLLMOutputSegmentCountText(node);
     if(segments) segments.innerHTML = classicLLMOutputSegmentItemsHtml(node);
+    if(llmPromptWorkspaceState?.nodeId === node?.id
+        && llmPromptWorkspaceState?.pane === 'segments'
+        && llmPromptWorkspaceModal?.classList.contains('open')){
+        renderLLMPromptWorkspace();
+    }
 }
 function classicLLMHasAnyResult(node){
     return Boolean(node?.outputText || (Array.isArray(node?.llmResultMemory) && node.llmResultMemory.length));
@@ -10596,7 +11054,7 @@ function renderGeneratorBody(node){
     wrap.className = 'generator-body';
     const inputSources = generatorSources(node);
     const ordered = orderedSources(node, inputSources);
-    const mediaInputs = ordered.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
+    const referenceItems = classicApiReferenceItems(node, ordered);
     const promptInputs = ordered.filter(src => src.prompt);
     const templateActive = promptTemplateModal?.classList.contains('open') && promptTemplateNodeId === node.id;
     sanitizeImageNodeProviderModel(node);
@@ -10725,7 +11183,7 @@ function renderGeneratorBody(node){
     const customWInput = wrap.querySelector('.custom-w-input');
     const customHInput = wrap.querySelector('.custom-h-input');
     const fitSizeBtn = wrap.querySelector('.fit-size-btn');
-    const referenceImages = ordered.flatMap(src => src.refs || []);
+    const referenceImages = referenceItems.flatMap(item => item.refs || []);
     const syncQualityControls = () => {
         qualitySelect.disabled = false;
         if(!['auto','low','medium','high'].includes(String(node.quality || 'auto'))) node.quality = 'auto';
@@ -10967,16 +11425,7 @@ function renderGeneratorBody(node){
         e.target.value = '';
     };
     const list = wrap.querySelector('.input-list');
-    renderImageInputList(list, node, mediaInputs);
-    const connectedMentionRefs = classicImageMentionConnectedRefs(node, 'api');
-    const clickableMentionRefs = mediaInputs.map(source => {
-        const firstRef = imageRefsOnly(source.refs || [])[0];
-        return connectedMentionRefs.find(ref => ref.url === firstRef?.url) || firstRef || null;
-    });
-    [...list.querySelectorAll('.input-item')].forEach((item, index) => {
-        item.dataset.classicImageMentionIndex = String(index);
-    });
-    bindClassicImageMentionThumbnailClicks(list, node, 'api', localPromptInput, localPromptMentionChips, clickableMentionRefs);
+    renderClassicApiReferenceInputs(list, node, ordered, localPromptInput, localPromptMentionChips, referenceItems);
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
     const generateBtn = wrap.querySelector('.gen-btn');
     generateBtn.onmouseenter = () => setClassicCurrentNodePreview(node.id);
@@ -11796,27 +12245,72 @@ function renderImageInputList(list, node, imageInputs, emptyText=null){
     imageInputs.forEach((src, i) => {
         const item = document.createElement('div');
         item.className = 'input-item';
-        item.draggable = true;
-        item.dataset.sourceId = src.id;
+        const reorderable = src.reorderable !== false;
+        const reorderId = src.reorderId || src.id;
+        item.draggable = reorderable;
+        item.dataset.sourceId = reorderId;
+        if(!reorderable) item.classList.add('is-static-reference');
         const previewHtml = src.preview && !isMissingAssetUrl(src.preview) ? canvasPreviewImgHtml(src.preview, 256) : (src.preview ? missingAssetHtml(src.preview, true) : '<i data-lucide="image" class="w-6 h-6 text-slate-400"></i>');
         item.innerHTML = `<span class="input-index">${i + 1}</span>${previewHtml}<span class="input-label">${escapeHtml(src.label)}</span>`;
-        item.ondragstart = e => {
-            e.stopPropagation();
-            internalDrag = true;
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('application/x-canvas-input', src.id);
-        };
-        item.ondragend = () => { internalDrag = false; };
-        item.ondragover = e => { e.preventDefault(); e.stopPropagation(); };
-        item.ondrop = e => {
-            e.preventDefault();
-            e.stopPropagation();
-            reorderInput(node, e.dataTransfer.getData('application/x-canvas-input'), src.id);
-            internalDrag = false;
-        };
+        if(reorderable){
+            item.ondragstart = e => {
+                e.stopPropagation();
+                internalDrag = true;
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('application/x-canvas-input', reorderId);
+            };
+            item.ondragend = () => { internalDrag = false; };
+            item.ondragover = e => { e.preventDefault(); e.stopPropagation(); };
+            item.ondrop = e => {
+                e.preventDefault();
+                e.stopPropagation();
+                reorderInput(node, e.dataTransfer.getData('application/x-canvas-input'), reorderId);
+                internalDrag = false;
+            };
+        }
         list.appendChild(item);
     });
     refreshIcons();
+}
+function renderClassicApiReferenceInputs(list, node, sources, inputEl, chipsEl=null, referenceItems=null){
+    if(!list || !node) return [];
+    list.classList.add('classic-api-reference-list');
+    const items = Array.isArray(referenceItems) ? referenceItems : classicApiReferenceItems(node, sources);
+    renderImageInputList(list, node, items);
+    const elements = [...list.querySelectorAll('.input-item')];
+    elements.forEach((element, index) => {
+        const reference = items[index];
+        if(!reference?.referenceUrl) return;
+        element.dataset.classicImageMentionIndex = String(index);
+        const removeButton = document.createElement('button');
+        removeButton.type = 'button';
+        removeButton.className = 'api-reference-remove';
+        removeButton.setAttribute('aria-label', '移除参考图片');
+        removeButton.title = reference.connectionIds.length
+            ? (reference.hasMention ? '移除引用并断开连接' : '断开图片连接')
+            : '移除引用';
+        removeButton.innerHTML = '<i data-lucide="x"></i>';
+        removeButton.onmousedown = event => {
+            event.preventDefault();
+            event.stopPropagation();
+        };
+        removeButton.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+            removeClassicApiReference(node, reference);
+        };
+        element.appendChild(removeButton);
+    });
+    bindClassicImageMentionThumbnailClicks(
+        list,
+        node,
+        'api',
+        inputEl,
+        chipsEl,
+        items.map(item => item.refs?.[0] || null),
+    );
+    refreshIcons();
+    return items;
 }
 function renderVideoImageInputs(list, node, imageInputs){
     if(!list) return;
@@ -14151,7 +14645,7 @@ function refreshGeneratorInputViews(){
             if(isClassicInlineMentionEditor(localPromptInput)) localPromptInput.dataset.placeholder = placeholder;
             else localPromptInput.placeholder = placeholder;
         }
-        if(gen.type === 'generator') renderImageInputList(el.querySelector('.input-list'), gen, imageInputs);
+        if(gen.type === 'generator') renderClassicApiReferenceInputs(el.querySelector('.input-list'), gen, sources, localPromptInput);
         if(gen.type === 'midjourney') renderImageInputList(el.querySelector('.mj-input-list'), gen, imageInputs);
         if(gen.type === 'msgen') renderImageInputList(el.querySelector('.ms-img-list'), gen, imageInputs);
         if(gen.type === 'comfy') renderComfyImages(el.querySelector('.input-list'), gen, imageInputs);
@@ -18224,6 +18718,10 @@ function initOutputCompareEvents(){
     window.addEventListener('touchend', () => { outputCompareDrag = false; });
     window.addEventListener('resize', () => {
         if(outputLightbox.classList.contains('open')) requestAnimationFrame(applyOutputCompareDisplayMode);
+        if(llmPromptWorkspaceModal?.classList.contains('open')) placeClassicLLMPromptWorkspacePanel({
+            w:llmPromptWorkspacePanel?.getBoundingClientRect?.().width,
+            h:llmPromptWorkspacePanel?.getBoundingClientRect?.().height,
+        });
     });
 }
 function openOutputLightbox(url, out){
@@ -18983,6 +19481,7 @@ function onNodeResize(e){
         el.classList.add('sized');
         el.style.width = `${resizeNode.node.w}px`;
         el.style.height = `${resizeNode.node.h}px`;
+        if(resizeNode.node.type === 'llm') syncClassicLLMNodePaneHeights(resizeNode.node, el);
     }
     scheduleLinksRender();
     renderSelectionHub();
@@ -19701,7 +20200,7 @@ canvasArrangeBtn?.addEventListener('click', e => {
     arrangeSelectedCanvasNodes();
 });
 function isZoomPreviewIgnoredTarget(target){
-    return !!target?.closest?.('#createMenu, #linkCreateMenu, #nodeInputMenu, #nodeOutputMenu, #imageNodeMenu, #favoriteNodesModal, .minimap, #canvasAssetPanel, #assetManagerModal, #workflowTransferModal, #logModal, #promptTemplateModal, #imageEditModal, #outputLightbox');
+    return !!target?.closest?.('#createMenu, #linkCreateMenu, #nodeInputMenu, #nodeOutputMenu, #imageNodeMenu, #favoriteNodesModal, .minimap, #canvasAssetPanel, #assetManagerModal, #workflowTransferModal, #logModal, #llmPromptWorkspaceModal, #promptTemplateModal, #imageEditModal, #outputLightbox');
 }
 board.addEventListener('mousedown', e => {
     if(!zoomPreviewState || e.button !== 0) return;
@@ -19890,6 +20389,7 @@ window.addEventListener('keydown', e => {
     const key = String(e.key || '').toLowerCase();
     if(key === 'r' && !isEditableTarget(e.target)) isRKeyDown = true;
     if(e.key === 'Shift' && !e.altKey && !isEditableTarget(document.activeElement)) setKnifeMode(true);
+    if(e.key === 'Escape' && llmPromptWorkspaceModal?.classList.contains('open')) { closeLLMPromptWorkspace(); return; }
     if(e.key === 'Escape' && document.getElementById('imageEditModal').classList.contains('open')) { closeImageEditor(); return; }
     if(e.key === 'Escape' && promptTemplateModal?.classList.contains('open')) { closePromptTemplateModal(); return; }
     if(e.key === 'Enter' && promptTemplateModal?.classList.contains('open') && !isEditableTarget(e.target)){
@@ -19910,6 +20410,7 @@ window.addEventListener('keydown', e => {
     if(e.key === 'Escape' && outputLightbox.classList.contains('open')) { closeOutputLightbox(); return; }
     if(!e.ctrlKey && !e.metaKey && !e.altKey && key === 'z' && !isEditableTarget(e.target)
         && !document.getElementById('imageEditModal')?.classList.contains('open')
+        && !llmPromptWorkspaceModal?.classList.contains('open')
         && !promptTemplateModal?.classList.contains('open')
         && !outputLightbox.classList.contains('open')
         && !assetManagerModal?.classList.contains('open')

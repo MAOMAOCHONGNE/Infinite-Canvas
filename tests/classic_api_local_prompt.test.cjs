@@ -5,6 +5,7 @@ const test = require('node:test');
 
 const ROOT = path.resolve(__dirname, '..');
 const CANVAS_PATH = path.join(ROOT, 'static', 'js', 'canvas.js');
+const CSS_PATH = path.join(ROOT, 'static', 'css', 'canvas.css');
 const PLAN_PATH = path.join(ROOT, 'static', 'js', 'classic-cascade-plan.js');
 const ClassicCascadePlan = require(PLAN_PATH);
 
@@ -221,4 +222,14 @@ test('generator refresh updates only the API prompt label and preserves its temp
 
     assert.match(refreshBlock, /querySelector\(['"]\.api-local-prompt-label['"]\)/);
     assert.doesNotMatch(refreshBlock, /localPromptHead\.textContent/);
+});
+
+test('resized classic API generator grows the local prompt instead of the image list', () => {
+    const css = fs.readFileSync(CSS_PATH, 'utf8');
+
+    assert.match(css, /\.node\.sized\.generator-node \.generator-body\s*\{[^}]*display:flex;[^}]*flex-direction:column;/s);
+    assert.match(css, /\.node\.sized\.generator-node \.api-local-prompt-editor\s*\{[^}]*flex:1 1 84px;[^}]*display:flex;[^}]*flex-direction:column;[^}]*min-height:0;/s);
+    assert.match(css, /\.node\.sized\.generator-node \.api-local-prompt-input\s*\{[^}]*flex:1 1 auto;[^}]*height:auto;[^}]*min-height:84px;/s);
+    assert.match(css, /\.node\.sized\.generator-node \.input-list\s*\{[^}]*flex:0 0 auto;[^}]*min-height:56px;[^}]*max-height:84px;[^}]*overflow:auto;/s);
+    assert.doesNotMatch(css, /\.node\.sized\.generator-node \.input-list\s*\{[^}]*flex:1;/s);
 });

@@ -235,6 +235,42 @@
         };
     }
 
+    function removeMentionOccurrence(options={}){
+        const mention = options.mention || {};
+        const value = String(options.text || '');
+        const records = normalizeMentions(options.mentions);
+        const requestedIndex = Number(options.occurrenceIndex);
+        const occurrenceIndex = Number.isFinite(requestedIndex) ? Math.max(0, Math.trunc(requestedIndex)) : 0;
+        const pattern = mentionPattern(mention.marker || mention.name);
+        const matches = [...value.matchAll(pattern)];
+        const match = matches[occurrenceIndex];
+        if(!match) return {text:value, mentions:records, removed:false};
+
+        const start = match.index;
+        const end = start + match[0].length;
+        let before = value.slice(0, start);
+        let after = value.slice(end);
+        if(before && after && /[ \t]$/.test(before) && /^[ \t]/.test(after)){
+            before = before.replace(/[ \t]+$/, ' ');
+            after = after.replace(/^[ \t]+/, '');
+        }else if(!before){
+            after = after.replace(/^[ \t]+/, '');
+        }else if(!after){
+            before = before.replace(/[ \t]+$/, '');
+        }
+        const text = `${before}${after}`;
+        const hasRemainingOccurrence = mentionPattern(mention.marker || mention.name).test(text);
+        const id = String(mention.id || '');
+        const url = String(mention.url || '');
+        return {
+            text,
+            mentions:hasRemainingOccurrence
+                ? records
+                : records.filter(item => id ? item.id !== id : item.url !== url),
+            removed:true,
+        };
+    }
+
     function pruneMentions(text, records){
         return activeMentions(text, records);
     }
@@ -356,7 +392,7 @@
         return inlineParts(text, records).map(part => {
             if(part.type !== 'mention') return escapeMarkup(part.text).replace(/\n/g, '<br>');
             const title = part.name || part.label || '图片';
-            return `<span class="classic-inline-mention-token" contenteditable="false" data-mention-id="${escapeMarkup(part.id)}" data-url="${escapeMarkup(part.url)}" data-thumbnail="${escapeMarkup(part.thumbnail)}" data-name="${escapeMarkup(part.name)}" data-marker="${escapeMarkup(part.marker)}" title="${escapeMarkup(title)}"><img src="${escapeMarkup(part.thumbnail || part.url)}" alt=""><span class="classic-inline-mention-token-label">${escapeMarkup(part.label)}</span></span>`;
+            return `<span class="classic-inline-mention-token" contenteditable="false" data-mention-id="${escapeMarkup(part.id)}" data-url="${escapeMarkup(part.url)}" data-thumbnail="${escapeMarkup(part.thumbnail)}" data-name="${escapeMarkup(part.name)}" data-marker="${escapeMarkup(part.marker)}" title="${escapeMarkup(title)}"><img src="${escapeMarkup(part.thumbnail || part.url)}" alt=""><button type="button" class="classic-inline-mention-remove" data-classic-inline-mention-remove="${escapeMarkup(part.id || part.url)}" title="移除 @ 标签" aria-label="移除 @ 标签"><span aria-hidden="true">&times;</span></button><span class="classic-inline-mention-token-label">${escapeMarkup(part.label)}</span></span>`;
         }).join('');
     }
 
@@ -376,6 +412,7 @@
         pruneMentions,
         refKey,
         removeMention,
+        removeMentionOccurrence,
         uniqueRefs,
     };
 });

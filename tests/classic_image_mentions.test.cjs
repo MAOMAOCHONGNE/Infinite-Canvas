@@ -117,6 +117,46 @@ test('removing a mention removes its marker without affecting other text', () =>
     assert.deepEqual(result.mentions.map(item => item.id), ['person']);
 });
 
+test('removing one repeated mention occurrence retains the shared record until the final occurrence', () => {
+    const mentions = require(HELPER_PATH);
+    const record = {id:'image-3', url:'/assets/image-3.png', name:'image-3.png', marker:'图片3'};
+    let state = {
+        text:'@图片3 @图片3 @图片3',
+        mentions:[record],
+    };
+
+    state = mentions.removeMentionOccurrence({...state, mention:record, occurrenceIndex:2});
+    assert.equal(state.removed, true);
+    assert.equal(state.text, '@图片3 @图片3');
+    assert.deepEqual(state.mentions.map(item => item.id), ['image-3']);
+
+    state = mentions.removeMentionOccurrence({...state, mention:record, occurrenceIndex:1});
+    assert.equal(state.text, '@图片3');
+    assert.deepEqual(state.mentions.map(item => item.id), ['image-3']);
+
+    state = mentions.removeMentionOccurrence({...state, mention:record, occurrenceIndex:0});
+    assert.equal(state.text, '');
+    assert.deepEqual(state.mentions, []);
+});
+
+test('occurrence removal supports consecutive distinct mentions without changing unrelated spacing', () => {
+    const mentions = require(HELPER_PATH);
+    const records = [
+        {id:'a', url:'/assets/a.png', name:'a.png', marker:'A'},
+        {id:'b', url:'/assets/b.png', name:'b.png', marker:'B'},
+        {id:'c', url:'/assets/c.png', name:'c.png', marker:'C'},
+    ];
+    let state = {text:'前缀  @A @B @C  后缀', mentions:records};
+
+    for(const mention of [...records].reverse()){
+        state = mentions.removeMentionOccurrence({...state, mention, occurrenceIndex:0});
+        assert.equal(state.removed, true);
+    }
+
+    assert.equal(state.text, '前缀 后缀');
+    assert.deepEqual(state.mentions, []);
+});
+
 test('a suffixed duplicate marker does not accidentally activate the shorter name', () => {
     const mentions = require(HELPER_PATH);
     const request = mentions.buildPromptRequest({
@@ -244,6 +284,9 @@ test('classic inline mention markup renders a non-editable thumbnail token insid
     assert.match(html, /class="classic-inline-mention-token"/);
     assert.match(html, /contenteditable="false"/);
     assert.match(html, /<img[^>]+src="\/assets\/one\.png"/);
+    assert.match(html, /class="classic-inline-mention-remove"/);
+    assert.match(html, /data-classic-inline-mention-remove="one"/);
+    assert.match(html, /aria-label="移除 @ 标签"/);
     assert.match(html, /title="real-file\.png"/);
     assert.match(html, />\u56fe\u72471<\/span>/);
     assert.doesNotMatch(html, /@\u56fe\u72471/);
