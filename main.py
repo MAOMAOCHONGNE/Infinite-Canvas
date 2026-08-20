@@ -198,7 +198,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.08.19-custom.1"
+APP_VERSION = "2026.08.20-custom.1"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -392,8 +392,8 @@ JIMENG_LOGIN_SESSION = {
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
 SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "gemini-cli", "volcengine", "runninghub", "jimeng", "codex"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json", "openai-video-proxy", "openai-responses", "tudou-async"}
-RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.ai"
-RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.ai/openapi/v2"
+RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
+RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
 RUNNINGHUB_MODEL_REGISTRY_URL = "https://raw.githubusercontent.com/HM-RunningHub/ComfyUI_RH_OpenAPI/main/models_registry.json"
 RUNNINGHUB_LLM_BASE_URL = "https://llm.runninghub.ai/v1"
 RUNNINGHUB_FILE_HOST_REWRITES = {
@@ -10936,7 +10936,7 @@ def runninghub_api_key(provider=None, use_wallet=False, prefer_wallet=False):
 
 def runninghub_app_headers(json_body=True, use_wallet=False, provider=None):
     provider = provider or runninghub_provider()
-    host = urllib.parse.urlsplit(str((provider or {}).get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL)).netloc or "www.runninghub.ai"
+    host = urllib.parse.urlsplit(str((provider or {}).get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL)).netloc or "www.runninghub.cn"
     headers = {"Host": host}
     if provider:
         api_key = runninghub_api_key(provider, use_wallet=use_wallet)

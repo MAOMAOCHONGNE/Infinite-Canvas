@@ -2,7 +2,7 @@
   {
     "id": "runninghub",
     "name": "RunningHub",
-    "base_url": "https://www.runninghub.ai",
+    "base_url": "https://www.runninghub.cn",
     "protocol": "runninghub",
     "image_generation_endpoint": "",
     "image_edit_endpoint": "",

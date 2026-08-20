@@ -103,7 +103,7 @@ const MS_BUILTIN_IMAGE_MODELS = [
     'black-forest-labs/FLUX.2-klein-9B'
 ];
 const MS_DEFAULT_BASE_URL = 'https://api-inference.modelscope.cn/v1';
-const RH_DEFAULT_BASE_URL = 'https://www.runninghub.ai';
+const RH_DEFAULT_BASE_URL = 'https://www.runninghub.cn';
 const LINGJING_DEFAULT_BASE_URL = 'https://apistudio.vip';
 const LINGJING_REGISTER_URL = 'https://apistudio.vip/register?aff=g1CT';
 const VIP_GPT_DEFAULT_BASE_URL = 'https://www.vip-gpt.net';
@@ -136,10 +136,10 @@ const ONBOARDING_GUIDES = {
     runninghub:{
         titleKey:'api.rhOnboardingTitle',
         descKey:'api.rhOnboardingDesc',
-        primaryLabelKey:'api.rhGetKeyGlobal',
-        primaryUrl:'https://www.runninghub.ai/enterprise-api/consumerApi?inviteCode=rh-v1331',
-        walletPrimaryLabelKey:'api.rhGetWalletKeyGlobal',
-        walletPrimaryUrl:'https://www.runninghub.ai/enterprise-api/sharedApi?inviteCode=rh-v1331'
+        primaryLabelKey:'api.rhGetKeyCn',
+        primaryUrl:'https://www.runninghub.cn/enterprise-api/consumerApi?inviteCode=rh-v1331',
+        walletPrimaryLabelKey:'api.rhGetWalletKeyCn',
+        walletPrimaryUrl:'https://www.runninghub.cn/enterprise-api/sharedApi?inviteCode=rh-v1331'
     },
     lingjing:{
         titleKey:'api.lingjingOnboardingTitle',
