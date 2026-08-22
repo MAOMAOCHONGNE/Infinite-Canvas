@@ -56,6 +56,7 @@
         const apps = asArray(options.runninghub?.apps);
         const workflows = asArray(options.runninghub?.workflows);
         const promptLibraries = asArray(options.prompt_libraries);
+        const detailPages = asArray(options.detail_pages);
         const projectCanvases = new Map();
         projects.forEach(project => projectCanvases.set(itemId(project), asArray(project.canvases).map(itemId).filter(Boolean)));
         return {
@@ -67,6 +68,7 @@
             runninghubAppIds:new Set(apps.map(itemId).filter(Boolean)),
             runninghubWorkflowIds:new Set(workflows.map(itemId).filter(Boolean)),
             promptLibraryIds:new Set(promptLibraries.map(itemId).filter(Boolean)),
+            detailPageTaskIds:new Set(detailPages.map(itemId).filter(Boolean)),
             includeAssets:true,
             includePreferences:Boolean(options.preferences?.available),
         };
@@ -94,6 +96,9 @@
             break;
         }
     }
+    function setDetailPageSelected(state, taskId, selected){
+        setIdsSelected(state.detailPageTaskIds, [taskId], selected);
+    }
     function setIdsSelected(target, ids, selected){
         ids.forEach(id => selected ? target.add(String(id)) : target.delete(String(id)));
     }
@@ -110,6 +115,7 @@
         setIdsSelected(state.runninghubAppIds, asArray(state.options.runninghub?.apps).map(itemId), selected);
         setIdsSelected(state.runninghubWorkflowIds, asArray(state.options.runninghub?.workflows).map(itemId), selected);
         setIdsSelected(state.promptLibraryIds, asArray(state.options.prompt_libraries).map(itemId), selected);
+        setIdsSelected(state.detailPageTaskIds, asArray(state.options.detail_pages).map(itemId), selected);
         state.includeAssets = selected;
         state.includePreferences = selected && Boolean(state.options.preferences?.available);
     }
@@ -120,6 +126,7 @@
         if(asArray(state.options.runninghub?.apps).length) flags.push(idsSelectionState(state.runninghubAppIds, asArray(state.options.runninghub.apps).map(itemId)));
         if(asArray(state.options.runninghub?.workflows).length) flags.push(idsSelectionState(state.runninghubWorkflowIds, asArray(state.options.runninghub.workflows).map(itemId)));
         if(asArray(state.options.prompt_libraries).length) flags.push(idsSelectionState(state.promptLibraryIds, asArray(state.options.prompt_libraries).map(itemId)));
+        if(asArray(state.options.detail_pages).length) flags.push(idsSelectionState(state.detailPageTaskIds, asArray(state.options.detail_pages).map(itemId)));
         if(state.options.preferences?.available) flags.push(state.includePreferences ? 'checked' : 'unchecked');
         if(flags.length && state.includeAssets) flags.push('checked');
         if(flags.length && flags.every(value => value === 'checked')) return 'checked';
@@ -136,6 +143,7 @@
             runninghub_app_ids:[...state.runninghubAppIds],
             runninghub_workflow_ids:[...state.runninghubWorkflowIds],
             prompt_library_ids:[...state.promptLibraryIds],
+            detail_page_task_ids:[...state.detailPageTaskIds],
             include_preferences:Boolean(state.includePreferences),
             preferences:state.includePreferences ? readPortablePreferences() : {},
         };
@@ -144,7 +152,8 @@
         const payload = buildBackupExportRequest(state);
         return payload.project_ids.length > 0 || payload.canvas_ids.length > 0 || payload.provider_ids.length > 0
             || payload.runninghub_app_ids.length > 0 || payload.runninghub_workflow_ids.length > 0
-            || payload.prompt_library_ids.length > 0 || payload.include_preferences;
+            || payload.prompt_library_ids.length > 0 || payload.detail_page_task_ids.length > 0
+            || payload.include_preferences;
     }
     function formatBytes(value){
         const bytes = Math.max(0, Number(value) || 0);
@@ -264,6 +273,36 @@
                 </div>`;
             }).join('');
         }
+        function renderDetailPageTree(){
+            const tasks = asArray(options?.detail_pages);
+            if(!tasks.length) return `<div class="backup-tree-empty">${zh('没有可备份的详情页历史','No detail-page history available')}</div>`;
+            const ids = tasks.map(itemId).filter(Boolean);
+            const groupState = idsSelectionState(state.detailPageTaskIds, ids);
+            const collapseKey = 'group:detail-pages';
+            const collapsed = collapsedGroups.has(collapseKey);
+            const statusLabel = value => ({
+                succeeded:zh('全部完成','Completed'), partial:zh('部分完成','Partially completed'), failed:zh('任务失败','Failed'),
+                cancelled:zh('已取消','Cancelled'), interrupted:zh('已中断','Interrupted'), generating:zh('生成中','Generating'),
+                planning:zh('规划中','Planning'), pending:zh('等待中','Pending'), unknown:zh('结果未知','Unknown result'),
+            }[String(value || '').toLowerCase()] || String(value || zh('未知状态','Unknown')));
+            const dateLabel = value => {
+                const raw = Number(value || 0);
+                if(!raw) return '';
+                const date = new Date(raw < 100000000000 ? raw * 1000 : raw);
+                return Number.isNaN(date.getTime()) ? '' : date.toLocaleString([], {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+            };
+            return `<div class="backup-tree-branch detail-page-group">
+                ${collapsibleCheckbox(groupState, 'detail-page-group', '', collapseKey, zh('详情页历史','Detail-page history'), zh(`${ids.length} 组`, `${ids.length} groups`), 'panels-top-left')}
+                <div class="backup-tree-children${collapsed ? ' is-collapsed' : ''}">${tasks.map(task => {
+                    const taskId = itemId(task);
+                    const groupNo = Number(task.group_no || 0);
+                    const title = String(task.title || '').trim();
+                    const name = `${groupNo > 0 ? `${zh('分组','Group')} #${groupNo}` : zh('详情页历史','Detail-page history')}${title ? ` · ${title}` : ''}`;
+                    const meta = [statusLabel(task.status), dateLabel(task.updated_at || task.created_at), zh(`${Number(task.screen_count || 0)} 屏`, `${Number(task.screen_count || 0)} screens`)].filter(Boolean).join(' · ');
+                    return checkbox(state.detailPageTaskIds.has(taskId) ? 'checked' : 'unchecked', 'detail-page', taskId, name, meta);
+                }).join('')}</div>
+            </div>`;
+        }
         function renderFlatGroup(title, icon, collapseKey, groupKind, itemKind, items, target, metaKey=''){
             if(!items.length) return '';
             const ids = items.map(itemId);
@@ -305,18 +344,24 @@
             const apps = asArray(options?.runninghub?.apps);
             const workflows = asArray(options?.runninghub?.workflows);
             const libraries = asArray(options?.prompt_libraries);
+            const detailPages = asArray(options?.detail_pages);
             const resourceCount = Number(options?.resource_count || 0);
             const resourceBytes = Number(options?.resource_bytes || 0);
             const assetsDisabled = mode === 'import' && resourceCount <= 0;
             const assetsMeta = mode === 'import'
                 ? zh(`${resourceCount} 个文件，${formatBytes(resourceBytes)}`, `${resourceCount} files, ${formatBytes(resourceBytes)}`)
-                : zh('仅收集所选画布实际使用的文件', 'Only files referenced by selected canvases');
+                : zh('收集所选画布及详情页实际使用的文件', 'Collect files referenced by selected canvases and detail pages');
+            const detailAssetsWarning = mode === 'import' && detailPages.length && !state.includeAssets
+                ? `<div class="backup-warning"><i data-lucide="image-off"></i><span>${zh('未选择详情页素材：仅导入记录，缺失图片会在历史中标记为异常。','Detail-page media is disabled: records will import, but missing images will be marked unavailable.')}</span></div>`
+                : '';
             modalBody.innerHTML = `
                 <div class="backup-privacy"><i data-lucide="shield-check"></i><span>${zh('API Key、Token、密码和密钥预览永远不会进入备份。','API keys, tokens, passwords, and secret previews are never included.')}</span></div>
                 ${mode === 'import' && asArray(options?.missing_resources).length ? `<div class="backup-warning"><i data-lucide="triangle-alert"></i><span>${zh(`备份记录了 ${options.missing_resources.length} 个缺失素材，相关节点会保留原路径。`, `${options.missing_resources.length} assets were missing when exported.`)}</span></div>` : ''}
                 <div class="backup-select-all">${checkbox(overallSelectionState(state), 'all', '', zh('全选','Select all'))}</div>
                 ${renderSection('section:projects', zh('项目与画布','Projects and canvases'), 'folders', renderProjectTree())}
-                ${renderSection('section:assets', zh('画布素材','Canvas media'), 'images', checkbox(state.includeAssets && !assetsDisabled ? 'checked' : 'unchecked', 'assets', '', zh('包含所选画布使用的素材','Include media used by selected canvases'), assetsMeta, assetsDisabled))}
+                ${renderSection('section:detail-pages', zh('详情页历史','Detail-page history'), 'panels-top-left', renderDetailPageTree())}
+                ${renderSection('section:assets', zh('画布与详情页素材','Canvas and detail-page media'), 'images', checkbox(state.includeAssets && !assetsDisabled ? 'checked' : 'unchecked', 'assets', '', zh('包含所选画布与详情页使用的素材','Include media used by selected canvases and detail pages'), assetsMeta, assetsDisabled))}
+                ${detailAssetsWarning}
                 ${renderSection('section:config', zh('全局配置','Global configuration'), 'settings-2', `
                     ${renderFlatGroup(zh('API 配置平台','API providers'), 'server', 'group:providers', 'provider-group', 'provider', providers, state.providerIds)}
                     ${renderFlatGroup(zh('RunningHub 应用','RunningHub apps'), 'blocks', 'group:runninghub-apps', 'rh-app-group', 'rh-app', apps, state.runninghubAppIds)}
@@ -337,6 +382,7 @@
             const appIds = asArray(options.runninghub?.apps).map(itemId);
             const workflowIds = asArray(options.runninghub?.workflows).map(itemId);
             const promptIds = asArray(options.prompt_libraries).map(itemId);
+            const detailPageIds = asArray(options.detail_pages).map(itemId);
             if(kind === 'all') setAllSelected(state, checked);
             else if(kind === 'project') setProjectSelected(state, id, checked);
             else if(kind === 'canvas') setCanvasSelected(state, id, checked);
@@ -349,6 +395,8 @@
             else if(kind === 'rh-workflow') setIdsSelected(state.runninghubWorkflowIds, [id], checked);
             else if(kind === 'prompt-group') setIdsSelected(state.promptLibraryIds, promptIds, checked);
             else if(kind === 'prompt-library') setIdsSelected(state.promptLibraryIds, [id], checked);
+            else if(kind === 'detail-page-group') setIdsSelected(state.detailPageTaskIds, detailPageIds, checked);
+            else if(kind === 'detail-page') setDetailPageSelected(state, id, checked);
             else if(kind === 'preferences') state.includePreferences = checked;
             renderTree();
         }
@@ -433,6 +481,7 @@
                 if(Number(result.runninghub_apps_imported || 0)) importedParts.push(zh(`RunningHub 应用 ${result.runninghub_apps_imported} 个`, `${result.runninghub_apps_imported} RunningHub apps`));
                 if(Number(result.runninghub_workflows_imported || 0)) importedParts.push(zh(`RunningHub 工作流 ${result.runninghub_workflows_imported} 个`, `${result.runninghub_workflows_imported} RunningHub workflows`));
                 if(Number(result.prompt_libraries_imported || 0)) importedParts.push(zh(`提示词模板库 ${result.prompt_libraries_imported} 个`, `${result.prompt_libraries_imported} prompt libraries`));
+                if(Number(result.detail_pages || 0)) importedParts.push(zh(`详情页历史 ${result.detail_pages} 组`, `${result.detail_pages} detail-page histories`));
                 if(result.preferences && Object.keys(result.preferences).length) importedParts.push(zh('界面与使用偏好 1 组', '1 interface preference set'));
                 if(Number(result.providers_skipped || 0)) skippedParts.push(zh(`API 平台 ${result.providers_skipped} 个`, `${result.providers_skipped} API providers`));
                 if(Number(result.runninghub_apps_skipped || 0)) skippedParts.push(zh(`RunningHub 应用 ${result.runninghub_apps_skipped} 个`, `${result.runninghub_apps_skipped} RunningHub apps`));
@@ -446,19 +495,30 @@
                 const skippedNote = skippedParts.length
                     ? zh(`跳过冲突：${skippedParts.join('、')}。`, `Skipped conflicts: ${skippedParts.join(', ')}.`)
                     : '';
+                const missingMediaNote = Number(result.detail_page_missing_media || 0)
+                    ? zh(`有 ${result.detail_page_missing_media} 个详情页素材缺失，已在对应历史中标记。`, `${result.detail_page_missing_media} detail-page media files are missing and were marked in history.`)
+                    : '';
                 // 直接重读当前页面数据，不依赖本地浏览器壳是否允许脚本导航。
                 // 这会立即刷新项目、画布和回收站；API 设置页下次打开时也会通过 no-store 读取新配置。
                 if(typeof window.loadAll === 'function') {
                     try { await window.loadAll(); } catch(_error) { /* 导入已经完成，导航兜底仍可用 */ }
                 }
-                const importMessage = zh(`导入完成：${importedParts.join('、')}。${skippedNote}${providerNote}${endpointNote ? `\n${endpointNote}` : ''}`, `Import complete: ${importedParts.join(', ')}. ${skippedNote}${providerNote ? ` ${providerNote}` : ''}${endpointNote ? ` ${endpointNote}` : ''}`);
+                const importMessage = zh(`导入完成：${importedParts.join('、')}。${skippedNote}${providerNote}${missingMediaNote}${endpointNote ? `\n${endpointNote}` : ''}`, `Import complete: ${importedParts.join(', ')}. ${skippedNote}${providerNote ? ` ${providerNote}` : ''}${missingMediaNote ? ` ${missingMediaNote}` : ''}${endpointNote ? ` ${endpointNote}` : ''}`);
                 if(typeof window.setStatus === 'function') window.setStatus(importMessage);
                 window.dispatchEvent(new CustomEvent('backup-imported', {detail:result}));
+                window.dispatchEvent(new CustomEvent('detail-pages-changed', {detail:result}));
                 // Notify API settings and other open views that global providers/workflows changed.
                 const changeMessage = {type:'providers-changed', updated_at:Date.now(), source:'backup-import'};
+                const detailChangeMessage = {type:'detail-pages-changed', updated_at:changeMessage.updated_at, source:'backup-import'};
                 try { localStorage.setItem('studio_api_updated_at', String(changeMessage.updated_at)); } catch(_error) {}
-                try { new BroadcastChannel('studio-api').postMessage(changeMessage); } catch(_error) {}
+                try {
+                    const channel = new BroadcastChannel('studio-api');
+                    channel.postMessage(changeMessage);
+                    channel.postMessage(detailChangeMessage);
+                    channel.close();
+                } catch(_error) {}
                 try { window.parent?.postMessage(changeMessage, '*'); } catch(_error) {}
+                try { window.parent?.postMessage(detailChangeMessage, location.origin); } catch(_error) {}
                 // The backup UI runs in an iframe in the main studio shell. Reload the
                 // top-level shell so every iframe rebuilds its in-memory provider/workflow state.
                 try {
@@ -516,6 +576,7 @@
         projectSelectionState,
         setProjectSelected,
         setCanvasSelected,
+        setDetailPageSelected,
         setAllSelected,
         buildBackupExportRequest,
         formatBytes,

@@ -13,12 +13,12 @@
             } catch(e) {}
         })();
     </script>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.20-custom.1.1787287296">
-    <link rel="stylesheet" href="/static/css/detail-page.css?v=2026.08.20-custom.1.1787287297">
-    <script src="/static/vendor/js/lucide.js?v=2026.08.20-custom.1.1787287297"></script>
-    <script src="/static/js/theme.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/model-config.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/adaptive-image-ratio.js?v=2026.08.20-custom.1.1787287296"></script>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.22-custom.1.1785863189">
+    <link rel="stylesheet" href="/static/css/detail-page.css?v=2026.08.22-custom.1.1787486400">
+    <script src="/static/vendor/js/lucide.js?v=2026.08.22-custom.1.1785863219"></script>
+    <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
+    <script src="/static/js/model-config.js?v=2026.08.22-custom.1.1786809997"></script>
+    <script src="/static/js/adaptive-image-ratio.js?v=2026.08.22-custom.1.1786809997"></script>
 </head>
 <body>
     <div class="detail-app">
@@ -229,6 +229,9 @@
                 <button id="analyzeBtn" class="primary-command" type="button">
                     <i data-lucide="wand-sparkles"></i><span>开始生成</span>
                 </button>
+                <button id="forceGenerateBtn" class="secondary-command" type="button" hidden>
+                    <i data-lucide="copy-plus"></i><span>相同配置再次生成</span>
+                </button>
             </footer>
         </aside>
 
@@ -247,7 +250,15 @@
             <section class="result-group" aria-labelledby="resultGroupTitle">
                 <div class="result-group-head">
                     <div class="result-title-line">
-                        <h2 id="resultGroupTitle">分组 #1</h2>
+                        <div class="task-title-control">
+                            <h2 id="resultGroupTitle">新分组</h2>
+                            <button id="renameTaskBtn" class="rename-task-btn" type="button" title="修改分组名称" aria-label="修改分组名称" hidden><i data-lucide="pencil"></i></button>
+                            <form id="taskTitleForm" class="task-title-form" hidden>
+                                <input id="taskTitleInput" type="text" maxlength="60" autocomplete="off" aria-label="分组名称">
+                                <button id="saveTaskTitleBtn" type="submit" title="保存名称" aria-label="保存名称"><i data-lucide="check"></i></button>
+                                <button id="cancelTaskTitleBtn" type="button" title="取消修改" aria-label="取消修改"><i data-lucide="x"></i></button>
+                            </form>
+                        </div>
                         <span id="resultCount" class="result-count">0 屏</span>
                         <span id="resultStatus" class="result-status">待分析</span>
                         <span id="llmTrace" class="llm-trace" hidden></span>
@@ -260,6 +271,7 @@
                         <button id="downloadAllBtn" type="button" disabled><i data-lucide="download"></i><span>下载全部</span></button>
                     </div>
                 </div>
+                <div id="importMediaWarning" class="import-media-warning" hidden role="status"></div>
                 <details id="requestPreview" class="request-preview" hidden><summary>实际请求</summary><pre id="requestPreviewText"></pre></details>
                 <div id="resultGrid" class="result-grid" style="--result-columns:5">
                     <div class="empty-results">
@@ -270,6 +282,25 @@
                 </div>
             </section>
         </main>
+    </div>
+
+    <div id="promptEditorModal" class="prompt-editor-modal" hidden role="dialog" aria-modal="true" aria-labelledby="promptEditorTitle">
+        <section class="prompt-editor-dialog">
+            <header class="prompt-editor-head">
+                <div><span id="promptEditorNumber" class="screen-number"></span><h2 id="promptEditorTitle">生图提示词</h2></div>
+                <button id="promptEditorClose" type="button" aria-label="关闭提示词编辑" title="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <p id="promptEditorPurpose" class="prompt-editor-purpose" hidden></p>
+            <textarea id="promptEditorText" aria-label="生图提示词" spellcheck="false"></textarea>
+            <div id="promptEditorCandidates" class="prompt-editor-candidates" hidden>
+                <label><span>优化候选</span><select id="promptEditorCandidateSelect"><option value="">请选择候选</option></select></label>
+            </div>
+            <label class="prompt-editor-instruction"><span>优化要求（可选）</span><input id="promptEditorInstruction" type="text" maxlength="4000" placeholder="例如：画面更克制、突出透明材质"></label>
+            <footer class="prompt-editor-actions">
+                <button id="promptEditorOptimize" type="button"><i data-lucide="sparkles"></i><span>优化提示词</span></button>
+                <button id="promptEditorSave" class="primary" type="button"><i data-lucide="save"></i><span>保存提示词</span></button>
+            </footer>
+        </section>
     </div>
 
     <div id="imagePreview" class="image-preview" hidden role="dialog" aria-modal="true" aria-label="图片预览">
@@ -289,6 +320,6 @@
     </div>
     <div id="detailToast" class="detail-toast" role="status" aria-live="polite"></div>
 
-    <script src="/static/js/detail-page.js?v=2026.08.20-custom.1.1787287297"></script>
+    <script src="/static/js/detail-page.js?v=2026.08.22-custom.1.1787486400"></script>
 </body>
 </html>

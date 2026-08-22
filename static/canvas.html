@@ -16,19 +16,19 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.20-custom.1.1787287297"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.08.20-custom.1.1787287297"></script>
-    <script src="/static/js/theme.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/touch-mouse.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/i18n.js?v=2026.08.20-custom.1.1787287296"></script>
-    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.08.20-custom.1.1787287296">
-    <link rel="stylesheet" href="/static/css/canvas-shortcuts-help.css?v=2026.08.20-custom.1.1787287296">
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.20-custom.1.1787287296">
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.22-custom.1.1785863220"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.08.22-custom.1.1785863219"></script>
+    <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
+    <script src="/static/js/touch-mouse.js?v=2026.08.22-custom.1.1785863206"></script>
+    <script src="/static/js/i18n.js?v=2026.08.22-custom.1.1786958929"></script>
+    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.08.22-custom.1.1787338201">
+    <link rel="stylesheet" href="/static/css/canvas-shortcuts-help.css?v=2026.08.22-custom.1.1787308797">
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.22-custom.1.1785863189">
 </head>
 <body>
     <div id="shell" class="shell no-canvas">
-        <div class="topbar">
-            <div class="panel canvas-nav">
+        <header class="topbar">
+            <div class="canvas-nav">
                 <button id="backToManagerBtn" class="tool-btn" type="button" title="返回画布管理" aria-label="返回画布管理" data-i18n-title="canvas.backToManager"><i data-lucide="arrow-left" class="w-4 h-4"></i></button>
                 <div class="canvas-nav-meta">
                     <div id="currentCanvasTitle" class="current-canvas-title">未命名画布</div>
@@ -36,32 +36,16 @@
                 </div>
                 <p id="saveState" style="display:none" data-i18n="canvas.chooseFirst">请选择或新建画布</p>
             </div>
-            <div id="quickToolbar" class="panel toolbar editor-only collapsed">
-                <button class="tool-btn toolbar-toggle" type="button" onclick="toggleQuickToolbar()" title="展开快捷菜单" aria-label="展开快捷菜单"><i data-lucide="chevron-left" class="w-4 h-4"></i></button>
-                <div class="toolbar-items">
-                    <button class="tool-btn" onclick="addImageNode()"><i data-lucide="image-plus" class="w-4 h-4"></i><span data-i18n="canvas.image">图片</span></button>
-                    <button class="tool-btn" onclick="addPromptNode()"><i data-lucide="text-cursor-input" class="w-4 h-4"></i><span data-i18n="canvas.prompt">提示词</span></button>
-                    <button class="tool-btn" onclick="addNoteNode()"><i data-lucide="sticky-note" class="w-4 h-4"></i><span>便签</span></button>
-                    <button class="tool-btn" onclick="addLoopNode()"><i data-lucide="repeat-2" class="w-4 h-4"></i><span data-i18n="canvas.loop">循环</span></button>
-                    <button class="tool-btn" onclick="addLLMNode()"><i data-lucide="message-square-text" class="w-4 h-4"></i>LLM</button>
-                    <button class="tool-btn" onclick="addGeneratorNode()"><i data-lucide="wand-sparkles" class="w-4 h-4"></i><span data-i18n="canvas.apiGenerate">API生成</span></button>
-                    <button class="tool-btn" onclick="addMsGenNode()"><i data-lucide="cloud-lightning" class="w-4 h-4"></i><span data-i18n="canvas.msGenerate">MS生成</span></button>
-                    <button class="tool-btn" onclick="addVideoNode()"><i data-lucide="clapperboard" class="w-4 h-4"></i><span data-i18n="canvas.videoGenerate">视频生成</span></button>
-                    <button class="tool-btn" onclick="addMiniMaxNode()"><i data-lucide="sparkles" class="w-4 h-4"></i><span>MiniMax</span></button>
-                    <button class="tool-btn" onclick="addRhNode()"><i data-lucide="workflow" class="w-4 h-4"></i><span data-i18n="canvas.rhGenerate">RH生成</span></button>
-                    <button class="tool-btn" onclick="addComfyNode()"><i data-lucide="workflow" class="w-4 h-4"></i>ComfyUI</button>
-                    <button class="tool-btn" onclick="addLTXDirectorNode()"><i data-lucide="film" class="w-4 h-4"></i><span data-i18n="canvas.ltxDirector">LTX Director</span></button>
-                    <button class="tool-btn" onclick="addOutputNode()"><i data-lucide="circle-dot" class="w-4 h-4"></i>Output</button>
-                    <button class="tool-btn" onclick="groupSelectedImages()"><i data-lucide="group" class="w-4 h-4"></i><span data-i18n="canvas.group">分组</span></button>
-                </div>
+            <div id="quickToolbar" class="toolbar editor-only" role="toolbar" aria-label="画布工具">
                 <div class="toolbar-fixed">
                     <button id="workflowTransferToggle" class="tool-btn toolbar-workflow" type="button" title="导入导出工作流" aria-label="导入导出工作流"><i data-lucide="package-open" class="w-4 h-4"></i><span>工作流</span></button>
                     <button id="canvasShortcutToggle" class="tool-btn toolbar-shortcut" type="button" title="快捷键" aria-label="快捷键" aria-controls="canvasShortcutModal" aria-expanded="false" data-i18n-title="smart.shortcuts"><i data-lucide="keyboard" class="w-4 h-4"></i><span data-i18n="smart.shortcuts">快捷键</span></button>
-                    <button id="canvasLogToggle" class="tool-btn toolbar-log" type="button" onclick="openCanvasLog(event)" title="日志" aria-label="日志" data-i18n-title="canvas.logs"><i data-lucide="list-todo" class="w-4 h-4"></i><span data-i18n="canvas.logs">日志</span></button>
+                    <button id="canvasLogToggle" class="tool-btn toolbar-log" type="button" title="日志" aria-label="日志" data-i18n-title="canvas.logs"><i data-lucide="list-todo" class="w-4 h-4"></i><span data-i18n="canvas.logs">日志</span></button>
                     <button id="canvasAssetToggle" class="tool-btn toolbar-asset canvas-asset-toggle" type="button" title="资产库" aria-label="资产库"><i data-lucide="library" class="w-4 h-4"></i><span>资产库</span></button>
+                    <button id="canvasChatToggle" class="tool-btn toolbar-chat" type="button" title="对话" aria-label="对话" aria-controls="canvasChatPanel" aria-expanded="false"><i data-lucide="message-circle" class="w-4 h-4"></i><span>对话</span></button>
                 </div>
             </div>
-        </div>
+        </header>
 
         <!-- 选画布 gate 已拆分到独立页面 static/canvas-list.html（更轻量）。本页只负责编辑器，通过 ?id 打开。 -->
 
@@ -152,6 +136,10 @@
                 <div class="canvas-asset-hover-name"></div>
             </div>
         </div>
+        <aside id="canvasChatPanel" class="canvas-chat-panel editor-only" aria-hidden="true">
+            <div id="canvasChatResize" class="canvas-chat-resize" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整对话宽度" aria-valuemin="490" aria-valuemax="960" aria-valuenow="490"></div>
+            <iframe id="canvasChatFrame" title="GPT 对话" data-src="/static/gpt-chat.html?embed=canvas&amp;v=2026.08.22-custom.1.1787326486" scrolling="no"></iframe>
+        </aside>
         <div id="outputLightbox" class="output-lightbox" onclick="closeOutputLightbox()">
             <div id="outputLightboxShell" class="output-lightbox-shell" onclick="event.stopPropagation()">
             <div id="outputPreview" class="output-preview">
@@ -412,23 +400,25 @@
         </div>
     </div>
 
-    <script src="/static/js/ltx-director-timeline.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/canvas-history.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/canvas-duplication.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/canvas-spatial-frames.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/adaptive-image-ratio.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/output-compare-layout.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/canvas-shortcuts-help.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/image-outpaint-geometry.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/llm-result-memory.js?v=2026.08.20-custom.1.1787287296"></script>
-<script src="/static/js/mask-preview-style.js?v=2026.08.20-custom.1.1787287296"></script>
-<script src="/static/js/classic-cascade-plan.js?v=2026.08.20-custom.1.1787287296"></script>
-<script src="/static/js/prompt-template-order.js?v=2026.08.20-custom.1.1787287296"></script>
-<link rel="stylesheet" href="/static/css/prompt-template-thumbnails.css?v=2026.08.20-custom.1.1787287296">
-<script src="/static/js/prompt-template-thumbnails.js?v=2026.08.20-custom.1.1787287296"></script>
-<script src="/static/js/classic-image-mentions.js?v=2026.08.20-custom.1.1787287296"></script>
-<script src="/static/js/classic-node-favorites.js?v=2026.08.20-custom.1.1787287296"></script>
-<script src="/static/js/model-config.js?v=2026.08.20-custom.1.1787287296"></script>
-<script src="/static/js/canvas.js?v=2026.08.20-custom.1.1787287296"></script>
+    <script src="/static/js/ltx-director-timeline.js?v=2026.08.22-custom.1.1785863203"></script>
+    <script src="/static/js/canvas-history.js?v=2026.08.22-custom.1.1786035382"></script>
+    <script src="/static/js/canvas-duplication.js?v=2026.08.22-custom.1.1786035561"></script>
+    <script src="/static/js/canvas-spatial-frames.js?v=2026.08.22-custom.1.1786303811"></script>
+    <script src="/static/js/adaptive-image-ratio.js?v=2026.08.22-custom.1.1786809997"></script>
+    <script src="/static/js/output-compare-layout.js?v=2026.08.22-custom.1.1786201771"></script>
+    <script src="/static/js/canvas-shortcuts-help.js?v=2026.08.22-custom.1.1786666001"></script>
+    <script src="/static/js/image-outpaint-geometry.js?v=2026.08.22-custom.1.1786247596"></script>
+    <script src="/static/js/llm-result-memory.js?v=2026.08.22-custom.1.1786274704"></script>
+<script src="/static/js/mask-preview-style.js?v=2026.08.22-custom.1.1786386938"></script>
+<script src="/static/js/classic-cascade-plan.js?v=2026.08.22-custom.1.1786627631"></script>
+<script src="/static/js/prompt-template-order.js?v=2026.08.22-custom.1.1786474608"></script>
+<link rel="stylesheet" href="/static/css/prompt-template-thumbnails.css?v=2026.08.22-custom.1.1786691114">
+<script src="/static/js/prompt-template-thumbnails.js?v=2026.08.22-custom.1.1786691716"></script>
+<script src="/static/js/classic-image-mentions.js?v=2026.08.22-custom.1.1787030302"></script>
+<script src="/static/js/classic-node-favorites.js?v=2026.08.22-custom.1.1786700089"></script>
+<script src="/static/js/model-config.js?v=2026.08.22-custom.1.1786809997"></script>
+<script src="/static/js/canvas-agent-chat-client.js?v=2026.08.22-custom.1.1787323537"></script>
+<script src="/static/js/classic-canvas-agent-context.js?v=2026.08.22-custom.1.1787318488"></script>
+<script src="/static/js/canvas.js?v=2026.08.22-custom.1.1787370760"></script>
 </body>
 </html>

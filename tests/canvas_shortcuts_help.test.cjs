@@ -89,14 +89,15 @@ test('shortcut controller keeps modal visibility, button state, and accessibilit
     assert.equal(toggle.getAttribute('aria-expanded'), 'false');
 });
 
-test('classic upper-right controls place shortcuts between workflow and logs, with assets last', () => {
+test('classic upper-right controls place shortcuts between workflow and logs, with Chat after assets', () => {
     const html = fs.readFileSync(CLASSIC_HTML_PATH, 'utf8');
     const workflow = html.indexOf('id="workflowTransferToggle"');
     const shortcuts = html.indexOf('id="canvasShortcutToggle"');
     const logs = html.indexOf('id="canvasLogToggle"');
     const assets = html.indexOf('id="canvasAssetToggle"');
+    const chat = html.indexOf('id="canvasChatToggle"');
 
-    assert.ok(workflow >= 0 && workflow < shortcuts && shortcuts < logs && logs < assets);
+    assert.ok(workflow >= 0 && workflow < shortcuts && shortcuts < logs && logs < assets && assets < chat);
     assert.match(html, /id="canvasShortcutModal"[^>]*data-shortcut-profile="classic"/);
 });
 

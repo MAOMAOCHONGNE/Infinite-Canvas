@@ -502,6 +502,23 @@ test('tolerant round runner attempts every ordinary failure but still propagates
     );
 });
 
+test('classic ordinary loop allows up to ten parallel rounds without overriding backend-bound limits', () => {
+    const source = fs.readFileSync(CANVAS_PATH, 'utf8');
+    const block = sourceBlock(source, 'function cascadeParallelLimit', 'async function runLimitedCascadeRounds');
+    const makeLimit = (nodes, comfyBackendCount) => new Function(
+        'nodes',
+        'comfyBackendCount',
+        `${block}; return cascadeParallelLimit;`,
+    )(nodes, comfyBackendCount);
+
+    const ordinaryLimit = makeLimit([{id:'api-1', type:'generator'}], 3);
+    assert.equal(ordinaryLimit(['api-1'], 20), 10);
+    assert.equal(ordinaryLimit(['api-1'], 7), 7);
+
+    const comfyLimit = makeLimit([{id:'comfy-1', type:'comfy'}], 3);
+    assert.equal(comfyLimit(['comfy-1'], 20), 3);
+});
+
 test('slot-aware loop selection preserves failed upstream positions for downstream stages', () => {
     const planner = loadPlanner();
     const rounds = [1, 2, 3, 4].map(index => ({index}));

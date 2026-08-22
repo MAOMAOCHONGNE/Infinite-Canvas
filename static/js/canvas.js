@@ -227,6 +227,7 @@ function applyLanguage(lang){
     }
     renderCanvasList();
     render();
+    syncCanvasChatContext();
 }
 async function refreshCanvasConfigFromSettings(){
     await loadConfig();
@@ -237,9 +238,100 @@ async function refreshCanvasConfigFromSettings(){
     });
     if(typeof render === 'function') render();
 }
+const canvasCreativeInsertRequestIds = new Set();
 window.addEventListener('message', event => {
     if(event.origin && event.origin !== location.origin) return;
+    if(window.ClassicCanvasAgentContext?.isCanvasAgentContextRequestEvent(
+        event,
+        location.origin,
+        canvasChatFrame?.contentWindow
+    )){
+        const requestId = event.data.request_id;
+        if(!canvas?.id){
+            event.source.postMessage({
+                type:'canvas-agent-context-response',
+                request_id:requestId,
+                error:'画布尚未加载，请稍后重新发送。',
+            }, location.origin);
+            return;
+        }
+        try {
+            const context = window.ClassicCanvasAgentContext.buildCanvasAgentContext({
+                canvas,
+                nodes,
+                connections,
+                selectedIds:[...selected],
+            });
+            event.source.postMessage({
+                type:'canvas-agent-context-response',
+                request_id:requestId,
+                context,
+            }, location.origin);
+        } catch(error){
+            event.source.postMessage({
+                type:'canvas-agent-context-response',
+                request_id:requestId,
+                error:error?.message || '读取画布上下文失败，请重新发送。',
+            }, location.origin);
+        }
+        return;
+    }
+    if(event.data?.type === 'canvas-creative-agent-media-request' && event.source === canvasChatFrame?.contentWindow){
+        const requestId = String(event.data.request_id || '');
+        Promise.resolve(loadCanvasAssetLibrary({renderPanel:false})).catch(() => {}).finally(() => {
+            const items = [];
+            const seen = new Set();
+            const add = item => {
+                const url = String(item?.url || '').trim();
+                if(!url || seen.has(url)) return;
+                seen.add(url);
+                items.push({url, name:String(item?.name || outputImageName(url) || '图片'), kind:'image', source:item?.source || 'canvas'});
+            };
+            (nodes || []).forEach(node => {
+                if(node.type === 'image' && node.url && mediaKindForNode(node) === 'image') add({url:node.url, name:node.name, source:'canvas'});
+                generatedImageRefs(node).forEach(add);
+            });
+            classicImageMentionAssetRefs().forEach(add);
+            event.source?.postMessage({type:'canvas-creative-agent-media-response', request_id:requestId, canvas_id:canvas?.id || '', items:items.slice(0,500)}, location.origin);
+        });
+        return;
+    }
+    if(window.CanvasAgentChatClient?.isCreativeAgentInsertEvent?.(event, location.origin, canvasChatFrame?.contentWindow, canvas?.id || '')){
+        const requestId = String(event.data.request_id || '');
+        if(canvasCreativeInsertRequestIds.has(requestId)){
+            event.source.postMessage({type:'canvas-creative-agent-insert-response', request_id:requestId, canvas_id:canvas.id, ok:true, duplicate:true}, location.origin);
+            return;
+        }
+        try {
+            const media = (Array.isArray(event.data.media) ? event.data.media : []).slice(0,10).filter(item => {
+                const url = String(item?.url || '').trim();
+                return url && (/^https?:\/\//i.test(url) || /^\/(assets|output|static)\//i.test(url) || /^data:(image|video)\//i.test(url));
+            });
+            if(!media.length) throw new Error('没有可放入画布的媒体结果。');
+            canvasCreativeInsertRequestIds.add(requestId);
+            pushUndo();
+            const base = defaultPoint(0, 0);
+            const columns = Math.min(3, Math.max(1, Math.ceil(Math.sqrt(media.length))));
+            media.forEach((item,index) => {
+                const column = index % columns;
+                const row = Math.floor(index / columns);
+                nodes.push({
+                    id:uid('img'), type:'image', x:base.x + column * 300, y:base.y + row * 260,
+                    url:String(item.url), name:String(item.name || (item.kind === 'video' ? 'Agent 视频' : 'Agent 图片')),
+                    mediaKind:item.kind === 'video' ? 'video' : 'image',
+                    agentPrompt:String(event.data.optimized_prompt || '').slice(0,20000),
+                });
+            });
+            render();
+            scheduleSave();
+            event.source.postMessage({type:'canvas-creative-agent-insert-response', request_id:requestId, canvas_id:canvas.id, ok:true, count:media.length}, location.origin);
+        } catch(error){
+            event.source.postMessage({type:'canvas-creative-agent-insert-response', request_id:requestId, canvas_id:canvas?.id || '', ok:false, error:error?.message || '放入画布失败。'}, location.origin);
+        }
+        return;
+    }
     if(event.data?.type === 'studio-lang') applyLanguage(event.data.lang);
+    if(event.data?.type === 'canvas-chat-close' && event.source === canvasChatFrame?.contentWindow) closeCanvasChat();
     if(event.data?.type === 'canvas_updated') handleCanvasUpdatedMessage(event.data);
     if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'comfy-instances-changed'){
         refreshCanvasConfigFromSettings();
@@ -256,8 +348,9 @@ window.addEventListener('studio-lang-change', () => {
     if(canvas) currentCanvasTitle.textContent = canvas?.title || tr('canvas.untitled');
     renderCanvasList();
     render();
+    syncCanvasChatContext();
 });
-window.addEventListener('studio-ui-scale-change', applyQuickToolbarState);
+window.addEventListener('studio-ui-scale-change', syncCanvasChatContext);
 const shell = document.getElementById('shell');
 const canvasGate = document.getElementById('canvasGate');
 const board = document.getElementById('board');
@@ -343,6 +436,10 @@ const canvasShortcutToggle = document.getElementById('canvasShortcutToggle');
 const canvasShortcutModal = document.getElementById('canvasShortcutModal');
 const canvasShortcutList = document.getElementById('canvasShortcutList');
 const canvasLogToggle = document.getElementById('canvasLogToggle');
+const canvasChatToggle = document.getElementById('canvasChatToggle');
+const canvasChatPanel = document.getElementById('canvasChatPanel');
+const canvasChatFrame = document.getElementById('canvasChatFrame');
+const canvasChatResize = document.getElementById('canvasChatResize');
 const workflowTransferModal = document.getElementById('workflowTransferModal');
 const workflowTransferSub = document.getElementById('workflowTransferSub');
 const workflowExportMeta = document.getElementById('workflowExportMeta');
@@ -373,10 +470,27 @@ const canvasShortcutController = window.CanvasShortcutsHelp?.mountShortcutHelp({
     list:canvasShortcutList,
     profile:'classic',
     keyboardTarget:window,
-    onOpen:refreshIcons,
+    onOpen:() => {
+        openExclusiveCanvasTool('shortcuts');
+        refreshIcons();
+    },
 });
 function openCanvasShortcuts(){ canvasShortcutController?.open(); }
 function closeCanvasShortcuts(){ canvasShortcutController?.close(); }
+const EXCLUSIVE_CANVAS_TOOLS = ['workflow', 'shortcuts', 'logs', 'assets'];
+function closeExclusiveCanvasTools(except=''){
+    if(except !== 'workflow') closeWorkflowTransferModal();
+    if(except !== 'shortcuts') closeCanvasShortcuts();
+    if(except !== 'logs') closeCanvasLog();
+    if(except !== 'assets' && canvasAssetLibraryOpen) toggleCanvasAssetLibrary(false);
+}
+function openExclusiveCanvasTool(tool=''){
+    if(!EXCLUSIVE_CANVAS_TOOLS.includes(tool)){
+        closeExclusiveCanvasTools();
+        return;
+    }
+    closeExclusiveCanvasTools(tool);
+}
 const errorModal = document.getElementById('errorModal');
 const errorTitle = document.getElementById('errorTitle');
 const errorMessage = document.getElementById('errorMessage');
@@ -391,7 +505,9 @@ let dragBoard = null;
 let minimapDrag = false;
 let minimapState = null;
 let minimapRenderQueued = false;
+let minimapGeometryDirty = true;
 let linksRenderQueued = false;
+let viewportOverlayUpdateQueued = false;
 let zoomPreviewState = null;
 let resizeNode = null;
 let llmPaneDrag = null;
@@ -614,10 +730,8 @@ const CUSTOM_IMAGE_MODELS_KEY = 'canvas_custom_image_models';
 const MANAGED_IMAGE_MODELS_KEY = 'canvas_image_models_ordered';
 const MANAGED_CHAT_MODELS_KEY = 'canvas_chat_models_ordered';
 const CANVAS_THEME_KEY = 'canvas_theme';
-const QUICK_TOOLBAR_COLLAPSED_KEY = 'canvas_quick_toolbar_collapsed';
 const CANVAS_SESSION_VIEWPORTS_KEY = 'canvas_session_viewports_v1';
 let canvasSessionViewportFallback = {};
-let quickToolbarExpanded = false;
 const DEFAULT_VIDEO_MODELS = [
     // Veo
     'veo2', 'veo2-fast', 'veo2-pro',
@@ -680,25 +794,81 @@ function applyTheme(theme){
     document.body.classList.toggle('theme-dark', dark);
     shell.classList.toggle('theme-dark', dark);
 }
-function applyQuickToolbarState(){
-    const toolbar = document.getElementById('quickToolbar');
-    if(!toolbar) return;
-    const uiScale = Number(getComputedStyle(document.documentElement).getPropertyValue('--studio-ui-scale')) || 1;
-    const isScaledUi = uiScale < 0.995;
-    const collapsed = !quickToolbarExpanded;
-    toolbar.classList.toggle('scale-expanded', isScaledUi && quickToolbarExpanded);
-    toolbar.classList.toggle('collapsed', collapsed);
-    const btn = toolbar.querySelector('.toolbar-toggle');
-    if(btn){
-        btn.title = collapsed ? '展开快捷菜单' : '折叠快捷菜单';
-        btn.setAttribute('aria-label', btn.title);
-    }
-    refreshIcons();
+function canvasChatIsNarrow(){
+    return window.matchMedia('(max-width:780px)').matches;
 }
-function toggleQuickToolbar(){
-    const toolbar = document.getElementById('quickToolbar');
-    quickToolbarExpanded = Boolean(toolbar?.classList.contains('collapsed'));
-    applyQuickToolbarState();
+function resetCanvasChatWidth(){
+    canvasChatPanel?.style.removeProperty('width');
+    canvasChatResize?.setAttribute('aria-valuenow', '490');
+}
+function canvasChatMaxWidth(){
+    return Math.max(490, Math.min(960, window.innerWidth - 120));
+}
+function setCanvasChatWidth(width){
+    if(!canvasChatPanel || canvasChatIsNarrow()) return 490;
+    const next = Math.max(490, Math.min(canvasChatMaxWidth(), Number(width) || 490));
+    canvasChatPanel.style.width = `${Math.round(next)}px`;
+    canvasChatResize?.setAttribute('aria-valuemax', String(Math.round(canvasChatMaxWidth())));
+    canvasChatResize?.setAttribute('aria-valuenow', String(Math.round(next)));
+    return next;
+}
+function syncCanvasChatContext(){
+    if(!canvasChatFrame?.contentWindow || !canvasChatFrame.getAttribute('src')) return;
+    const theme = window.StudioTheme?.get?.() || localStorage.getItem('studio_theme') || localStorage.getItem(CANVAS_THEME_KEY) || 'light';
+    const mode = window.StudioScale?.getMode?.() || localStorage.getItem('studio_ui_scale_mode') || 'auto';
+    const cssScale = Number(getComputedStyle(document.documentElement).getPropertyValue('--studio-ui-scale'));
+    const scale = Number.isFinite(cssScale) && cssScale > 0 ? cssScale : (window.StudioScale?.getScale?.() || 1);
+    const lang = window.StudioI18n?.lang?.() || localStorage.getItem('studio_lang') || 'zh';
+    canvasChatFrame.contentWindow.postMessage({type:'studio-theme', theme, canvas_id:canvas?.id || ''}, location.origin);
+    canvasChatFrame.contentWindow.postMessage({type:'studio-ui-scale', mode, scale}, location.origin);
+    canvasChatFrame.contentWindow.postMessage({type:'studio-lang', lang}, location.origin);
+}
+function openCanvasChat(){
+    if(!canvasChatPanel || !canvasChatFrame) return;
+    const wasOpen = canvasChatPanel.classList.contains('open');
+    if(!wasOpen) resetCanvasChatWidth();
+    canvasChatPanel.classList.add('open');
+    canvasChatPanel.setAttribute('aria-hidden', 'false');
+    canvasChatToggle?.classList.add('active');
+    canvasChatToggle?.setAttribute('aria-expanded', 'true');
+    if(!canvasChatFrame.getAttribute('src')) canvasChatFrame.src = canvasChatFrame.dataset.src;
+    else syncCanvasChatContext();
+    requestAnimationFrame(() => {
+        try { canvasChatFrame.contentWindow?.focus(); } catch(e) {}
+    });
+}
+function closeCanvasChat(){
+    canvasChatPanel?.classList.remove('open');
+    canvasChatPanel?.setAttribute('aria-hidden', 'true');
+    canvasChatToggle?.classList.remove('active');
+    canvasChatToggle?.setAttribute('aria-expanded', 'false');
+    document.body.classList.remove('canvas-chat-resizing');
+}
+function toggleCanvasChat(){
+    if(canvasChatPanel?.classList.contains('open')) closeCanvasChat();
+    else openCanvasChat();
+}
+function handleCanvasChatViewport(){
+    if(!canvasChatPanel?.classList.contains('open')) return;
+    if(canvasChatIsNarrow()) resetCanvasChatWidth();
+    else if(canvasChatPanel.style.width) setCanvasChatWidth(parseFloat(canvasChatPanel.style.width));
+}
+function beginCanvasChatResize(event){
+    if(!canvasChatPanel || canvasChatIsNarrow() || event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = canvasChatPanel.getBoundingClientRect().width;
+    document.body.classList.add('canvas-chat-resizing');
+    const move = moveEvent => setCanvasChatWidth(startWidth + startX - moveEvent.clientX);
+    const finish = () => {
+        document.body.classList.remove('canvas-chat-resizing');
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', finish);
+        window.removeEventListener('pointercancel', finish);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', finish, {once:true});
+    window.addEventListener('pointercancel', finish, {once:true});
 }
 function loadLocalModelLists(){
     try {
@@ -1395,7 +1565,7 @@ function screenToWorld(clientX, clientY){
 }
 function applyViewport(){
     world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`;
-    scheduleMinimapRender();
+    scheduleViewportOverlayUpdate();
     scheduleCanvasImageResolutionSync(nodesEl, 120);
 }
 function estimatedNodeRect(n){
@@ -1430,6 +1600,7 @@ function minimapBounds(){
     return {x:minX - pad, y:minY - pad, w:Math.max(1, maxX - minX + pad * 2), h:Math.max(1, maxY - minY + pad * 2)};
 }
 function scheduleMinimapRender(){
+    minimapGeometryDirty = true;
     if(minimapRenderQueued) return;
     minimapRenderQueued = true;
     requestAnimationFrame(() => {
@@ -1444,6 +1615,29 @@ function scheduleLinksRender(){
     requestAnimationFrame(() => {
         linksRenderQueued = false;
         renderLinks();
+    });
+}
+function viewportRectFitsMinimapBounds(rect, bounds){
+    if(!rect || !bounds) return false;
+    return rect.x >= bounds.x
+        && rect.y >= bounds.y
+        && rect.x + rect.w <= bounds.x + bounds.w
+        && rect.y + rect.h <= bounds.y + bounds.h;
+}
+function updateViewportOverlays(){
+    const viewRect = currentWorldViewRect();
+    if(!minimapRenderQueued){
+        if(!minimapState || minimapGeometryDirty || !viewportRectFitsMinimapBounds(viewRect, minimapState.bounds)) renderMinimap();
+        else updateMinimapViewport(viewRect);
+    }
+    positionSelectionHub();
+}
+function scheduleViewportOverlayUpdate(){
+    if(viewportOverlayUpdateQueued) return;
+    viewportOverlayUpdateQueued = true;
+    requestAnimationFrame(() => {
+        viewportOverlayUpdateQueued = false;
+        updateViewportOverlays();
     });
 }
 function renderMinimap(){
@@ -1464,11 +1658,12 @@ function renderMinimap(){
     }).join('');
     minimapContent.innerHTML = `${nodeHtml}${nodes?.length ? '' : '<div class="minimap-empty">EMPTY</div>'}<div id="minimapViewport" class="minimap-viewport"></div>`;
     minimapViewport = document.getElementById('minimapViewport');
+    minimapGeometryDirty = false;
     updateMinimapViewport();
 }
-function updateMinimapViewport(){
+function updateMinimapViewport(viewRect=null){
     if(!minimapViewport || !minimapState) return;
-    const r = currentWorldViewRect();
+    const r = viewRect || currentWorldViewRect();
     const {bounds, scale, ox, oy} = minimapState;
     minimapViewport.style.left = `${ox + (r.x - bounds.x) * scale}px`;
     minimapViewport.style.top = `${oy + (r.y - bounds.y) * scale}px`;
@@ -1476,7 +1671,7 @@ function updateMinimapViewport(){
     minimapViewport.style.height = `${Math.max(8, r.h * scale)}px`;
 }
 function minimapEventToWorld(e){
-    if(!minimapState) renderMinimap();
+    if(!minimapState || minimapGeometryDirty) renderMinimap();
     const state = minimapState;
     const rect = minimapContent.getBoundingClientRect();
     const x = (e.clientX - rect.left - state.ox) / state.scale + state.bounds.x;
@@ -1488,8 +1683,6 @@ function centerViewportOnWorldPoint(point){
     viewport.x = rect.width / 2 - point.x * viewport.scale;
     viewport.y = rect.height / 2 - point.y * viewport.scale;
     applyViewport();
-    renderLinks();
-    renderSelectionHub();
 }
 function safeViewportScale(value){
     const n = Number(value);
@@ -1502,8 +1695,6 @@ function fitAllNodesViewport(){
         viewport.x = rect.width / 2;
         viewport.y = rect.height / 2;
         applyViewport();
-        renderLinks();
-        renderSelectionHub();
         scheduleViewportSave();
         return;
     }
@@ -1522,8 +1713,6 @@ function fitAllNodesViewport(){
     viewport.x = rect.width / 2 - cx * viewport.scale;
     viewport.y = rect.height / 2 - cy * viewport.scale;
     applyViewport();
-    renderLinks();
-    renderSelectionHub();
     scheduleViewportSave();
 }
 function enterZoomPreview(){
@@ -1551,8 +1740,6 @@ function exitZoomPreview(point=null){
         viewport.y = prev.y;
     }
     applyViewport();
-    renderLinks();
-    renderSelectionHub();
     scheduleViewportSave();
     return true;
 }
@@ -1580,8 +1767,6 @@ function exitZoomPreviewToNode(nodeId){
     viewport.x = boardRect.width / 2 - cx * viewport.scale;
     viewport.y = boardRect.height / 2 - cy * viewport.scale;
     applyViewport();
-    renderLinks();
-    renderSelectionHub();
     scheduleViewportSave();
     return true;
 }
@@ -2720,7 +2905,10 @@ document.addEventListener('mousedown', e => {
 });
 gateCanvasList?.addEventListener('scroll', () => requestAnimationFrame(positionCanvasMetaPopover), {passive:true});
 window.addEventListener('resize', () => requestAnimationFrame(positionCanvasMetaPopover));
-window.addEventListener('studio-theme-change', event => applyTheme(event.detail?.theme || 'light'));
+window.addEventListener('studio-theme-change', event => {
+    applyTheme(event.detail?.theme || 'light');
+    syncCanvasChatContext();
+});
 function cropDragModeFromPointer(event){
     const explicit = event.target.closest?.('[data-crop-handle]')?.dataset?.cropHandle;
     if(explicit) return `crop-${explicit}`;
@@ -6728,6 +6916,7 @@ function render(){
     syncCanvasSelectedImageResolution(nodesEl);
     measureCanvasOriginalImageNodes(nodesEl);
     refreshOutputTimer();
+    scheduleMinimapRender();
 }
 function refreshNodes(ids=[]){
     const uniqueIds = [...new Set((ids || []).filter(Boolean))];
@@ -6759,6 +6948,7 @@ function refreshNodes(ids=[]){
     syncCanvasSelectedImageResolution(nodesEl);
     measureCanvasOriginalImageNodes(nodesEl);
     refreshOutputTimer();
+    scheduleMinimapRender();
 }
 function refreshRunNodes(node, out=null){
     refreshNodes([node?.id, out?.id]);
@@ -8841,8 +9031,8 @@ function renderCanvasAssetLibrary(){
     refreshIcons();
 }
 function toggleCanvasAssetLibrary(open=!canvasAssetLibraryOpen){
+    if(open) openExclusiveCanvasTool('assets');
     canvasAssetLibraryOpen = !!open;
-    if(canvasAssetLibraryOpen && workflowTransferModal?.classList.contains('open')) closeWorkflowTransferModal();
     canvasAssetPanel?.classList.toggle('open', canvasAssetLibraryOpen);
     canvasAssetToggle?.classList.toggle('active', canvasAssetLibraryOpen);
     if(!canvasAssetLibraryOpen) hideCanvasAssetHoverPreview();
@@ -16349,7 +16539,7 @@ async function runCascadeNodeWithLoopContext(node, ctx, opts={}){
 function cascadeParallelLimit(order, totalRounds){
     const hasComfy = order.some(id => ['comfy','minimax'].includes(nodes.find(n => n.id === id)?.type));
     if(hasComfy) return Math.max(1, Math.min(totalRounds, comfyBackendCount || 1));
-    return Math.max(1, Math.min(totalRounds, 6));
+    return Math.max(1, Math.min(totalRounds, 10));
 }
 async function runLimitedCascadeRounds(rounds, limit, runner){
     let next = 0;
@@ -17503,9 +17693,11 @@ function openCanvasLog(event){
     event?.preventDefault?.();
     event?.stopPropagation?.();
     event?.stopImmediatePropagation?.();
+    openExclusiveCanvasTool('logs');
     const modal = document.getElementById('logModal') || (typeof logModal !== 'undefined' ? logModal : null);
     const list = document.getElementById('logList') || (typeof logList !== 'undefined' ? logList : null);
     modal?.classList.add('open');
+    canvasLogToggle?.classList.add('active');
     if(list && !list.innerHTML) list.innerHTML = `<div class="log-empty">${tr('canvas.noLogs')}</div>`;
     try {
         renderCanvasLog();
@@ -17517,6 +17709,7 @@ function openCanvasLog(event){
 function closeCanvasLog(){
     const modal = document.getElementById('logModal') || (typeof logModal !== 'undefined' ? logModal : null);
     modal?.classList.remove('open');
+    canvasLogToggle?.classList.remove('active');
 }
 window.openCanvasLog = openCanvasLog;
 window.closeCanvasLog = closeCanvasLog;
@@ -18162,6 +18355,16 @@ promptTemplatePanel?.addEventListener('keydown', event => {
     applyPromptTemplateToPromptNode('positive');
 });
 canvasAssetToggle?.addEventListener('click', () => toggleCanvasAssetLibrary());
+canvasChatToggle?.addEventListener('click', toggleCanvasChat);
+canvasChatFrame?.addEventListener('load', syncCanvasChatContext);
+canvasChatResize?.addEventListener('pointerdown', beginCanvasChatResize);
+canvasChatResize?.addEventListener('keydown', event => {
+    if(!['ArrowLeft', 'ArrowRight'].includes(event.key) || canvasChatIsNarrow()) return;
+    event.preventDefault();
+    const current = canvasChatPanel?.getBoundingClientRect().width || 490;
+    setCanvasChatWidth(current + (event.key === 'ArrowLeft' ? 24 : -24));
+});
+window.addEventListener('resize', handleCanvasChatViewport);
 workflowTransferToggle?.addEventListener('click', () => {
     if(workflowTransferModal?.classList.contains('open')) closeWorkflowTransferModal();
     else openWorkflowTransferModal();
@@ -18970,19 +19173,27 @@ function renderSelectionHub(){
         selectionHub.querySelector('[data-selection-frame]').onclick = event => { event.stopPropagation(); createFrameFromClassicSelection(); };
         selectionHub.querySelector('[data-selection-download]').onclick = event => { event.stopPropagation(); downloadClassicSelectionMedia(); };
     }
+    selectionHub.classList.add('open');
+    positionSelectionHub();
+    refreshIcons();
+}
+function positionSelectionHub(){
+    if(!selectionHub?.classList?.contains('open')) return;
+    const ids = [...selected].filter(id => nodes.some(node => node.id === id));
     const elements = ids.map(canvasNodeElement).filter(Boolean);
-    if(!elements.length) return;
+    if(!elements.length){
+        selectionHub.classList.remove('open');
+        return;
+    }
     const boardRect = board.getBoundingClientRect();
     const rects = elements.map(el => el.getBoundingClientRect());
     const left = Math.min(...rects.map(rect => rect.left));
     const right = Math.max(...rects.map(rect => rect.right));
     const top = Math.min(...rects.map(rect => rect.top));
-    selectionHub.classList.add('open');
     const halfWidth = Math.max(22, selectionHub.offsetWidth / 2);
     selectionHub.style.left = `${Math.max(halfWidth + 8, Math.min(boardRect.width - halfWidth - 8, (left + right) / 2 - boardRect.left))}px`;
     selectionHub.style.top = `${Math.max(12, top - boardRect.top - 48)}px`;
     selectionHub.style.transform = 'translateX(-50%)';
-    refreshIcons();
 }
 function startSelectionLink(e, kind){
     e.preventDefault();
@@ -19184,7 +19395,7 @@ function downloadUrl(url, filename='download'){
 }
 function openWorkflowTransferModal(){
     if(!canvas){ setStatus(tr('canvas.needCanvas')); return; }
-    if(canvasAssetLibraryOpen) toggleCanvasAssetLibrary(false);
+    openExclusiveCanvasTool('workflow');
     updateWorkflowTransferMeta();
     workflowTransferModal?.classList.add('open');
     workflowTransferToggle?.classList.add('active');
@@ -19441,7 +19652,7 @@ function onNodeDrag(e){
         }
     });
     scheduleLinksRender();
-    renderSelectionHub();
+    scheduleViewportOverlayUpdate();
     if(workflowTransferModal?.classList.contains('open')) updateWorkflowTransferMeta();
     scheduleMinimapRender();
 }
@@ -19484,7 +19695,7 @@ function onNodeResize(e){
         if(resizeNode.node.type === 'llm') syncClassicLLMNodePaneHeights(resizeNode.node, el);
     }
     scheduleLinksRender();
-    renderSelectionHub();
+    scheduleViewportOverlayUpdate();
     scheduleMinimapRender();
 }
 function startLink(e, originId, originKind){
@@ -19735,7 +19946,7 @@ function endDrag(event=null){
     window.onmousemove = null;
     window.onmouseup = null;
     if(shouldRenderKnife) render();
-    scheduleMinimapRender();
+    if(hadContentDrag) scheduleMinimapRender();
     if(hadContentDrag) scheduleSave();
     else if(hadViewportDrag) scheduleViewportSave();
 }
@@ -20132,6 +20343,10 @@ function applyKnifeCut(from, to){
     scheduleSave();
 }
 function setKnifeMode(active){
+    const wasActive = knifeActive
+        || Boolean(knifePoint)
+        || knifeTrail.length > 0
+        || document.body.classList.contains('canvas-knife');
     document.body.classList.toggle('canvas-knife', Boolean(active && canvas));
     if(!active){
         knifeActive = false;
@@ -20139,7 +20354,7 @@ function setKnifeMode(active){
         knifeTrail = [];
         knifeChanged = false;
         knifeNeedsRender = false;
-        renderLinks();
+        if(wasActive) renderLinks();
     }
 }
 function startKnifeDrag(e){
@@ -20307,13 +20522,12 @@ board.onwheel = e => {
     if(!canvas) return;
     e.preventDefault();
     const before = screenToWorld(e.clientX, e.clientY);
-    viewport.scale = viewport.scale * (e.deltaY > 0 ? .92 : 1.08);
+    const factor = Math.exp(-e.deltaY * 0.001);
+    viewport.scale = safeViewportScale(viewport.scale * factor);
     const rect = board.getBoundingClientRect();
     viewport.x = e.clientX - rect.left - before.x * viewport.scale;
     viewport.y = e.clientY - rect.top - before.y * viewport.scale;
     applyViewport();
-    renderLinks();
-    renderSelectionHub();
     scheduleViewportSave();
 };
 board.addEventListener('dragover', e => {
@@ -20534,7 +20748,6 @@ function escapeAttr(str){ return escapeHtml(str); }
 
 window.onload = async () => {
     applyTheme(localStorage.getItem('studio_theme') || localStorage.getItem(CANVAS_THEME_KEY) || 'light');
-    applyQuickToolbarState();
     if(window.StudioI18n) StudioI18n.apply();
     document.title = tr('canvas.title');
     initOutputCompareEvents();

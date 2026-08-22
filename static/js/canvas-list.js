@@ -509,7 +509,7 @@ function openCanvas(c){
     rememberProjectId(c.project || currentProjectId || 'default');
     window.location.href = (c.kind === 'smart')
         ? `/static/smart-canvas.html?id=${enc}&project=${project}&v=2026.07.03.4`
-        : `/static/canvas.html?id=${enc}&project=${project}&v=2026.07.03.4`;
+        : `/static/canvas.html?id=${enc}&project=${project}&v=2026.08.21-custom.1.1787337600`;
 }
 
 /* ===== Card create flow ===== */

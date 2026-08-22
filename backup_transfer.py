@@ -18,7 +18,9 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence,
 
 
 BACKUP_FORMAT = "infinite-canvas-backup"
-BACKUP_VERSION = 1
+BACKUP_VERSION = 2
+BACKUP_LEGACY_VERSION = 1
+BACKUP_SUPPORTED_VERSIONS = {BACKUP_LEGACY_VERSION, BACKUP_VERSION}
 MAX_ARCHIVE_MEMBERS = 20_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
 
@@ -69,6 +71,18 @@ _RUNTIME_KEYS = {
     "runStatus",
     "runProgress",
     "runTimerStartedAt",
+    "raw",
+    "provider_snapshot",
+    "upstream_task_id",
+    "query_attempts",
+    "last_query_at",
+    "query_error",
+    "netWssUrl",
+    "net_wss_url",
+    "b64_json",
+    "base64",
+    "image_base64",
+    "data_url",
 }
 
 
@@ -132,7 +146,11 @@ def collect_local_resource_urls(value: Any) -> List[str]:
     def walk(item: Any) -> None:
         if isinstance(item, str):
             text = item.strip()
-            if (text.startswith("/assets/") or text.startswith("/output/")) and text not in seen:
+            if (
+                text.startswith("/assets/")
+                or text.startswith("/output/")
+                or text.startswith("/api/storage-files/")
+            ) and text not in seen:
                 seen.add(text)
                 result.append(text)
             return
@@ -145,6 +163,58 @@ def collect_local_resource_urls(value: Any) -> List[str]:
                 walk(child)
 
     walk(value)
+    return result
+
+
+def collect_detail_page_media_urls(task: Mapping[str, Any]) -> List[str]:
+    """Collect media only from known detail-page fields, never from prompts or provider URLs."""
+    result: List[str] = []
+    seen = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, Mapping):
+            add(value.get("url") or value.get("value"))
+            return
+        if not isinstance(value, str):
+            return
+        text = value.strip()
+        if not text or text in seen:
+            return
+        if not (
+            text.startswith("/assets/")
+            or text.startswith("/output/")
+            or text.startswith("/api/storage-files/")
+            or text.startswith("http://")
+            or text.startswith("https://")
+        ):
+            return
+        seen.add(text)
+        result.append(text)
+
+    def add_result(value: Any) -> None:
+        if not isinstance(value, Mapping):
+            return
+        add(value.get("image_url"))
+        for item in value.get("images") or []:
+            add(item)
+        for item in value.get("image_items") or []:
+            add(item)
+
+    if not isinstance(task, Mapping):
+        return result
+    settings = task.get("settings") if isinstance(task.get("settings"), Mapping) else {}
+    for key in ("product_images", "reference_images", "product_image_meta", "reference_image_meta"):
+        for item in settings.get(key) or []:
+            add(item)
+    for screen in task.get("screens") or []:
+        if not isinstance(screen, Mapping):
+            continue
+        add_result(screen.get("result"))
+        for candidate in screen.get("candidates") or []:
+            if not isinstance(candidate, Mapping):
+                continue
+            add(candidate.get("image_url"))
+            add_result(candidate.get("result"))
     return result
 
 
@@ -171,6 +241,8 @@ _PROVIDER_REFERENCE_KEYS = {
     "llm_provider",
     "imageProvider",
     "image_provider",
+    "image_provider_id",
+    "llm_provider_id",
 }
 
 
@@ -265,6 +337,102 @@ def prepare_imported_canvas(
     clean["updated_at"] = int(timestamp)
     clean["logs"] = []
     clean.pop("deleted_at", None)
+    return clean
+
+
+_DETAIL_ACTIVE_STATUSES = {
+    "uploading", "planning", "repairing", "generating", "analyzing", "compiling",
+    "queued", "submitting", "recovering",
+}
+
+
+def prepare_exported_detail_task(task: Mapping[str, Any]) -> Dict[str, Any]:
+    """Create a portable, credential-free detail-page history snapshot."""
+    if not isinstance(task, Mapping) or str(task.get("type") or "") != "detail-page":
+        raise ValueError("详情页任务数据无效")
+    settings = task.get("settings")
+    if settings is not None and not isinstance(settings, Mapping):
+        raise ValueError("详情页任务设置无效")
+    screens = task.get("screens")
+    if screens is not None and not isinstance(screens, list):
+        raise ValueError("详情页分屏数据无效")
+    if len(screens or []) > 1000:
+        raise ValueError("详情页分屏数量异常")
+    for screen in screens or []:
+        if not isinstance(screen, Mapping):
+            raise ValueError("详情页分屏数据无效")
+        candidates = screen.get("candidates")
+        if candidates is not None and not isinstance(candidates, list):
+            raise ValueError("详情页候选数据无效")
+        if len(candidates or []) > 1000 or any(not isinstance(item, Mapping) for item in candidates or []):
+            raise ValueError("详情页候选数据无效")
+    clean = sanitize_portable_config(copy.deepcopy(dict(task)))
+    if not isinstance(clean, dict):
+        raise ValueError("详情页任务数据无效")
+    for key in (
+        "runtime_id", "submission_id", "submission_ids", "config_fingerprint",
+        "background_task", "screen_tasks", "client_id",
+    ):
+        clean.pop(key, None)
+    return _clear_runtime_state(clean)
+
+
+def prepare_imported_detail_task(
+    task: Mapping[str, Any],
+    *,
+    new_task_id: str,
+    new_submission_id: str,
+    new_group_no: int,
+    runtime_id: str,
+    imported_at: float,
+    url_mapping: Mapping[str, str] | None = None,
+    provider_id_map: Mapping[str, str] | None = None,
+) -> Dict[str, Any]:
+    """Import a history as an independent task that cannot resume source runtime work."""
+    source = prepare_exported_detail_task(task)
+    source_task_id = str(source.get("id") or "")
+    try:
+        source_group_no = int(source.get("group_no") or 0)
+    except (TypeError, ValueError):
+        source_group_no = 0
+    clean = rewrite_nested_values(source, url_mapping or {})
+    clean = rewrite_provider_references(clean, provider_id_map or {})
+    source_status = str(clean.get("status") or "")
+    was_active = source_status in _DETAIL_ACTIVE_STATUSES
+    if was_active:
+        clean["status"] = "interrupted"
+        clean["error"] = "任务在导出时仍在运行，导入后已安全中断；不会自动恢复或回补上游任务"
+    for screen in clean.get("screens") or []:
+        if not isinstance(screen, MutableMapping):
+            continue
+        if str(screen.get("status") or "") in _DETAIL_ACTIVE_STATUSES:
+            screen["status"] = "interrupted"
+            screen["error"] = "导入时已中断"
+        for candidate in screen.get("candidates") or []:
+            if not isinstance(candidate, MutableMapping):
+                continue
+            if str(candidate.get("status") or "") in _DETAIL_ACTIVE_STATUSES:
+                candidate["status"] = "interrupted"
+                candidate["error"] = "导入时已中断，不能回补源设备的上游任务"
+                candidate.pop("upstream_task_id", None)
+                candidate.pop("provider_snapshot", None)
+                candidate.pop("query_attempts", None)
+                candidate.pop("last_query_at", None)
+    clean.update({
+        "id": str(new_task_id),
+        "type": "detail-page",
+        "group_no": int(new_group_no),
+        "runtime_id": str(runtime_id or ""),
+        "submission_id": str(new_submission_id),
+        "submission_ids": [str(new_submission_id)],
+        "config_fingerprint": "",
+        "cancel_requested": False,
+        "imported_at": float(imported_at),
+        "imported_from": {
+            "task_id": source_task_id,
+            "group_no": source_group_no,
+        },
+    })
     return clean
 
 

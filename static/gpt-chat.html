@@ -8,6 +8,7 @@
     <script>
         (function(){
             try {
+                if(new URLSearchParams(location.search).get('embed') === 'canvas') document.documentElement.classList.add('canvas-chat-embed');
                 var theme = localStorage.getItem('studio_theme') || localStorage.getItem('canvas_theme') || 'light';
                 if(theme === 'dark') {
                     document.documentElement.classList.add('studio-theme-dark');
@@ -16,13 +17,13 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.20-custom.1.1787287297"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.08.20-custom.1.1787287297"></script>
-    <script src="/static/js/theme.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/i18n.js?v=2026.08.20-custom.1.1787287296"></script>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.20-custom.1.1787287296">
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.22-custom.1.1785863220"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.08.22-custom.1.1785863219"></script>
+    <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
+    <script src="/static/js/i18n.js?v=2026.08.22-custom.1.1786958929"></script>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.22-custom.1.1785863189">
     <style>
-        @import url('/static/vendor/css/fonts.css?v=2026.08.20-custom.1.1787287297');
+        @import url('/static/vendor/css/fonts.css?v=2026.08.22-custom.1.1785863213');
         :root {
             --ease:cubic-bezier(.4,0,.2,1);
             --chat-bg:#eef2f6;
@@ -70,6 +71,27 @@
         }
         * { box-sizing:border-box; }
         body { margin:0; height:100vh; overflow:hidden; background:var(--chat-bg); color:var(--chat-text); font-family:'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; -webkit-font-smoothing:antialiased; }
+        html.canvas-chat-embed:not(.studio-theme-dark):not(.theme-dark) {
+            --chat-bg:#fff;
+            --chat-panel:#fff;
+            --chat-panel-2:#f8fafc;
+            --chat-soft:#f8fafc;
+            --chat-line:#e5e7eb;
+            --chat-line-2:#d1d5db;
+            --chat-shadow:transparent;
+        }
+        html.canvas-chat-embed:not(.studio-theme-dark):not(.theme-dark) body,
+        html.canvas-chat-embed:not(.studio-theme-dark):not(.theme-dark) .chat-shell,
+        html.canvas-chat-embed:not(.studio-theme-dark):not(.theme-dark) .chat-main,
+        html.canvas-chat-embed:not(.studio-theme-dark):not(.theme-dark) .topbar,
+        html.canvas-chat-embed:not(.studio-theme-dark):not(.theme-dark) .composer-wrap { background:#fff; }
+        html.canvas-chat-embed:not(.studio-theme-dark):not(.theme-dark) .topbar { backdrop-filter:none; }
+        html.canvas-chat-embed:not(.studio-theme-dark):not(.theme-dark) .composer {
+            background:#fff;
+            border-color:var(--chat-line);
+            box-shadow:none;
+            backdrop-filter:none;
+        }
         html.studio-ui-scaled body:not(.studio-scale-host) {
             width:calc(100vw / var(--studio-ui-scale, 1)) !important;
         }
@@ -104,8 +126,8 @@
         .thread-delete:hover { background:rgba(100,116,139,.13); color:var(--chat-text); }
         .thread-item.active + .thread-delete { color:var(--chat-active-text); opacity:.58; }
         .thread-item.active + .thread-delete:hover { background:rgba(100,116,139,.14); color:var(--chat-active-text); opacity:1; }
-        .chat-main { width:100%; height:100%; min-width:0; min-height:0; position:relative; display:grid; grid-template-rows:auto minmax(0,1fr) auto; overflow:hidden; }
-        .topbar { min-height:74px; padding:0 30px; border-bottom:0; background:rgba(238,242,246,.72); backdrop-filter:blur(18px); z-index:5; }
+        .chat-main { width:100%; height:100%; min-width:0; min-height:0; position:relative; display:grid; grid-template-rows:auto auto minmax(0,1fr) auto; grid-template-areas:"topbar" "notice" "messages" "composer"; overflow:hidden; }
+        .topbar { grid-area:topbar; min-height:74px; padding:0 30px; border-bottom:0; background:rgba(238,242,246,.72); backdrop-filter:blur(18px); z-index:5; }
         .topbar-inner { height:100%; max-width:var(--chat-width); margin:0 auto; display:flex; align-items:center; justify-content:space-between; gap:18px; }
         .title-block { min-width:0; display:flex; flex-direction:column; gap:6px; }
         .title-block h1 { margin:0; color:var(--chat-text); font-size:18px; line-height:1.2; font-weight:950; letter-spacing:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -114,6 +136,19 @@
         .action-btn { height:38px; min-width:38px; padding:0 12px; border-radius:12px; display:flex; align-items:center; justify-content:center; gap:7px; background:var(--chat-panel); border:1px solid var(--chat-line); color:var(--chat-muted); font-size:11px; font-weight:850; transition:background .16s var(--ease), color .16s var(--ease), border-color .16s var(--ease); }
         .action-btn:hover { background:var(--chat-soft); color:var(--chat-text); border-color:var(--chat-line-2); }
         .action-btn i,.action-btn svg { width:16px; height:16px; }
+        .canvas-embed-collapse { display:none; }
+        html.canvas-chat-embed .canvas-embed-collapse { display:flex; }
+        .canvas-agent-notice { grid-area:notice; display:none; width:min(var(--chat-width),calc(100% - 32px)); margin:0 auto 2px; min-height:32px; padding:6px 10px; align-items:center; gap:8px; border:1px solid var(--chat-line); border-radius:10px; background:var(--chat-soft); color:var(--chat-muted); font-size:10px; line-height:1.4; font-weight:800; }
+        .canvas-agent-notice i,.canvas-agent-notice svg { width:14px; height:14px; flex:0 0 auto; }
+        .canvas-agent-notice-copy { min-width:0; display:flex; align-items:center; gap:5px; }
+        .canvas-agent-context-status { color:inherit; font-weight:750; }
+        html.canvas-chat-embed body.creative-agent-busy .canvas-agent-notice { display:flex; }
+        html.canvas-chat-embed #imageControls,
+        html.canvas-chat-embed #modelPicker { display:none !important; }
+        html.canvas-chat-embed .topbar { display:flex; flex-direction:column; gap:6px; padding:5px 16px 3px; }
+        html.canvas-chat-embed .topbar-inner { width:100%; min-height:48px; height:auto; }
+        html.studio-theme-dark .canvas-agent-notice,
+        html.theme-dark .canvas-agent-notice { border-color:var(--chat-line); background:var(--chat-soft); color:var(--chat-muted); }
         .history-toggle { display:flex; }
         .system-prompt-popover { position:absolute; top:52px; right:0; width:min(430px,calc(100vw - 36px)); display:none; flex-direction:column; gap:10px; padding:12px; background:rgba(248,250,252,.97); border:1px solid var(--chat-line); border-radius:16px; color:var(--chat-text); box-shadow:0 22px 54px rgba(15,23,42,.16); backdrop-filter:blur(18px); z-index:72; }
         .system-prompt-popover.open { display:flex; animation:popIn .16s var(--ease); }
@@ -127,7 +162,7 @@
         .system-prompt-actions button:hover { background:var(--chat-soft); color:var(--chat-text); border-color:var(--chat-line-2); }
         .system-prompt-actions .primary { background:var(--chat-strong); color:var(--chat-strong-text); border-color:var(--chat-strong); }
         .system-prompt-actions .primary:hover { background:var(--chat-strong); color:var(--chat-strong-text); opacity:.92; }
-        .messages { width:min(var(--chat-width),calc(100% - 60px)); min-height:0; margin:0 auto; overflow-y:auto; overflow-x:hidden; padding:24px 0 18px; display:flex; flex-direction:column; align-items:center; gap:16px; scroll-behavior:smooth; scrollbar-gutter:stable; }
+        .messages { grid-area:messages; width:min(var(--chat-width),calc(100% - 60px)); min-height:0; margin:0 auto; overflow-y:auto; overflow-x:hidden; padding:24px 0 18px; display:flex; flex-direction:column; align-items:center; gap:16px; scroll-behavior:smooth; scrollbar-gutter:stable; }
         .empty-state { margin:auto; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; color:var(--chat-faint); text-align:center; }
         .empty-state i,.empty-state svg { width:54px; height:54px; stroke-width:1.2; }
         .empty-state-text { font-size:11px; line-height:1; font-weight:950; letter-spacing:.22em; text-transform:uppercase; }
@@ -144,7 +179,8 @@
         .generated-grid.count-2,
         .generated-grid.count-3,
         .generated-grid.count-4 { grid-template-columns:repeat(2,minmax(0,1fr)); }
-        .bubble img.generated { display:block; width:auto; max-width:min(560px,100%); max-height:min(42vh,420px); height:auto; object-fit:contain; border-radius:14px; margin-top:0; border:1px solid var(--chat-line); cursor:zoom-in; }
+        .bubble img.generated,.bubble video.generated { display:block; width:auto; max-width:min(560px,100%); max-height:min(42vh,420px); height:auto; object-fit:contain; border-radius:14px; margin-top:0; border:1px solid var(--chat-line); }
+        .bubble img.generated { cursor:zoom-in; }
         .generated-grid.count-2 img.generated,
         .generated-grid.count-3 img.generated,
         .generated-grid.count-4 img.generated { width:100%; max-width:280px; }
@@ -154,7 +190,7 @@
         .thumb.file-thumb i,.thumb.file-thumb svg { width:15px; height:15px; flex:0 0 auto; color:var(--chat-muted); }
         .thumb-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .assistant .thumb { border-color:var(--chat-line); }
-        .composer-wrap { min-height:0; padding:10px 30px 18px; background:linear-gradient(to top,var(--chat-bg) 82%,rgba(238,242,246,0)); border-top:0; z-index:6; }
+        .composer-wrap { grid-area:composer; min-height:0; padding:10px 30px 18px; background:linear-gradient(to top,var(--chat-bg) 82%,rgba(238,242,246,0)); border-top:0; z-index:6; }
         .composer { width:min(var(--chat-width),calc(100% - 60px)); margin:0 auto; min-height:0; max-height:min(34vh,310px); background:rgba(248,250,252,.94); border:1px solid var(--chat-line); border-radius:18px; box-shadow:0 14px 36px var(--chat-shadow); padding:8px; display:flex; flex-direction:column; gap:8px; backdrop-filter:blur(14px); overflow:hidden; }
         .mode-switch { display:none; }
         .mode-switch button { height:30px; min-width:72px; border-radius:10px; display:flex; align-items:center; justify-content:center; gap:5px; color:var(--chat-muted); background:transparent; font-size:11px; font-weight:800; transition:background .16s var(--ease), color .16s var(--ease), box-shadow .16s var(--ease); }
@@ -243,6 +279,44 @@
         .upload-btn { width:36px; height:36px; border-radius:12px; flex:0 0 auto; display:flex; align-items:center; justify-content:center; background:var(--chat-panel); border:1px solid var(--chat-line); color:var(--chat-muted); transition:background .16s var(--ease), color .16s var(--ease), border-color .16s var(--ease), transform .16s var(--ease); }
         .upload-btn:hover { background:var(--chat-soft); color:var(--chat-text); border-color:var(--chat-line-2); transform:translateY(-1px); }
         .upload-btn i,.upload-btn svg { width:16px; height:16px; }
+        .creative-controls { display:none; align-items:center; gap:6px; position:relative; }
+        html.canvas-chat-embed .creative-controls { display:flex; }
+        .creative-control { position:relative; flex:0 0 auto; }
+        .creative-icon-btn,.creative-mode-button { height:36px; border-radius:12px; display:flex; align-items:center; justify-content:center; gap:6px; border:1px solid var(--chat-line); background:var(--chat-panel); color:var(--chat-muted); font-size:11px; font-weight:900; padding:0 9px; transition:background .16s var(--ease),color .16s var(--ease),border-color .16s var(--ease); }
+        .creative-icon-btn { width:36px; padding:0; }
+        .creative-icon-btn:hover,.creative-mode-button:hover,.creative-control.open > button { background:var(--chat-soft); color:var(--chat-text); border-color:var(--chat-line-2); }
+        .creative-icon-btn i,.creative-icon-btn svg,.creative-mode-button i,.creative-mode-button svg { width:16px; height:16px; }
+        .creative-popover { display:none; position:fixed; left:var(--creative-left,16px); bottom:var(--creative-bottom,76px); z-index:120; width:min(var(--creative-width,310px),calc(100vw - 24px)); max-height:min(520px,calc(100vh - 100px)); overflow:auto; padding:10px; border:1px solid var(--chat-line); border-radius:15px; background:var(--chat-panel); color:var(--chat-text); box-shadow:0 18px 48px rgba(15,23,42,.16); }
+        .creative-control.open .creative-popover { display:block; animation:popIn .14s var(--ease); }
+        .creative-menu-list { display:flex; flex-direction:column; gap:4px; }
+        .creative-menu-item { width:100%; min-height:38px; padding:8px 10px; border-radius:10px; display:flex; align-items:center; gap:9px; text-align:left; background:transparent; color:var(--chat-muted); font-size:12px; font-weight:850; }
+        .creative-menu-item:hover,.creative-menu-item.active { background:var(--chat-soft); color:var(--chat-text); }
+        .creative-menu-item i,.creative-menu-item svg { width:16px; height:16px; }
+        .creative-section { padding:8px 4px; border-top:1px solid var(--chat-line); }
+        .creative-section:first-child { padding-top:2px; border-top:0; }
+        .creative-section-title { margin-bottom:7px; color:var(--chat-muted); font-size:10px; font-weight:950; letter-spacing:.06em; }
+        .creative-check-list { display:flex; flex-direction:column; gap:5px; }
+        .creative-check { min-height:34px; display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:9px; background:var(--chat-soft); color:var(--chat-text); font-size:11px; font-weight:800; }
+        .creative-check input { accent-color:var(--chat-strong); }
+        .creative-check span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .creative-preference-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+        .creative-field { display:flex; flex-direction:column; gap:4px; color:var(--chat-muted); font-size:10px; font-weight:850; }
+        .creative-field select,.creative-field input { width:100%; height:34px; border:1px solid var(--chat-line); border-radius:9px; background:var(--chat-panel-2); color:var(--chat-text); padding:0 8px; outline:none; }
+        .creative-mention-popover { width:min(360px,calc(100vw - 24px)); }
+        .creative-media-list { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; max-height:300px; overflow:auto; }
+        .creative-media-item { position:relative; aspect-ratio:1; padding:0; border:2px solid transparent; border-radius:10px; overflow:hidden; background:var(--chat-soft); }
+        .creative-media-item.selected { border-color:var(--chat-strong); }
+        .creative-media-item img { width:100%; height:100%; object-fit:cover; }
+        .creative-media-item span { position:absolute; left:3px; bottom:3px; max-width:calc(100% - 6px); padding:2px 4px; border-radius:5px; background:rgba(15,23,42,.7); color:#fff; font-size:8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .creative-ref-marker { position:absolute; left:3px; top:3px; padding:2px 4px; border-radius:5px; background:#fff; color:#111827; font-size:8px; font-weight:950; }
+        .creative-result-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
+        .creative-result-actions button,.creative-result-actions a { min-height:32px; padding:0 10px; border:1px solid var(--chat-line); border-radius:9px; display:inline-flex; align-items:center; gap:6px; background:var(--chat-soft); color:var(--chat-text); font-size:10px; font-weight:900; text-decoration:none; }
+        .creative-result-actions .primary { background:var(--chat-strong); color:var(--chat-strong-text); border-color:var(--chat-strong); }
+        .creative-result-actions i,.creative-result-actions svg { width:14px; height:14px; }
+        .creative-prompt-details { display:none; margin-top:8px; padding:8px; border:1px solid var(--chat-line); border-radius:9px; background:var(--chat-panel-2); color:var(--chat-muted); font-size:11px; white-space:pre-wrap; }
+        .creative-prompt-details.open { display:block; }
+        .creative-stage { display:flex; align-items:center; gap:7px; color:var(--chat-muted); font-size:11px; font-weight:800; }
+        .creative-stage::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--chat-muted); animation:cursorBlink .9s steps(2,end) infinite; }
         .file-input { display:none; }
         .send-btn { width:42px; height:42px; border-radius:13px; display:flex; align-items:center; justify-content:center; background:var(--chat-strong); color:var(--chat-strong-text); transition:opacity .16s var(--ease), transform .16s var(--ease); flex:0 0 auto; }
         .send-btn:hover { transform:translateY(-1px); }
@@ -407,6 +481,7 @@
         body.studio-theme-dark .rail-new,
         html.theme-dark body .rail-new,
         body.theme-dark .rail-new { background:var(--chat-strong) !important; color:var(--chat-strong-text) !important; }
+        html.canvas-chat-embed body .composer { box-shadow:none !important; }
         @media (max-width:900px){
             .chat-shell { display:block; }
             .chat-rail { position:absolute; top:48px; right:0; left:auto; bottom:auto; z-index:70; width:min(330px,calc(100vw - 28px)); max-height:calc(100vh - 86px); transform:none; box-shadow:0 22px 54px rgba(15,23,42,.18); transition:none; }
@@ -423,6 +498,8 @@
             .composer-body { min-height:0; }
             textarea { min-height:36px; max-height:84px; }
             .inline-controls { align-items:stretch; flex-direction:column; flex:1; }
+            html.canvas-chat-embed .inline-controls { align-items:center; flex-direction:row; flex-wrap:nowrap; flex:0 1 auto; }
+            html.canvas-chat-embed .left-tools { flex-wrap:nowrap; }
             .model-picker { width:100%; min-width:0; max-width:none; flex-basis:auto; }
             .model-picker-popover { left:0; right:0; width:100%; max-height:360px; }
             .model-picker-body { grid-template-columns:1fr; }
@@ -438,6 +515,7 @@
             .bubble.image-bubble { max-width:90%; }
             .bubble img.generated { max-width:100%; max-height:34vh; }
             .action-btn span { display:none; }
+            .canvas-agent-notice { width:calc(100% - 28px); }
         }
         .messages,
         .composer-body,
@@ -494,24 +572,102 @@
                             <button onclick="event.stopPropagation();newConversation()" class="rail-new" title="新建对话" data-i18n-title="chat.newConversation"><i data-lucide="plus"></i><span data-i18n="chat.new">新建</span></button>
                             <div id="threadList" class="thread-list"></div>
                         </aside>
+                        <button id="canvasEmbedCollapse" onclick="event.stopPropagation();closeCanvasEmbed()" class="action-btn canvas-embed-collapse" title="收起对话" aria-label="收起对话"><i data-lucide="panel-right-close"></i></button>
                     </div>
                 </div>
             </header>
+
+            <div id="canvasAgentNotice" class="canvas-agent-notice" role="status">
+                <i data-lucide="sparkles"></i>
+                <div class="canvas-agent-notice-copy">
+                    <span id="canvasAgentContextStatus" class="canvas-agent-context-status">正在分析要求…</span>
+                </div>
+            </div>
 
             <section id="messages" class="messages"></section>
 
             <div class="composer-wrap">
                 <div class="composer">
                     <div id="composerBody" class="composer-body">
-                        <textarea id="messageInput" rows="4" placeholder="输入消息，Enter 发送..." data-i18n-placeholder="chat.inputPlaceholder" oninput="autoGrow(this)" onkeydown="handleKey(event)"></textarea>
+                        <textarea id="messageInput" rows="4" placeholder="输入消息，Enter 发送..." data-i18n-placeholder="chat.inputPlaceholder" oninput="handleCreativeInput(this)" onkeydown="handleKey(event)"></textarea>
                         <div id="refStrip" class="ref-strip"></div>
                         <div class="composer-inside-foot">
                             <div class="left-tools">
                                 <div class="inline-controls">
+                                    <div class="creative-controls" aria-label="创作 Agent 工具">
+                                        <div id="creativeModeControl" class="creative-control">
+                                            <button id="creativeModeButton" type="button" class="creative-mode-button" onclick="event.stopPropagation();toggleCreativePopover('creativeModeControl')" title="选择创作模式">
+                                                <i data-lucide="sparkles"></i><span id="creativeModeLabel">Agent</span><i data-lucide="chevron-up"></i>
+                                            </button>
+                                            <div class="creative-popover" onclick="event.stopPropagation()">
+                                                <div class="creative-menu-list">
+                                                    <button class="creative-menu-item active" data-creative-mode="agent" onclick="setCreativeMode('agent')"><i data-lucide="sparkles"></i>Agent</button>
+                                                    <button class="creative-menu-item" data-creative-mode="image" onclick="setCreativeMode('image')"><i data-lucide="image"></i>图片生成</button>
+                                                    <button class="creative-menu-item" data-creative-mode="video" onclick="setCreativeMode('video')"><i data-lucide="film"></i>视频生成</button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
                                     <input id="attachmentInput" class="file-input" type="file" multiple onchange="uploadFiles(this.files); this.value='';">
                                     <button type="button" class="upload-btn" onclick="document.getElementById('attachmentInput')?.click()" title="上传附件" aria-label="上传附件">
                                         <i data-lucide="paperclip"></i>
                                     </button>
+                                    <div class="creative-controls">
+                                        <div id="creativeMentionControl" class="creative-control">
+                                            <button id="creativeMentionButton" type="button" class="creative-icon-btn" onclick="event.stopPropagation();openCreativeMentionPicker()" title="@引用图片" aria-label="@引用图片"><i data-lucide="at-sign"></i></button>
+                                            <div class="creative-popover creative-mention-popover" onclick="event.stopPropagation()">
+                                                <div class="creative-section-title">画布、资产库和本次上传图片（最多 20 张）</div>
+                                                <div id="creativeMediaList" class="creative-media-list"></div>
+                                            </div>
+                                        </div>
+                                        <div id="creativeModelControl" class="creative-control">
+                                            <button id="creativeModelButton" type="button" class="creative-icon-btn" onclick="event.stopPropagation();toggleCreativeModelPicker()" title="Agent 模型池" aria-label="Agent 模型池"><i data-lucide="brain-circuit"></i></button>
+                                            <div class="creative-popover" onclick="event.stopPropagation()">
+                                                <div class="creative-section">
+                                                    <div class="creative-section-title">脑模型（使用当前选择）</div>
+                                                    <div class="creative-preference-grid">
+                                                        <label class="creative-field">平台<select id="creativeBrainProvider" onchange="setCreativeBrainProvider(this.value)"></select></label>
+                                                        <label class="creative-field">模型<select id="creativeBrainModel" onchange="setCreativeBrainModel(this.value)"></select></label>
+                                                    </div>
+                                                    <div id="creativeBrainModelLabel" class="creative-section-title" style="margin:7px 0 0">加载中…</div>
+                                                </div>
+                                                <div class="creative-section"><div class="creative-section-title">图片候选模型</div><div id="creativeImageCandidateList" class="creative-check-list"></div></div>
+                                                <div class="creative-section"><div class="creative-section-title">视频候选模型</div><div id="creativeVideoCandidateList" class="creative-check-list"></div></div>
+                                            </div>
+                                        </div>
+                                        <div id="creativePreferencesControl" class="creative-control">
+                                            <button id="creativePreferencesButton" type="button" class="creative-icon-btn" onclick="event.stopPropagation();toggleCreativePreferences()" title="生成偏好" aria-label="生成偏好"><i data-lucide="sliders-horizontal"></i></button>
+                                            <div class="creative-popover" onclick="event.stopPropagation()">
+                                                <div class="creative-section">
+                                                    <div class="creative-section-title">图片偏好</div>
+                                                    <div class="creative-preference-grid">
+                                                        <label class="creative-field">比例<select id="creativeImageRatio" onchange="saveCreativePreferencesFromUI()"><option value="adaptive">智能</option><option>1:1</option><option>1:4</option><option>1:8</option><option>2:3</option><option>3:2</option><option>3:4</option><option>4:3</option><option>4:5</option><option>5:4</option><option>4:1</option><option>8:1</option><option>9:16</option><option>16:9</option><option>21:9</option></select></label>
+                                                        <label class="creative-field">清晰度<select id="creativeImageResolution" onchange="saveCreativePreferencesFromUI()"><option value="auto">自动</option><option value="1k">1K</option><option value="2k">2K</option><option value="4k">4K</option><option value="custom">自定义</option></select></label>
+                                                        <label class="creative-field">质量<select id="creativeImageQuality" onchange="saveCreativePreferencesFromUI()"><option value="auto">自动</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></label>
+                                                        <label class="creative-field">数量<input id="creativeImageCount" type="number" min="1" max="10" value="1" onchange="saveCreativePreferencesFromUI()"></label>
+                                                        <label class="creative-field">自定义宽<input id="creativeImageWidth" type="number" min="256" max="8192" step="16" value="1024" onchange="saveCreativePreferencesFromUI()"></label>
+                                                        <label class="creative-field">自定义高<input id="creativeImageHeight" type="number" min="256" max="8192" step="16" value="1024" onchange="saveCreativePreferencesFromUI()"></label>
+                                                    </div>
+                                                </div>
+                                                <div class="creative-section">
+                                                    <div class="creative-section-title">视频偏好</div>
+                                                    <div class="creative-preference-grid">
+                                                        <label class="creative-field">比例<select id="creativeVideoRatio" onchange="saveCreativePreferencesFromUI()"><option>16:9</option><option>9:16</option><option>1:1</option><option>4:3</option><option>3:4</option><option>21:9</option><option>9:21</option><option value="adaptive">智能</option></select></label>
+                                                        <label class="creative-field">清晰度<select id="creativeVideoResolution" onchange="saveCreativePreferencesFromUI()"><option value="720p">720P</option><option value="1080p">1080P</option><option value="480p">480P</option></select></label>
+                                                        <label class="creative-field">时长<input id="creativeVideoDuration" type="number" min="1" max="60" value="5" onchange="saveCreativePreferencesFromUI()"></label>
+                                                        <label class="creative-check"><input id="creativeVideoAudio" type="checkbox" onchange="saveCreativePreferencesFromUI()"><span>生成声音</span></label>
+                                                        <label class="creative-check"><input id="creativeVideoEnhance" type="checkbox" checked onchange="saveCreativePreferencesFromUI()"><span>增强提示词</span></label>
+                                                        <label class="creative-check"><input id="creativeVideoUpsample" type="checkbox" onchange="saveCreativePreferencesFromUI()"><span>超分辨率</span></label>
+                                                        <label class="creative-check"><input id="creativeVideoMultimodal" type="checkbox" onchange="saveCreativePreferencesFromUI()"><span>多模态参考</span></label>
+                                                        <label class="creative-check"><input id="creativeVideoFirstFrame" type="checkbox" onchange="saveCreativePreferencesFromUI()"><span>首图作首帧</span></label>
+                                                        <label class="creative-check"><input id="creativeVideoLastFrame" type="checkbox" onchange="saveCreativePreferencesFromUI()"><span>第二张作尾帧</span></label>
+                                                        <label class="creative-check"><input id="creativeVideoWatermark" type="checkbox" onchange="saveCreativePreferencesFromUI()"><span>水印</span></label>
+                                                        <label class="creative-check"><input id="creativeVideoCameraFixed" type="checkbox" onchange="saveCreativePreferencesFromUI()"><span>固定镜头</span></label>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
                                     <div id="modelPicker" class="model-picker">
                                         <button id="modelPickerBtn" class="model-picker-button" onclick="event.stopPropagation();toggleModelPicker()" title="选择平台和模型">
                                             <i data-lucide="boxes"></i>
@@ -604,7 +760,24 @@
         <img id="imagePreviewImg" src="" alt="preview" onclick="event.stopPropagation()">
     </div>
 
+    <script src="/static/js/canvas-agent-chat-client.js?v=2026.08.22-custom.1.1787323537"></script>
     <script>
+        const isCanvasEmbed = new URLSearchParams(location.search).get('embed') === 'canvas';
+        const canvasAgentWorkspaceState = window.CanvasAgentChatClient.createCanvasAgentWorkspaceState();
+        const creativeAgentWorkspaceState = window.CanvasAgentChatClient.createCreativeAgentWorkspaceState();
+        const canvasAgentContextRequester = isCanvasEmbed && window.parent !== window
+            ? window.CanvasAgentChatClient.createCanvasAgentContextRequester({
+                windowRef:window,
+                parentRef:window.parent,
+                origin:location.origin,
+                timeoutMs:5000,
+            })
+            : null;
+        function workspaceMode(){ return isCanvasEmbed ? 'creative' : 'normal'; }
+        function closeCanvasEmbed(){
+            if(!isCanvasEmbed || window.parent === window) return;
+            parent.postMessage({type:'canvas-chat-close'}, location.origin);
+        }
         lucide.createIcons();
         function tr(key){ return window.StudioI18n ? StudioI18n.t(key) : key; }
         function defaultTitle(){ return tr('chat.newConversation'); }
@@ -618,7 +791,19 @@
             renderThreads();
         }
         window.addEventListener('message', event => {
+            if(event.origin !== location.origin || event.source !== window.parent) return;
+            if(event.data?.canvas_id) canvasAgentCanvasId = String(event.data.canvas_id);
             if(event.data?.type === 'studio-lang') applyLanguage(event.data.lang);
+            if(event.data?.type === 'canvas-creative-agent-media-response' && event.data.request_id === creativeMediaRequestId){
+                creativeMediaCatalog = Array.isArray(event.data.items) ? event.data.items.filter(item => item?.url) : [];
+                renderCreativeMediaCatalog();
+            }
+            if(event.data?.type === 'canvas-creative-agent-insert-response' && creativePendingInsertions.has(event.data.request_id)){
+                const button = creativePendingInsertions.get(event.data.request_id);
+                creativePendingInsertions.delete(event.data.request_id);
+                button.disabled = Boolean(event.data.ok);
+                button.textContent = event.data.ok ? '已放入画布' : (event.data.error || '放入失败，请重试');
+            }
         });
         window.addEventListener('studio-lang-change', () => {
             document.title = tr('chat.title');
@@ -637,6 +822,7 @@
         const USER_KEY = 'gpt_chat_browser_user';
         const CHAT_SETTINGS_KEY = 'gpt_chat_settings_v1';
         const CHAT_LAST_CONVERSATION_KEY = 'gpt_chat_last_conversation_v1';
+        const CREATIVE_AGENT_SETTINGS_KEY = 'canvas_creative_agent_settings_v1';
         const CHAT_ATTACHMENT_MAX = 20;
         const CHAT_SIZE_MODE_VERSION = 2;
         const userId = localStorage.getItem(USER_KEY) || uuid();
@@ -677,6 +863,23 @@
         let resolutionPickerHome = null;
         let refs = [];
         let config = { chat_model: 'gpt-5.5', image_model: 'gpt-image-2', ms_chat_models: [] };
+        let canvasAgentCanvasId = '';
+        let lastCanvasAgentContext = null;
+        let creativeAgentBusy = false;
+        let creativeAbortController = null;
+        let creativeMediaCatalog = [];
+        let creativeMediaRequestId = '';
+        let creativePendingInsertions = new Map();
+        let creativeImageCandidates = Array.isArray(savedChatSettings.creativeImageCandidates) ? savedChatSettings.creativeImageCandidates : [];
+        let creativeVideoCandidates = Array.isArray(savedChatSettings.creativeVideoCandidates) ? savedChatSettings.creativeVideoCandidates : [];
+        let creativePreferences = isObject(savedChatSettings.creativePreferences) ? savedChatSettings.creativePreferences : {
+            image:{aspect_ratio:'adaptive', resolution:'auto', quality:'auto', count:1, size:'1024x1024'},
+            video:{aspect_ratio:'16:9', resolution:'720p', duration:5, generate_audio:false, enhance_prompt:true, enable_upsample:false, multimodal:false, use_first_frame:false, use_last_frame:false, watermark:false, camera_fixed:false},
+        };
+        const workspaceSessions = {
+            normal:{conversations:[], currentConversation:null, refs:[]},
+            'canvas-agent':{conversations:[], currentConversation:null, refs:[]},
+        };
 
         const SIZE_OPTIONS = {
             square: [['1024x1024','1k'], ['1536x1536','2k'], ['2048x2048','4k']],
@@ -711,6 +914,134 @@
             catch(e) { return ''; }
         }
 
+        function canvasAgentLastConversationKey(){
+            return canvasAgentCanvasId ? `gpt_canvas_creative_agent_last_${canvasAgentCanvasId}` : '';
+        }
+
+        function rememberCanvasAgentConversation(id){
+            const key = canvasAgentLastConversationKey();
+            if(!key) return;
+            try {
+                if(id) localStorage.setItem(key, id);
+                else localStorage.removeItem(key);
+            } catch(e) {}
+        }
+
+        function rememberedCanvasAgentConversation(){
+            const key = canvasAgentLastConversationKey();
+            if(!key) return '';
+            try { return localStorage.getItem(key) || ''; }
+            catch(e) { return ''; }
+        }
+
+        function saveWorkspaceSession(name = workspaceMode()){
+            workspaceSessions[name] = {
+                conversations:[...(conversations || [])],
+                currentConversation,
+                refs:[...(refs || [])],
+            };
+        }
+
+        function restoreWorkspaceSession(name){
+            const state = workspaceSessions[name] || {conversations:[], currentConversation:null, refs:[]};
+            conversations = [...(state.conversations || [])];
+            currentConversation = state.currentConversation || null;
+            refs = name === 'normal' ? [...(state.refs || [])] : [];
+        }
+
+        function setCanvasWorkspaceBusy(value){
+            creativeAgentBusy = Boolean(value);
+            creativeAgentWorkspaceState.setBusy(Boolean(value));
+            document.body.classList.toggle('creative-agent-busy', creativeAgentBusy);
+            document.querySelectorAll('[data-creative-mode]').forEach(button => button.toggleAttribute('disabled', creativeAgentBusy));
+            const sendButton = document.getElementById('sendBtn');
+            if(sendButton){
+                sendButton.disabled = false;
+                sendButton.title = creativeAgentBusy ? '停止等待' : tr('chat.send');
+                sendButton.innerHTML = creativeAgentBusy ? '<i data-lucide="square"></i>' : '<i data-lucide="send"></i>';
+                lucide.createIcons();
+            }
+        }
+
+        function updateCanvasAgentContextStatus(context, error = ''){
+            const status = document.getElementById('canvasAgentContextStatus');
+            if(!status) return;
+            if(error){
+                status.textContent = error;
+                return;
+            }
+            if(!context){
+                status.textContent = '正在分析要求…';
+                return;
+            }
+            const selected = context.selection?.node_ids?.length || 0;
+            const images = context.selection?.sent_image_count || 0;
+            const detail = context.details?.length || 0;
+            const cropped = context.truncated ? ' · 内容已按安全上限裁剪' : '';
+            status.textContent = selected
+                ? `已按需读取 ${selected} 个选中节点和 ${detail} 个相关节点${cropped}`
+                : `已读取画布概要，共 ${context.summary?.node_count || 0} 个节点${cropped}`;
+        }
+
+        async function requestCanvasAgentContext(){
+            if(!isCanvasEmbed || !canvasAgentContextRequester) throw new Error('画布 Agent 只能在普通画布的内嵌对话中使用。');
+            const context = await canvasAgentContextRequester.request();
+            if(!context?.canvas?.id) throw new Error('画布上下文无效，请重新发送。');
+            lastCanvasAgentContext = context;
+            updateCanvasAgentContextStatus(context);
+            return context;
+        }
+
+        function syncCanvasWorkspaceUI(){
+            const agent = isCanvasEmbed;
+            document.body.classList.toggle('canvas-creative-agent-workspace', agent);
+            const promptTitle = document.querySelector('.system-prompt-title');
+            if(promptTitle) promptTitle.textContent = agent ? '表达偏好' : '系统提示词';
+            const promptInput = document.getElementById('systemPromptInput');
+            if(promptInput) promptInput.placeholder = agent
+                ? '例如：回答简洁，生成提示词优先使用中文。该内容不能覆盖工具和安全边界。'
+                : '例如：你是一个专业图片创作助手，回答要简洁，并优先给出可执行步骤。';
+            setChatTitle(currentConversation?.title || '');
+            renderThreads();
+            renderMessages(currentConversation?.messages || []);
+            renderRefs();
+            if(agent) syncCreativeModeUI();
+            else setMode(mode, false);
+            lucide.createIcons();
+        }
+
+        async function setCanvasWorkspaceMode(next){
+            if(!isCanvasEmbed) return;
+            const target = next === 'canvas-agent' ? 'canvas-agent' : 'normal';
+            const previous = workspaceMode();
+            if(target === previous) return;
+            saveWorkspaceSession(previous);
+            if(!canvasAgentWorkspaceState.switchTo(target)) return;
+            restoreWorkspaceSession(target);
+            toggleHistory(false);
+            toggleSystemPrompt(false);
+            syncCanvasWorkspaceUI();
+            if(target === 'canvas-agent'){
+                try {
+                    const context = await requestCanvasAgentContext();
+                    if(canvasAgentCanvasId && canvasAgentCanvasId !== context.canvas.id){
+                        workspaceSessions['canvas-agent'] = {conversations:[], currentConversation:null, refs:[]};
+                        restoreWorkspaceSession('canvas-agent');
+                    }
+                    canvasAgentCanvasId = context.canvas.id;
+                    await loadConversations();
+                } catch(error){
+                    updateCanvasAgentContextStatus(null, error?.message || '读取画布上下文失败，请重新发送。');
+                    conversations = [];
+                    currentConversation = null;
+                    renderThreads();
+                    renderMessages([]);
+                }
+            } else {
+                await loadConversations();
+            }
+        }
+
         function saveChatSettings(){
             try {
                 localStorage.setItem(CHAT_SETTINGS_KEY, JSON.stringify({
@@ -727,6 +1058,9 @@
                     chatPresetResolution,
                     chatCustomSize,
                     modelPickerScope,
+                    creativeImageCandidates,
+                    creativeVideoCandidates,
+                    creativePreferences,
                     chatSizeModeVersion: CHAT_SIZE_MODE_VERSION
                 }));
             } catch(e) {}
@@ -775,7 +1109,12 @@
             return (list || []).map(item => String(item || '').trim()).filter(item => item && !seen.has(item) && seen.add(item));
         }
         function chatProviders(){
-            const list = (apiProviders || []).filter(p => p.enabled !== false && (p.chat_models || []).length);
+            const list = (apiProviders || []).filter(p => {
+                if(p.enabled === false || !(p.chat_models || []).length) return false;
+                if(!isCanvasEmbed) return true;
+                const protocol = String(p.protocol || 'openai').toLowerCase();
+                return protocol !== 'codex' && protocol !== 'gemini-cli';
+            });
             if(config.ms_chat_models?.length && !list.some(p => p.id === 'modelscope')) list.push({id:'modelscope', name:'ModelScope', chat_models:config.ms_chat_models, image_models:[]});
             return list.length ? list : [{id:'comfly', name:'API', chat_models:[config.chat_model || 'gpt-4o-mini'], image_models:[config.image_model || 'gpt-image-2']}];
         }
@@ -783,11 +1122,31 @@
             const list = (apiProviders || []).filter(p => p.enabled !== false && (p.image_models || []).length);
             return list.length ? list : [{id:'comfly', name:'API', image_models:[config.image_model || 'gpt-image-2'], chat_models:[config.chat_model || 'gpt-4o-mini']}];
         }
+        function videoProviders(){
+            return (apiProviders || []).filter(p => p.enabled !== false && (p.video_models || []).length);
+        }
+        function creativeCandidateKey(item){ return `${item?.provider || ''}::${item?.model || ''}`; }
+        function allCreativeCandidates(kind){
+            const providers = kind === 'video' ? videoProviders() : imageProviders();
+            const field = kind === 'video' ? 'video_models' : 'image_models';
+            return providers.flatMap(item => uniqueModels(item[field] || []).map(model => ({provider:item.id, provider_name:item.name || item.id, model})));
+        }
+        function ensureCreativeCandidateDefaults(){
+            const images = allCreativeCandidates('image');
+            const videos = allCreativeCandidates('video');
+            const validImages = new Set(images.map(creativeCandidateKey));
+            const validVideos = new Set(videos.map(creativeCandidateKey));
+            creativeImageCandidates = creativeImageCandidates.filter(item => validImages.has(creativeCandidateKey(item)));
+            creativeVideoCandidates = creativeVideoCandidates.filter(item => validVideos.has(creativeCandidateKey(item)));
+            if(!creativeImageCandidates.length && images.length) creativeImageCandidates = [images.find(item => item.provider === activeImageProvider && item.model === activeImageModel) || images[0]];
+            if(!creativeVideoCandidates.length && videos.length) creativeVideoCandidates = [videos[0]];
+        }
         function providerById(id, kind='chat'){
             const list = kind === 'image' ? imageProviders() : chatProviders();
             return list.find(p => p.id === id) || list[0];
         }
         function activePickerKind(){
+            if(isCanvasEmbed) return 'chat';
             return mode === 'image' ? 'image' : (mode === 'agent' ? modelPickerScope : 'chat');
         }
         function currentProviderId(kind=activePickerKind()){
@@ -852,7 +1211,12 @@
                 config.chat_model = (config.chat_models || []).find(m => m === 'gpt-5.5') || config.chat_model || 'gpt-5.5';
                 config.image_model = config.image_model || ((config.image_models || [])[0]) || 'gpt-image-2';
                 validateSavedProviderState();
-                setMode(mode, false);
+                ensureCreativeCandidateDefaults();
+                if(isCanvasEmbed) {
+                    renderCreativeModelSettings();
+                    syncCreativePreferencesUI();
+                    syncCreativeModeUI();
+                } else setMode(mode, false);
                 updateModelLabel();
                 saveChatSettings();
             } catch(e) {}
@@ -1022,16 +1386,18 @@
             const currentPid = currentProviderId(kind);
             const currentMdl = currentModel(kind);
             providerLabel.textContent = providerNameById(currentPid, kind);
-            if(mode === 'agent') {
+            if(isCanvasEmbed) {
+                modelLabel.textContent = shortModelName(currentMdl);
+            } else if(mode === 'agent') {
                 modelLabel.textContent = `${shortModelName(activeChatModel)} + ${shortModelName(activeImageModel)}`;
             } else {
                 modelLabel.textContent = shortModelName(currentMdl);
             }
-            title.textContent = mode === 'agent' ? 'Agent 模型' : (kind === 'image' ? '生图模型' : '对话模型');
-            scope.innerHTML = mode === 'agent'
+            title.textContent = isCanvasEmbed ? '创作 Agent 脑模型' : (mode === 'agent' ? 'Agent 模型' : (kind === 'image' ? '生图模型' : '对话模型'));
+            scope.innerHTML = mode === 'agent' && !isCanvasEmbed
                 ? `<button class="${kind === 'chat' ? 'active' : ''}" onclick="setModelPickerScope('chat')">对话</button><button class="${kind === 'image' ? 'active' : ''}" onclick="setModelPickerScope('image')">图像</button>`
                 : '';
-            scope.style.display = mode === 'agent' ? 'flex' : 'none';
+            scope.style.display = mode === 'agent' && !isCanvasEmbed ? 'flex' : 'none';
             const providers = kind === 'image' ? imageProviders() : chatProviders();
             providerList.innerHTML = providers.length
                 ? providers.map(p => `<button class="model-picker-option ${p.id === currentPid ? 'active' : ''}" onclick="setProvider('${escapeHtml(p.id)}','${kind}')"><span>${escapeHtml(p.name || p.id)}</span>${p.id === currentPid ? '<i data-lucide="check"></i>' : ''}</button>`).join('')
@@ -1043,12 +1409,201 @@
             lucide.createIcons();
         }
 
+        function closeCreativePopovers(except=''){
+            ['creativeModeControl','creativeModelControl','creativePreferencesControl','creativeMentionControl'].forEach(id => {
+                if(id !== except) document.getElementById(id)?.classList.remove('open');
+            });
+        }
+        function positionCreativePopover(control){
+            const button = control?.querySelector('button');
+            const popover = control?.querySelector('.creative-popover');
+            if(!button || !popover) return;
+            const rect = button.getBoundingClientRect();
+            const viewportW = window.visualViewport?.width || innerWidth;
+            const viewportH = window.visualViewport?.height || innerHeight;
+            const width = Math.min(Number(control.id === 'creativeMentionControl' ? 360 : 320), viewportW - 24);
+            const left = Math.min(Math.max(12, rect.left), Math.max(12, viewportW - width - 12));
+            popover.style.setProperty('--creative-left', `${Math.round(left)}px`);
+            popover.style.setProperty('--creative-bottom', `${Math.round(Math.max(12, viewportH - rect.top + 8))}px`);
+            popover.style.setProperty('--creative-width', `${Math.round(width)}px`);
+        }
+        function toggleCreativePopover(id, force){
+            if(!isCanvasEmbed) return;
+            const control = document.getElementById(id);
+            if(!control) return;
+            const open = typeof force === 'boolean' ? force : !control.classList.contains('open');
+            closeCreativePopovers(open ? id : '');
+            control.classList.toggle('open', open);
+            if(open){ positionCreativePopover(control); lucide.createIcons(); }
+        }
+        function creativeMode(){ return creativeAgentWorkspaceState.mode(); }
+        function syncCreativeModeUI(){
+            const current = creativeMode();
+            const labels = {agent:'Agent', image:'图片生成', video:'视频生成'};
+            const icons = {agent:'sparkles', image:'image', video:'film'};
+            const label = document.getElementById('creativeModeLabel');
+            if(label) label.textContent = labels[current] || labels.agent;
+            const firstIcon = document.querySelector('#creativeModeButton i, #creativeModeButton svg');
+            if(firstIcon?.setAttribute) firstIcon.setAttribute('data-lucide', icons[current] || icons.agent);
+            document.querySelectorAll('[data-creative-mode]').forEach(button => button.classList.toggle('active', button.dataset.creativeMode === current));
+            lucide.createIcons();
+        }
+        function setCreativeMode(next){
+            if(creativeAgentBusy || !creativeAgentWorkspaceState.switchTo(next)) return;
+            syncCreativeModeUI();
+            toggleCreativePopover('creativeModeControl', false);
+        }
+        function renderCreativeCandidateList(kind){
+            const target = document.getElementById(kind === 'video' ? 'creativeVideoCandidateList' : 'creativeImageCandidateList');
+            if(!target) return;
+            const selected = kind === 'video' ? creativeVideoCandidates : creativeImageCandidates;
+            const selectedKeys = new Set(selected.map(creativeCandidateKey));
+            const items = allCreativeCandidates(kind);
+            target.innerHTML = items.length ? items.map(item => {
+                const key = creativeCandidateKey(item);
+                return `<label class="creative-check"><input type="checkbox" ${selectedKeys.has(key) ? 'checked' : ''} onchange="toggleCreativeCandidateEncoded('${kind}','${encodeURIComponent(item.provider).replace(/'/g,'%27')}','${encodeURIComponent(item.model).replace(/'/g,'%27')}',this.checked)"><span title="${escapeHtml(item.model)}">${escapeHtml(item.provider_name)} · ${escapeHtml(shortModelName(item.model))}</span></label>`;
+            }).join('') : '<div class="model-picker-empty">暂无已配置模型</div>';
+        }
+        function renderCreativeModelSettings(){
+            ensureCreativeCandidateDefaults();
+            const providerSelect = document.getElementById('creativeBrainProvider');
+            const modelSelect = document.getElementById('creativeBrainModel');
+            const providers = chatProviders();
+            if(providerSelect){
+                providerSelect.innerHTML = providers.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name || item.id)}</option>`).join('');
+                providerSelect.value = provider;
+            }
+            const brainModels = uniqueModels(providerById(provider, 'chat')?.chat_models || []);
+            if(modelSelect){
+                modelSelect.innerHTML = brainModels.map(item => `<option value="${escapeHtml(item)}">${escapeHtml(shortModelName(item))}</option>`).join('');
+                modelSelect.value = provider === 'modelscope' ? (msModel || activeChatModel) : activeChatModel;
+            }
+            const brain = document.getElementById('creativeBrainModelLabel');
+            if(brain) brain.textContent = `${providerNameById(provider, 'chat')} · ${shortModelName(provider === 'modelscope' ? (msModel || activeChatModel) : activeChatModel)}`;
+            renderCreativeCandidateList('image');
+            renderCreativeCandidateList('video');
+            saveChatSettings();
+        }
+        function toggleCreativeCandidate(kind, providerId, modelName, checked){
+            const target = kind === 'video' ? creativeVideoCandidates : creativeImageCandidates;
+            const key = creativeCandidateKey({provider:providerId, model:modelName});
+            const next = target.filter(item => creativeCandidateKey(item) !== key);
+            if(checked) next.push({provider:providerId, model:modelName});
+            if(kind === 'video') creativeVideoCandidates = next;
+            else creativeImageCandidates = next;
+            saveChatSettings();
+        }
+        function toggleCreativeCandidateEncoded(kind, providerId, modelName, checked){
+            toggleCreativeCandidate(kind, decodeURIComponent(providerId), decodeURIComponent(modelName), checked);
+        }
+        function toggleCreativeModelPicker(){
+            renderCreativeModelSettings();
+            toggleCreativePopover('creativeModelControl');
+        }
+        function setCreativeBrainProvider(next){
+            setProvider(next, 'chat');
+            renderCreativeModelSettings();
+        }
+        function setCreativeBrainModel(next){
+            setActiveModel(next, 'chat');
+            renderCreativeModelSettings();
+        }
+        function syncCreativePreferencesUI(){
+            const image = creativePreferences.image || {};
+            const video = creativePreferences.video || {};
+            const values = {
+                creativeImageRatio:image.aspect_ratio || 'adaptive', creativeImageResolution:image.resolution || 'auto', creativeImageQuality:image.quality || 'auto', creativeImageCount:image.count || 1,
+                creativeVideoRatio:video.aspect_ratio || '16:9', creativeVideoResolution:video.resolution || '720p', creativeVideoDuration:video.duration || 5,
+            };
+            Object.entries(values).forEach(([id,value]) => { const element = document.getElementById(id); if(element) element.value = String(value); });
+            const [width,height] = String(image.size || '1024x1024').split('x');
+            const widthInput = document.getElementById('creativeImageWidth');
+            const heightInput = document.getElementById('creativeImageHeight');
+            if(widthInput) widthInput.value = width || '1024';
+            if(heightInput) heightInput.value = height || '1024';
+            [['creativeVideoAudio','generate_audio'],['creativeVideoEnhance','enhance_prompt'],['creativeVideoUpsample','enable_upsample'],['creativeVideoMultimodal','multimodal'],['creativeVideoFirstFrame','use_first_frame'],['creativeVideoLastFrame','use_last_frame'],['creativeVideoWatermark','watermark'],['creativeVideoCameraFixed','camera_fixed']].forEach(([id,key]) => { const el=document.getElementById(id); if(el) el.checked=Boolean(video[key]); });
+        }
+        function saveCreativePreferencesFromUI(){
+            const value = id => document.getElementById(id)?.value || '';
+            const checked = id => Boolean(document.getElementById(id)?.checked);
+            const width = Math.max(256, Math.min(8192, Number(value('creativeImageWidth')) || 1024));
+            const height = Math.max(256, Math.min(8192, Number(value('creativeImageHeight')) || 1024));
+            creativePreferences = {
+                image:{aspect_ratio:value('creativeImageRatio') || 'adaptive', resolution:value('creativeImageResolution') || 'auto', quality:value('creativeImageQuality') || 'auto', count:Math.max(1,Math.min(10,Number(value('creativeImageCount')) || 1)), size:`${width}x${height}`},
+                video:{aspect_ratio:value('creativeVideoRatio') || '16:9', resolution:value('creativeVideoResolution') || '720p', duration:Math.max(1,Math.min(60,Number(value('creativeVideoDuration')) || 5)), generate_audio:checked('creativeVideoAudio'), enhance_prompt:checked('creativeVideoEnhance'), enable_upsample:checked('creativeVideoUpsample'), multimodal:checked('creativeVideoMultimodal'), use_first_frame:checked('creativeVideoFirstFrame'), use_last_frame:checked('creativeVideoLastFrame'), watermark:checked('creativeVideoWatermark'), camera_fixed:checked('creativeVideoCameraFixed')},
+            };
+            saveChatSettings();
+        }
+        function toggleCreativePreferences(){
+            syncCreativePreferencesUI();
+            toggleCreativePopover('creativePreferencesControl');
+        }
+
+        function requestCreativeMediaCatalog(){
+            if(!isCanvasEmbed || window.parent === window) return;
+            creativeMediaRequestId = uuid();
+            parent.postMessage({type:'canvas-creative-agent-media-request', request_id:creativeMediaRequestId}, location.origin);
+        }
+        function renderCreativeMediaCatalog(){
+            const target = document.getElementById('creativeMediaList');
+            if(!target) return;
+            const selected = new Set(refs.map(item => item.url));
+            const items = [...refs, ...creativeMediaCatalog].filter((item,index,array) => item?.url && array.findIndex(other => other.url === item.url) === index).slice(0,100);
+            target.innerHTML = items.length ? items.map(item => `<button type="button" class="creative-media-item ${selected.has(item.url) ? 'selected' : ''}" onclick="selectCreativeMedia(decodeURIComponent('${encodeURIComponent(item.url).replace(/'/g,'%27')}'))"><img src="${escapeHtml(item.url)}" alt=""><span>${escapeHtml(item.name || item.source || '图片')}</span></button>`).join('') : '<div class="model-picker-empty">当前没有可引用图片</div>';
+        }
+        function openCreativeMentionPicker(){
+            renderCreativeMediaCatalog();
+            requestCreativeMediaCatalog();
+            toggleCreativePopover('creativeMentionControl', true);
+        }
+        function selectCreativeMedia(url){
+            const item = [...refs, ...creativeMediaCatalog].find(entry => entry.url === url);
+            if(!item) return;
+            let ref = refs.find(entry => entry.url === url);
+            if(!ref){
+                if(refs.length >= CHAT_ATTACHMENT_MAX){ alert('最多管理 20 张图片'); return; }
+                ref = {...item, marker:nextCreativeMarker()};
+                refs.push(ref);
+            }
+            const input = document.getElementById('messageInput');
+            const marker = `@${ref.marker}`;
+            const start = input.selectionStart ?? input.value.length;
+            const end = input.selectionEnd ?? start;
+            const before = input.value.slice(0,start).replace(/@$/, '');
+            const spacer = before && !/\s$/.test(before) ? ' ' : '';
+            input.value = `${before}${spacer}${marker} ${input.value.slice(end)}`;
+            input.focus();
+            const cursor = before.length + spacer.length + marker.length + 1;
+            input.setSelectionRange(cursor,cursor);
+            renderRefs();
+            renderCreativeMediaCatalog();
+            autoGrow(input);
+        }
+        function handleCreativeInput(input){
+            autoGrow(input);
+            if(isCanvasEmbed && /@$/.test(input.value.slice(0,input.selectionStart || input.value.length))) openCreativeMentionPicker();
+        }
+
+        function nextCreativeMarker(offset=0){
+            const max = refs.reduce((value,item) => Math.max(value, Number(String(item?.marker || '').match(/图片(\d+)/)?.[1] || 0)), 0);
+            return `图片${max + offset + 1}`;
+        }
+
         async function loadConversations(){
-            const data = await fetch('/api/conversations', {headers:{'X-User-ID':userId}}).then(r=>r.json());
+            if(isCanvasEmbed && !canvasAgentCanvasId){
+                await waitForCreativeCanvasId();
+            }
+            const url = isCanvasEmbed
+                ? `/api/canvas-creative-agent/conversations?canvas_id=${encodeURIComponent(canvasAgentCanvasId)}`
+                : '/api/conversations';
+            const data = await fetch(url, {headers:{'X-User-ID':userId}}).then(async response => {
+                if(!response.ok) throw new Error((await response.json()).detail || '读取历史失败');
+                return response.json();
+            });
             conversations = data.conversations || [];
             renderThreads();
             if(!currentConversation) {
-                const rememberedId = rememberedConversation();
+                const rememberedId = isCanvasEmbed ? rememberedCanvasAgentConversation() : rememberedConversation();
                 const target = (rememberedId && conversations.find(item => item.id === rememberedId)) || conversations[0];
                 if(target) await openConversation(target.id);
             }
@@ -1082,9 +1637,26 @@
         }
 
         async function newConversation(){
-            const data = await fetch('/api/conversations', {method:'POST', headers:headers(), body:JSON.stringify({title:'新对话'})}).then(r=>r.json());
+            let url = '/api/conversations';
+            let body = {title:'新对话'};
+            if(isCanvasEmbed){
+                if(!canvasAgentCanvasId){
+                    await waitForCreativeCanvasId();
+                }
+                url = '/api/canvas-creative-agent/conversations';
+                body = {canvas_id:canvasAgentCanvasId, title:'新对话'};
+            }
+            const data = await fetch(url, {method:'POST', headers:headers(), body:JSON.stringify(body)}).then(async response => {
+                if(!response.ok) throw new Error((await response.json()).detail || '新建对话失败');
+                return response.json();
+            });
             currentConversation = data.conversation;
-            rememberConversation(currentConversation.id);
+            if(isCanvasEmbed) {
+                rememberCanvasAgentConversation(currentConversation.id);
+                creativeAgentWorkspaceState.newConversation();
+                syncCreativeModeUI();
+            }
+            else rememberConversation(currentConversation.id);
             setChatTitle(currentConversation.title);
             await loadConversations();
             renderMessages([]);
@@ -1092,9 +1664,21 @@
         }
 
         async function openConversation(id, closePanel=false){
-            const data = await fetch(`/api/conversations/${id}`, {headers:{'X-User-ID':userId}}).then(r=>r.json());
+            const url = isCanvasEmbed
+                ? `/api/canvas-creative-agent/conversations/${encodeURIComponent(id)}?canvas_id=${encodeURIComponent(canvasAgentCanvasId)}`
+                : `/api/conversations/${encodeURIComponent(id)}`;
+            const data = await fetch(url, {headers:{'X-User-ID':userId}}).then(async response => {
+                if(!response.ok) throw new Error((await response.json()).detail || '读取对话失败');
+                return response.json();
+            });
             currentConversation = data.conversation;
-            rememberConversation(currentConversation.id);
+            if(isCanvasEmbed) {
+                rememberCanvasAgentConversation(currentConversation.id);
+                const lastMode = [...(currentConversation.messages || [])].reverse().find(item => ['agent','image','video'].includes(item.mode))?.mode || 'agent';
+                creativeAgentWorkspaceState.switchTo(lastMode);
+                syncCreativeModeUI();
+            }
+            else rememberConversation(currentConversation.id);
             setChatTitle(currentConversation.title);
             renderThreads();
             renderMessages(currentConversation.messages || []);
@@ -1104,9 +1688,18 @@
         async function deleteConversation(id, event){
             event.stopPropagation();
             if(!confirm(tr('chat.deleteConfirm'))) return;
-            await fetch(`/api/conversations/${id}`, {method:'DELETE', headers:{'X-User-ID':userId}});
+            const url = isCanvasEmbed
+                ? `/api/canvas-creative-agent/conversations/${encodeURIComponent(id)}?canvas_id=${encodeURIComponent(canvasAgentCanvasId)}`
+                : `/api/conversations/${encodeURIComponent(id)}`;
+            await fetch(url, {method:'DELETE', headers:{'X-User-ID':userId}});
             const deletedCurrent = currentConversation?.id === id;
-            if(deletedCurrent){ currentConversation = null; rememberConversation(''); setChatTitle(''); renderMessages([]); }
+            if(deletedCurrent){
+                currentConversation = null;
+                if(isCanvasEmbed) rememberCanvasAgentConversation('');
+                else rememberConversation('');
+                setChatTitle('');
+                renderMessages([]);
+            }
             await loadConversations();
             if(deletedCurrent && conversations[0]) await openConversation(conversations[0].id);
         }
@@ -1119,6 +1712,7 @@
         }
 
         document.addEventListener('click', (event) => {
+            if(!event.target.closest?.('.creative-control')) closeCreativePopovers();
             const picker = document.getElementById('modelPicker');
             const popover = document.getElementById('modelPickerPopover');
             if(picker?.classList.contains('open') && !picker.contains(event.target) && !popover?.contains(event.target)) toggleModelPicker(false);
@@ -1140,7 +1734,7 @@
             document.getElementById('chatModeBtn')?.classList.toggle('active', next === 'chat');
             document.getElementById('agentModeBtn')?.classList.toggle('active', next === 'agent');
             document.getElementById('imageModeBtn')?.classList.toggle('active', next === 'image');
-            document.getElementById('imageControls')?.classList.toggle('hidden', next === 'chat');
+            document.getElementById('imageControls')?.classList.toggle('hidden', next === 'chat' || workspaceMode() === 'canvas-agent');
             renderProviderControls();
             updateModelLabel();
             if(persist) saveChatSettings();
@@ -1148,7 +1742,9 @@
 
         function updateModelLabel(){
             let label = '';
-            if (mode === 'image') {
+            if(workspaceMode() === 'canvas-agent') {
+                label = `画布 Agent · ${(provider === 'modelscope' ? (msModel || activeChatModel) : activeChatModel || config.chat_model || 'Chat').split('/').pop().split(':')[0]}`;
+            } else if (mode === 'image') {
                 label = activeImageModel || config.image_model || 'Image';
             } else if (mode === 'agent') {
                 const chatLabel = provider === 'modelscope'
@@ -1359,7 +1955,10 @@
             const bubble = document.createElement('div');
             bubble.className = `bubble ${msg.role === 'user' ? 'user' : 'assistant'}`;
             const imageUrls = Array.isArray(msg.image_urls) && msg.image_urls.length ? msg.image_urls : (msg.image_url ? [msg.image_url] : []);
-            if(imageUrls.length) bubble.classList.add('image-bubble');
+            const media = Array.isArray(msg.media) && msg.media.length
+                ? msg.media.filter(item => item?.url)
+                : imageUrls.map(url => ({url, kind:'image', name:'生成图片'}));
+            if(media.length) bubble.classList.add('image-bubble');
             const text = document.createElement('div');
             text.textContent = msg.type === 'image' ? (msg.agent_reply || tr('chat.generated')) : (msg.content || '');
             text.className = 'bubble-text';
@@ -1373,17 +1972,27 @@
                 });
                 bubble.appendChild(thumbs);
             }
-            if(imageUrls.length){
+            if(media.length){
                 const grid = document.createElement('div');
-                grid.className = `generated-grid count-${Math.min(imageUrls.length, 4)}`;
-                imageUrls.forEach(url => {
-                    const img = document.createElement('img');
-                    img.className = 'generated';
-                    img.src = url;
-                    img.onclick = () => openImagePreview(url);
-                    grid.appendChild(img);
+                grid.className = `generated-grid count-${Math.min(media.length, 4)}`;
+                media.forEach(item => {
+                    if(item.kind === 'video'){
+                        const video = document.createElement('video');
+                        video.className = 'generated';
+                        video.src = item.url;
+                        video.controls = true;
+                        video.playsInline = true;
+                        grid.appendChild(video);
+                        return;
+                    }
+                    const image = document.createElement('img');
+                    image.className = 'generated';
+                    image.src = item.url;
+                    image.onclick = () => openImagePreview(item.url);
+                    grid.appendChild(image);
                 });
                 bubble.appendChild(grid);
+                if(isCanvasEmbed && msg.role === 'assistant') bubble.appendChild(createCreativeResultActions(msg, media));
             }
             // Show model badge for assistant messages
             if(msg.role === 'assistant' && msg.model){
@@ -1398,6 +2007,68 @@
             box.appendChild(row);
             lucide.createIcons();
             return {row, bubble, text};
+        }
+
+        function createCreativeResultActions(message, media){
+            const actions = document.createElement('div');
+            actions.className = 'creative-result-actions';
+            const insert = document.createElement('button');
+            insert.type = 'button';
+            insert.className = 'primary';
+            insert.innerHTML = '<i data-lucide="plus-square"></i>放入画布';
+            insert.onclick = () => insertCreativeMediaIntoCanvas(message, media, insert);
+            const regenerate = document.createElement('button');
+            regenerate.type = 'button';
+            regenerate.innerHTML = '<i data-lucide="refresh-cw"></i>重新生成';
+            regenerate.onclick = () => regenerateCreativeMessage(message);
+            actions.append(insert, regenerate);
+            media.forEach((item,index) => {
+                const download = document.createElement('a');
+                download.href = item.url;
+                download.download = item.name || `生成结果-${index + 1}`;
+                download.target = '_blank';
+                download.rel = 'noopener';
+                download.innerHTML = `<i data-lucide="download"></i>${media.length > 1 ? `下载${index + 1}` : '下载'}`;
+                actions.appendChild(download);
+            });
+            const detailsButton = document.createElement('button');
+            detailsButton.type = 'button';
+            detailsButton.innerHTML = '<i data-lucide="text"></i>查看优化提示词';
+            const details = document.createElement('div');
+            details.className = 'creative-prompt-details';
+            details.textContent = message.optimized_prompt || message.content || '';
+            detailsButton.onclick = () => details.classList.toggle('open');
+            const wrap = document.createElement('div');
+            wrap.style.width = '100%';
+            wrap.append(detailsButton, details);
+            actions.appendChild(wrap);
+            return actions;
+        }
+        function insertCreativeMediaIntoCanvas(message, media, button){
+            if(!isCanvasEmbed || window.parent === window || !canvasAgentCanvasId) return;
+            const requestId = uuid();
+            button.disabled = true;
+            button.textContent = '正在放入…';
+            creativePendingInsertions.set(requestId, button);
+            parent.postMessage({
+                type:'canvas-creative-agent-insert-media',
+                request_id:requestId,
+                canvas_id:canvasAgentCanvasId,
+                media,
+                optimized_prompt:message.optimized_prompt || message.content || '',
+            }, location.origin);
+            setTimeout(() => {
+                if(!creativePendingInsertions.has(requestId)) return;
+                creativePendingInsertions.delete(requestId);
+                button.disabled = false;
+                button.textContent = '放入失败，请重试';
+            }, 8000);
+        }
+        function regenerateCreativeMessage(message){
+            const input = document.getElementById('messageInput');
+            input.value = message.optimized_prompt || message.content || '';
+            input.focus();
+            autoGrow(input);
         }
 
         function openImagePreview(url){
@@ -1445,7 +2116,7 @@
 
         function renderRefChip(ref, i){
             if(isImageRef(ref)){
-                return `<div class="ref-chip"><img src="${escapeHtml(ref.url)}" title="${escapeHtml(attachmentName(ref))}"><button onclick="removeRef(${i})">×</button></div>`;
+                return `<div class="ref-chip"><img src="${escapeHtml(ref.url)}" title="${escapeHtml(attachmentName(ref))}">${isCanvasEmbed ? `<span class="creative-ref-marker">@${escapeHtml(ref.marker || `图片${i + 1}`)}</span>` : ''}<button onclick="removeRef(${i})">×</button></div>`;
             }
             return `<div class="ref-chip file"><i data-lucide="file"></i><span class="ref-file-name" title="${escapeHtml(attachmentName(ref))}">${escapeHtml(attachmentName(ref))}</span><button onclick="removeRef(${i})">×</button></div>`;
         }
@@ -1458,7 +2129,9 @@
             [...files].slice(0, available).forEach(file => form.append('files', file));
             try {
                 const data = await fetch('/api/ai/upload', {method:'POST', body:form}).then(async r => { if(!r.ok) throw new Error((await r.json()).detail || '上传失败'); return r.json(); });
-                refs.push(...(data.files || []));
+                const knownUrls = new Set(refs.map(item => item.url));
+                const uploaded = (data.files || []).filter(item => (!isCanvasEmbed || isImageRef(item)) && item?.url && !knownUrls.has(item.url) && knownUrls.add(item.url));
+                refs.push(...uploaded.map((item,index) => ({...item, marker:nextCreativeMarker(index)})));
                 renderRefs();
             } catch(e) {
                 alert(e.message || '上传失败');
@@ -1505,10 +2178,222 @@
         function autoGrow(el){ el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 150) + 'px'; updateComposerOverflow(); }
         function handleKey(e){ if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendMessage(); } }
         window.addEventListener('keydown', e => {
-            if(e.key === 'Escape') closeImagePreview();
+            if(e.key === 'Escape') { closeImagePreview(); closeCreativePopovers(); }
         });
 
+        async function waitForCreativeCanvasId(){
+            if(canvasAgentCanvasId) return canvasAgentCanvasId;
+            requestCreativeMediaCatalog();
+            const started = Date.now();
+            while(!canvasAgentCanvasId && Date.now() - started < 3000) await new Promise(resolve => setTimeout(resolve, 40));
+            if(!canvasAgentCanvasId) throw new Error('画布尚未加载完成，请稍后重新发送。');
+            return canvasAgentCanvasId;
+        }
+
+        async function sendCanvasCreativeAgentMessage(){
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            if(creativeAgentBusy){ creativeAbortController?.abort(); return; }
+            if(!message) return;
+            const button = document.getElementById('sendBtn');
+            let assistantBubble = null;
+            let context = null;
+            setCanvasWorkspaceBusy(true);
+            creativeAbortController = new AbortController();
+            closeCreativePopovers();
+            try {
+                await waitForCreativeCanvasId();
+                if(window.CanvasAgentChatClient.shouldRequestCreativeCanvasContext(message)){
+                    context = await requestCanvasAgentContext();
+                    if(context.canvas.id !== canvasAgentCanvasId) throw new Error('画布已经切换，请重新发送。');
+                }
+                const pendingRefs = window.CanvasAgentChatClient.resolveCreativeAgentReferences(message, refs).slice(0, CHAT_ATTACHMENT_MAX);
+                refs = [];
+                renderRefs();
+                input.value = '';
+                autoGrow(input);
+                if(!currentConversation){
+                    currentConversation = {id:'', kind:'canvas_creative_agent', canvas_id:canvasAgentCanvasId, title:'新对话', messages:[]};
+                    document.getElementById('messages').innerHTML = '';
+                }
+                addMessageBubble({role:'user', content:message, attachments:pendingRefs, mode:creativeMode()});
+                assistantBubble = addMessageBubble({role:'assistant', content:'正在分析要求…'});
+                assistantBubble.bubble.classList.add('streaming');
+                scrollBottom();
+                const brainModel = provider === 'modelscope' ? (msModel || activeChatModel || (config.ms_chat_models?.[0] || '')) : (activeChatModel || config.chat_model);
+                const response = await fetch('/api/chat/canvas-creative-agent/stream', {
+                    method:'POST', headers:headers(), body:JSON.stringify({
+                        conversation_id:currentConversation.id || '',
+                        canvas_id:canvasAgentCanvasId,
+                        mode:creativeMode(),
+                        message,
+                        system_prompt:currentSystemPrompt(),
+                        brain_provider:provider,
+                        brain_model:brainModel,
+                        brain_ms_model:provider === 'modelscope' ? brainModel : '',
+                        image_candidates:creativeImageCandidates,
+                        video_candidates:creativeVideoCandidates,
+                        preferences:creativePreferences,
+                        reference_images:pendingRefs,
+                        canvas_context:context,
+                    }), signal:creativeAbortController.signal,
+                });
+                if(!response.ok) throw new Error((await response.json()).detail || tr('chat.requestFailed'));
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let fullText = '';
+                while(true){
+                    const {value, done} = await reader.read();
+                    if(done) break;
+                    buffer += decoder.decode(value, {stream:true});
+                    const chunks = buffer.split('\n\n');
+                    buffer = chunks.pop() || '';
+                    for(const chunk of chunks){
+                        const line = chunk.split('\n').find(item => item.startsWith('data:'));
+                        if(!line) continue;
+                        const event = JSON.parse(line.slice(5).trim());
+                        if(event.type === 'meta'){
+                            currentConversation = event.conversation;
+                            rememberCanvasAgentConversation(currentConversation.id);
+                            setChatTitle(currentConversation.title);
+                        } else if(event.type === 'stage'){
+                            document.getElementById('canvasAgentContextStatus').textContent = event.message || '正在处理…';
+                            assistantBubble.text.innerHTML = `<span class="creative-stage">${escapeHtml(event.message || '正在处理…')}</span>`;
+                        } else if(event.type === 'delta'){
+                            fullText += event.delta || '';
+                            assistantBubble.text.textContent = fullText;
+                        } else if(event.type === 'tool_plan'){
+                            assistantBubble.text.textContent = `已优化提示词，正在使用 ${shortModelName(event.model)} 生成…`;
+                        } else if(event.type === 'error'){
+                            throw new Error(event.detail || tr('chat.requestFailed'));
+                        } else if(event.type === 'done'){
+                            currentConversation = event.conversation;
+                            rememberCanvasAgentConversation(currentConversation.id);
+                            setChatTitle(currentConversation.title);
+                            renderMessages(currentConversation.messages || []);
+                            await loadConversations();
+                        }
+                        scrollBottom();
+                    }
+                }
+                assistantBubble.bubble.classList.remove('streaming');
+            } catch(error){
+                const detail = error?.name === 'AbortError'
+                    ? '已停止本地等待；若平台不支持远程取消，官网任务可能仍在运行。'
+                    : (error?.message || tr('chat.requestFailed'));
+                if(assistantBubble){ assistantBubble.bubble.classList.remove('streaming'); assistantBubble.text.textContent = detail; }
+                else alert(detail);
+            } finally {
+                creativeAbortController = null;
+                setCanvasWorkspaceBusy(false);
+                scrollBottom();
+            }
+        }
+
+        async function sendCanvasAgentMessage(){
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            if(!message || canvasAgentWorkspaceState.isBusy()) return;
+            const btn = document.getElementById('sendBtn');
+            let assistantBubble = null;
+            setCanvasWorkspaceBusy(true);
+            btn.disabled = true;
+            try {
+                const context = await requestCanvasAgentContext();
+                if(canvasAgentCanvasId && canvasAgentCanvasId !== context.canvas.id){
+                    canvasAgentCanvasId = context.canvas.id;
+                    conversations = [];
+                    currentConversation = null;
+                    workspaceSessions['canvas-agent'] = {conversations:[], currentConversation:null, refs:[]};
+                    await loadConversations();
+                    throw new Error('画布已切换，已载入新画布的 Agent 历史；请重新发送这条消息。');
+                }
+                canvasAgentCanvasId = context.canvas.id;
+                const selectedImages = (context.selected_images || []).slice(0, 6);
+                input.value = '';
+                autoGrow(input);
+                if(!currentConversation){
+                    currentConversation = {id:'', kind:'canvas_agent', canvas_id:canvasAgentCanvasId, title:'新分析', messages:[]};
+                    document.getElementById('messages').innerHTML = '';
+                }
+                addMessageBubble({role:'user', content:message, attachments:selectedImages});
+                assistantBubble = addMessageBubble({role:'assistant', content:''});
+                assistantBubble.bubble.classList.add('streaming');
+                scrollBottom();
+                const currentProvider = provider;
+                const currentMsModel = provider === 'modelscope' ? (msModel || activeChatModel || (config.ms_chat_models?.[0] || '')) : '';
+                const currentModel = provider === 'modelscope' ? currentMsModel : (activeChatModel || config.chat_model);
+                const response = await fetch('/api/chat/canvas-agent/stream', {
+                    method:'POST',
+                    headers:headers(),
+                    body:JSON.stringify({
+                        conversation_id:currentConversation.id || '',
+                        canvas_id:canvasAgentCanvasId,
+                        message,
+                        system_prompt:currentSystemPrompt(),
+                        model:currentModel,
+                        ms_model:currentMsModel,
+                        provider:currentProvider,
+                        canvas_context:context,
+                        reference_images:selectedImages,
+                    }),
+                });
+                if(!response.ok) throw new Error((await response.json()).detail || tr('chat.requestFailed'));
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let fullText = '';
+                while(true){
+                    const {value, done} = await reader.read();
+                    if(done) break;
+                    buffer += decoder.decode(value, {stream:true});
+                    const events = buffer.split('\n\n');
+                    buffer = events.pop() || '';
+                    for(const eventText of events){
+                        const line = eventText.split('\n').find(item => item.startsWith('data:'));
+                        if(!line) continue;
+                        const event = JSON.parse(line.slice(5).trim());
+                        if(event.type === 'meta'){
+                            currentConversation = event.conversation;
+                            rememberCanvasAgentConversation(currentConversation.id);
+                            setChatTitle(currentConversation.title);
+                            if(event.context_summary?.truncated) updateCanvasAgentContextStatus(context);
+                        }
+                        if(event.type === 'delta'){
+                            fullText += event.delta || '';
+                            assistantBubble.text.textContent = fullText;
+                            scrollBottom();
+                        }
+                        if(event.type === 'error') throw new Error(event.detail || tr('chat.requestFailed'));
+                        if(event.type === 'done'){
+                            assistantBubble.bubble.classList.remove('streaming');
+                            currentConversation = event.conversation;
+                            rememberCanvasAgentConversation(currentConversation.id);
+                            setChatTitle(currentConversation.title);
+                            renderMessages(currentConversation.messages || []);
+                            await loadConversations();
+                        }
+                    }
+                }
+                assistantBubble.bubble.classList.remove('streaming');
+            } catch(error){
+                const messageText = error?.message || tr('chat.requestFailed');
+                if(assistantBubble){
+                    assistantBubble.bubble.classList.remove('streaming');
+                    assistantBubble.text.textContent = messageText;
+                } else {
+                    updateCanvasAgentContextStatus(null, messageText);
+                }
+            } finally {
+                btn.disabled = false;
+                setCanvasWorkspaceBusy(false);
+                scrollBottom();
+            }
+        }
+
         async function sendMessage(){
+            if(isCanvasEmbed) return sendCanvasCreativeAgentMessage();
             const input = document.getElementById('messageInput');
             const message = input.value.trim();
             if(!message) return;
@@ -1682,10 +2567,12 @@
             setChatRatio(chatRatio);
             setChatResolution(chatResolution);
             await loadConfig();
+            if(isCanvasEmbed) syncCanvasWorkspaceUI();
             await loadConversations();
             updateComposerOverflow();
         };
+        window.addEventListener('beforeunload', () => canvasAgentContextRequester?.dispose());
     </script>
-    <script src="/static/js/global-prompt-library.js?v=2026.08.20-custom.1.1787287296"></script>
+    <script src="/static/js/global-prompt-library.js?v=2026.08.22-custom.1.1786676777"></script>
 </body>
 </html>

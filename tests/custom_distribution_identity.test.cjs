@@ -91,8 +91,14 @@ test('custom version and update notes form one release identity', () => {
     assert.match(version, /^\d{4}\.\d{2}\.\d{2}-custom\.\d+$/);
     assert.equal(notes.version, version);
     assert.deepEqual(notes.items, [
-        { type: 'fix', text: '将新安装的 RunningHub 默认请求地址切换为国内站' }
+        { type: 'feature', text: '一键详情页新增多任务跟踪、历史完整恢复、异步断线回补和永久分组编号' },
+        { type: 'feature', text: '备份系统支持选择并迁移一键详情页历史及相关媒体' },
+        { type: 'feature', text: '普通画布新增右侧创作 Agent、顶部工具栏和画布图片引用管理' },
+        { type: 'feature', text: 'RunningHub 支持远程取消、实时进度和账户状态显示' },
+        { type: 'improvement', text: '优化循环流程并发、重复运行状态、日志保留、版本管理和启动服务' },
+        { type: 'fix', text: '修复详情页重复提交、普通画布节点布局及多项界面交互问题' }
     ]);
+    assert.match(main, new RegExp(`APP_VERSION\\s*=\\s*["']${version.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}["']`));
     assert.match(main, /"edition":\s*CUSTOM_MAINTAINER/);
     assert.match(main, /"update_channel":\s*CUSTOM_UPDATE_BRANCH/);
     assert.match(main, /"upstream_repo_url":\s*UPSTREAM_REPO_URL/);

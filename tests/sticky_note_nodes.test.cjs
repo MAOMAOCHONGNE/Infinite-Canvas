@@ -22,8 +22,8 @@ test('classic and smart canvases expose a sticky-note creator with the agreed ey
 });
 
 test('both creation menus include a visual-only sticky-note entry', () => {
-    assert.match(classicHtml, /addNoteNode\(\)/);
-    assert.match(classicHtml, /sticky-note/);
+    assert.match(classic, /FavoriteNodes\.blankCanvasTypes\(\)[\s\S]*?setQuickCreateMenu\(createMenu/);
+    assert.match(classic, /if\(type === 'note'\) addNoteNode\(menuPoint\)/);
     assert.match(smartHtml, /data-create-type="note"/);
     assert.match(smartHtml, /便签/);
 });

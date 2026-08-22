@@ -48,8 +48,8 @@ function detailResolutionOptions(provider, model, tools=globalThis.ModelConfigTo
 const DETAIL_PRESET_KEY = 'detail_page_preset_v1';
 const DETAIL_MAX_IMAGES = 6;
 const DETAIL_ACTIVE_STATUSES = new Set(['uploading', 'planning', 'repairing', 'generating', 'analyzing', 'compiling']);
-const DETAIL_SCREEN_ACTIVE_STATUSES = new Set(['queued', 'generating']);
-const DETAIL_TERMINAL_STATUSES = new Set(['succeeded', 'partial', 'failed', 'cancelled', 'interrupted']);
+const DETAIL_SCREEN_ACTIVE_STATUSES = new Set(['queued', 'submitting', 'generating', 'recovering']);
+const DETAIL_TERMINAL_STATUSES = new Set(['succeeded', 'partial', 'failed', 'cancelled', 'interrupted', 'unknown']);
 const detailState = {
     providers:[],
     imageChoice:'',
@@ -75,13 +75,20 @@ const detailState = {
     images:{product:[], reference:[]},
 };
 const detailRuntime = {
-    taskId:'',
+    viewTaskId:'',
     task:null,
     pollTimer:null,
+    pollInFlight:false,
     abortController:null,
     isUploading:false,
     promptDrafts:new Map(),
     history:[],
+    taskCache:new Map(),
+    activeTaskIds:new Set(),
+    draftBaseline:'',
+    pendingSubmission:null,
+    renamingTaskId:'',
+    promptEditorScreenNo:0,
     screenDragNo:0,
     viewer:{items:[], screenIndex:0, candidateIndex:0, scale:1, x:0, y:0, dragging:false, startX:0, startY:0, startOffsetX:0, startOffsetY:0, pointers:new Map(), pinchDistance:0},
 };
@@ -223,6 +230,60 @@ function detailImageId(){
     return `detail_image_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 }
 
+function detailImageNameFromUrl(url, fallback='图片'){
+    try {
+        const pathname = new URL(String(url || ''), globalThis.location?.href || 'http://localhost/').pathname;
+        const name = decodeURIComponent(pathname.split('/').pop() || '').trim();
+        return name || fallback;
+    } catch(_) { return fallback; }
+}
+
+function detailRestoredImageRecords(urls, metadata, kind){
+    const items = Array.isArray(urls) ? urls : [];
+    const metaItems = Array.isArray(metadata) ? metadata : [];
+    return items.map((value, index) => {
+        const url = String(value || '').trim();
+        const meta = metaItems.find(item => String(item?.url || '') === url) || metaItems[index] || {};
+        return {
+            id:detailImageId(), file:null, persisted:true, missing:false, url,
+            name:String(meta.name || detailImageNameFromUrl(url, `${kind === 'product' ? '产品图' : '参考图'}${index + 1}`)),
+            width:Math.max(0, Number(meta.width) || 0), height:Math.max(0, Number(meta.height) || 0),
+        };
+    }).filter(item => item.url);
+}
+
+function detailRestoredState(settings={}){
+    const size = String(settings.size || '').match(/^(\d+)\s*[x×]\s*(\d+)$/i);
+    const ratio = String(settings.ratio_mode || settings.aspect_ratio || '3:4');
+    const ratioParts = String(settings.aspect_ratio || '').match(/^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/);
+    return {
+        imageChoice:detailEncodeChoice(settings.image_provider_id, settings.image_model),
+        llmChoice:detailEncodeChoice(settings.llm_provider_id, settings.llm_model),
+        ratio,
+        resolution:String(settings.resolution || '2k'),
+        screenCount:String(settings.screen_count ?? 7),
+        copywriting:String(settings.copywriting || 'required'),
+        richness:String(settings.richness || 'concise'),
+        fontStyle:String(settings.font_style || 'auto'),
+        outputLanguage:String(settings.output_language || '自动识别'),
+        modelSetting:String(settings.model_setting || 'use'),
+        modelPose:String(settings.model_pose || 'normal'),
+        modelUsage:String(settings.model_usage ?? 4),
+        reversalScreens:String(settings.reversal_screens ?? 2),
+        productName:String(settings.product_name || ''),
+        productFeatures:String(settings.product_features || ''),
+        userInstruction:String(settings.user_instruction || ''),
+        customRatioWidth:String(settings.custom_ratio_width ?? ratioParts?.[1] ?? 3),
+        customRatioHeight:String(settings.custom_ratio_height ?? ratioParts?.[2] ?? 4),
+        customSizeWidth:String(settings.custom_size_width ?? size?.[1] ?? 1536),
+        customSizeHeight:String(settings.custom_size_height ?? size?.[2] ?? 2048),
+        images:{
+            product:detailRestoredImageRecords(settings.product_images, settings.product_image_meta, 'product'),
+            reference:detailRestoredImageRecords(settings.reference_images, settings.reference_image_meta, 'reference'),
+        },
+    };
+}
+
 async function detailReadImage(file){
     const url = URL.createObjectURL(file);
     const size = await new Promise(resolve => {
@@ -248,9 +309,10 @@ async function detailAddFiles(kind, files){
 
 function detailUploadThumb(image, kind, index){
     const displayIndex = kind === 'reference' ? detailState.images.product.length + index + 1 : index + 1;
-    return `<article class="upload-thumb" draggable="true" data-image-id="${detailEscapeHtml(image.id)}" data-image-kind="${kind}" data-image-index="${index}" title="${detailEscapeHtml(image.name)}">
+    return `<article class="upload-thumb ${image.missing ? 'is-missing' : ''}" draggable="true" data-image-id="${detailEscapeHtml(image.id)}" data-image-kind="${kind}" data-image-index="${index}" title="${detailEscapeHtml(image.name)}">
         <img src="${detailEscapeHtml(image.url)}" alt="">
         <span class="thumb-index">图${displayIndex}</span>
+        ${image.missing ? '<span class="thumb-error">原图失效</span>' : ''}
         <span class="thumb-actions">
             <button type="button" data-preview-image="${detailEscapeHtml(image.id)}" data-preview-kind="${kind}" title="查看图片" aria-label="查看图片"><i data-lucide="zoom-in"></i></button>
             <button type="button" data-remove-image="${detailEscapeHtml(image.id)}" data-remove-kind="${kind}" title="删除图片" aria-label="删除图片"><i data-lucide="x"></i></button>
@@ -277,6 +339,11 @@ function detailRenderUpload(kind){
         event.stopPropagation();
         detailRemoveImage(button.dataset.removeKind, button.dataset.removeImage);
     }));
+    list.querySelectorAll('.upload-thumb img').forEach(imageElement => imageElement.addEventListener('error', () => {
+        const thumb = imageElement.closest('.upload-thumb');
+        const image = images.find(item => item.id === thumb?.dataset.imageId);
+        if(image){ image.missing = true; thumb.classList.add('is-missing'); }
+    }, {once:true}));
     list.querySelectorAll('.upload-thumb').forEach(thumb => {
         thumb.addEventListener('dragstart', event => {
             detailDrag = {kind, id:thumb.dataset.imageId};
@@ -303,6 +370,7 @@ function detailRenderUploads(){
     detailRenderUpload('product');
     detailRenderUpload('reference');
     detailSyncSizeFields();
+    detailRenderGenerateAction();
     lucide.createIcons();
 }
 
@@ -311,7 +379,7 @@ function detailRemoveImage(kind, id){
     const index = images.findIndex(image => image.id === id);
     if(index < 0) return;
     const [removed] = images.splice(index, 1);
-    if(removed?.url) URL.revokeObjectURL(removed.url);
+    if(String(removed?.url || '').startsWith('blob:')) URL.revokeObjectURL(removed.url);
     detailRenderUploads();
 }
 
@@ -443,9 +511,64 @@ function detailBindUpload(kind){
     input.addEventListener('change', () => { detailAddFiles(kind, input.files); input.value = ''; });
 }
 
-function detailPresetData(){
+function detailPresetData(source=detailState){
     const keys = ['imageChoice','llmChoice','ratio','resolution','screenCount','copywriting','richness','fontStyle','outputLanguage','modelSetting','modelPose','modelUsage','reversalScreens','productName','productFeatures','userInstruction','customRatioWidth','customRatioHeight','customSizeWidth','customSizeHeight'];
-    return Object.fromEntries(keys.map(key => [key, detailState[key]]));
+    return Object.fromEntries(keys.map(key => [key, source[key]]));
+}
+
+function detailDraftSnapshotFromState(source){
+    return {
+        ...detailPresetData(source),
+        images:Object.fromEntries(['product', 'reference'].map(kind => [kind, (source.images?.[kind] || []).map(image => ({
+            url:String(image.url || ''), name:String(image.name || ''), width:Number(image.width) || 0, height:Number(image.height) || 0,
+        }))])),
+    };
+}
+
+function detailDraftSnapshot(){
+    return detailDraftSnapshotFromState(detailState);
+}
+
+function detailDraftSignature(){
+    return JSON.stringify(detailDraftSnapshot());
+}
+
+function detailGenerationSnapshotFromState(source){
+    return {
+        ...detailPresetData(source),
+        images:Object.fromEntries(['product', 'reference'].map(kind => [kind, (source.images?.[kind] || []).map(image => String(image?.url || ''))])),
+    };
+}
+
+function detailGenerationSignature(){
+    return JSON.stringify(detailGenerationSnapshotFromState(detailState));
+}
+
+function detailTaskGenerationSignature(task){
+    return JSON.stringify(detailGenerationSnapshotFromState(detailRestoredState(task?.settings || {})));
+}
+
+function detailMarkDraftBaseline(){
+    detailRuntime.draftBaseline = detailDraftSignature();
+}
+
+function detailHasUnsavedDraft(){
+    return Boolean(detailRuntime.draftBaseline) && detailRuntime.draftBaseline !== detailDraftSignature();
+}
+
+function detailReleaseDraftImages(){
+    [...detailState.images.product, ...detailState.images.reference].forEach(image => {
+        if(String(image?.url || '').startsWith('blob:')) URL.revokeObjectURL(image.url);
+    });
+}
+
+function detailApplyRestoredSettings(settings){
+    detailReleaseDraftImages();
+    Object.assign(detailState, detailRestoredState(settings));
+    if(detailState.providers.length) detailRenderModels();
+    detailApplyStateToControls();
+    detailRenderUploads();
+    detailMarkDraftBaseline();
 }
 
 function detailSavePreset(){
@@ -512,13 +635,15 @@ function detailEffectiveSize(){
     return '1024x1024';
 }
 
-function detailTaskPayload(uploaded){
+function detailTaskPayload(uploaded, options={}){
     const image = detailDecodeChoice(detailState.imageChoice);
     const llm = detailDecodeChoice(detailState.llmChoice);
-    return {
+    const payload = {
         page_type:'detail',
         product_images:[...(uploaded?.product || [])],
         reference_images:[...(uploaded?.reference || [])],
+        product_image_meta:[...(uploaded?.productMeta || [])],
+        reference_image_meta:[...(uploaded?.referenceMeta || [])],
         image_provider_id:image.providerId,
         image_model:image.model,
         llm_provider_id:llm.providerId,
@@ -526,6 +651,11 @@ function detailTaskPayload(uploaded){
         aspect_ratio:detailEffectiveRatio(),
         resolution:detailState.resolution,
         size:detailEffectiveSize(),
+        ratio_mode:detailState.ratio,
+        custom_ratio_width:Math.max(1, Number(detailState.customRatioWidth) || 1),
+        custom_ratio_height:Math.max(1, Number(detailState.customRatioHeight) || 1),
+        custom_size_width:Math.max(64, Number(detailState.customSizeWidth) || 64),
+        custom_size_height:Math.max(64, Number(detailState.customSizeHeight) || 64),
         quality:'auto',
         screen_count:Number(detailState.screenCount),
         copywriting:detailState.copywriting,
@@ -540,6 +670,9 @@ function detailTaskPayload(uploaded){
         product_features:detailState.productFeatures.trim(),
         user_instruction:detailState.userInstruction.trim(),
     };
+    if(options.submissionId) payload.submission_id = String(options.submissionId);
+    if(options.forceNew) payload.force_new = true;
+    return payload;
 }
 
 function detailErrorMessage(data, fallback='请求失败'){
@@ -555,7 +688,11 @@ async function detailFetchJson(url, options={}){
     let data = null;
     try { data = await response.json(); }
     catch(_) { data = null; }
-    if(!response.ok) throw new Error(detailErrorMessage(data, `HTTP ${response.status}`));
+    if(!response.ok){
+        const error = new Error(detailErrorMessage(data, `HTTP ${response.status}`));
+        error.status = response.status;
+        throw error;
+    }
     return data;
 }
 
@@ -563,38 +700,159 @@ async function detailUploadTaskImages(signal){
     const product = detailState.images.product;
     const reference = detailState.images.reference;
     const ordered = [...product, ...reference];
-    const form = new FormData();
-    ordered.forEach(image => form.append('files', image.file, image.name || image.file?.name || 'image.png'));
-    const data = await detailFetchJson('/api/ai/upload', {method:'POST', body:form, signal});
-    const files = Array.isArray(data?.files) ? data.files : [];
-    if(files.length !== ordered.length) throw new Error(`图片上传不完整：需要 ${ordered.length} 张，实际 ${files.length} 张`);
-    const urls = files.map(item => String(item?.url || '').trim());
+    const pending = ordered.filter(image => image?.file);
+    let files = [];
+    if(pending.length){
+        const form = new FormData();
+        pending.forEach(image => form.append('files', image.file, image.name || image.file?.name || 'image.png'));
+        const data = await detailFetchJson('/api/ai/upload', {method:'POST', body:form, signal});
+        files = Array.isArray(data?.files) ? data.files : [];
+        if(files.length !== pending.length) throw new Error(`图片上传不完整：需要 ${pending.length} 张，实际 ${files.length} 张`);
+    }
+    let uploadedIndex = 0;
+    const urls = ordered.map(image => image?.file ? String(files[uploadedIndex++]?.url || '').trim() : String(image?.url || '').trim());
     if(urls.some(url => !url)) throw new Error('图片上传结果缺少地址');
+    const metadata = ordered.map((image, index) => ({
+        url:urls[index], name:String(image?.name || detailImageNameFromUrl(urls[index])),
+        width:Math.max(0, Number(image?.width) || 0), height:Math.max(0, Number(image?.height) || 0),
+    }));
     return {
         product:urls.slice(0, product.length),
         reference:urls.slice(product.length),
+        productMeta:metadata.slice(0, product.length),
+        referenceMeta:metadata.slice(product.length),
     };
 }
 
+function detailPromoteUploadedImages(uploaded){
+    detailReleaseDraftImages();
+    detailState.images.product = detailRestoredImageRecords(uploaded?.product, uploaded?.productMeta, 'product');
+    detailState.images.reference = detailRestoredImageRecords(uploaded?.reference, uploaded?.referenceMeta, 'reference');
+    return detailState.images;
+}
+
 function detailTaskIsActive(task=detailRuntime.task){
-    return detailRuntime.isUploading || DETAIL_ACTIVE_STATUSES.has(String(task?.status || ''));
+    return DETAIL_ACTIVE_STATUSES.has(String(task?.status || ''));
 }
 
 function detailScreenRegenerationLocked(screen, task=detailRuntime.task){
     const taskStatus = String(task?.status || '');
-    const taskBlocksScreens = detailRuntime.isUploading || (DETAIL_ACTIVE_STATUSES.has(taskStatus) && taskStatus !== 'generating');
+    const taskBlocksScreens = DETAIL_ACTIVE_STATUSES.has(taskStatus) && taskStatus !== 'generating';
     return taskBlocksScreens || DETAIL_SCREEN_ACTIVE_STATUSES.has(String(screen?.status || ''));
 }
 
 function detailTaskStatusLabel(status){
     return ({
         uploading:'上传图片', planning:'规划提示词', analyzing:'兼容分析', repairing:'修复结果', compiling:'兼容编译', generating:'并发生成',
-        succeeded:'全部完成', partial:'部分完成', failed:'任务失败', cancelled:'已取消', interrupted:'已中断',
+        succeeded:'全部完成', partial:'部分完成', failed:'任务失败', cancelled:'已取消', interrupted:'已中断', unknown:'存在待回补结果',
     })[status] || '待规划';
 }
 
+function detailTaskGroupNumber(task){
+    const groupNo = Number(task?.group_no);
+    if(Number.isInteger(groupNo) && groupNo > 0) return groupNo;
+    // 仅兼容尚未重启迁移的旧后端；新后端返回 group_no 后不再动态计算。
+    const ordered = [...detailRuntime.history].sort((left, right) => {
+        const created = Number(left?.created_at || 0) - Number(right?.created_at || 0);
+        return created || String(left?.id || '').localeCompare(String(right?.id || ''));
+    });
+    const index = ordered.findIndex(item => String(item?.id || '') === String(task?.id || ''));
+    return index < 0 ? detailRuntime.history.length + 1 : index + 1;
+}
+
+function detailTaskHeading(task){
+    if(!task) return '新分组';
+    const title = String(task?.title || '').trim();
+    const group = `分组 #${detailTaskGroupNumber(task)}`;
+    return title ? `${title} · ${group}` : group;
+}
+
+function detailDefaultTaskTitle(value){
+    const title = String(value || '').replace(/\s+/g, ' ').trim();
+    if(!title) return '';
+    if(title.endsWith('详情页')) return title.slice(0, 60).trim();
+    return `${title.slice(0, 57).trim()}详情页`;
+}
+
+function detailActiveTaskProgress(task){
+    const status = String(task?.status || '');
+    if(status === 'generating'){
+        const screens = Array.isArray(task?.screens) ? task.screens : [];
+        const completed = screens.filter(screen => ['succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(screen?.status || ''))).length;
+        const total = screens.length || Math.max(0, Number(task?.settings?.screen_count) || 0);
+        return `生成中 ${completed}/${total}`;
+    }
+    return ({uploading:'上传中', planning:'规划中', analyzing:'规划中', repairing:'修复规划中', compiling:'整理规划中'})[status] || detailTaskStatusLabel(status);
+}
+
+function detailGenerationActionState(){
+    if(detailRuntime.isUploading) return {mode:'submitting', label:'正在提交', disabled:true, showForce:false, matchCount:0, task:null};
+    const signature = detailGenerationSignature();
+    const matching = detailRuntime.history.filter(task => detailTaskGenerationSignature(task) === signature);
+    const activeMatches = matching.filter(task => detailTaskIsActive(task)).sort((left, right) => Number(right?.created_at || 0) - Number(left?.created_at || 0));
+    if(activeMatches.length){
+        const task = activeMatches[0];
+        const label = activeMatches.length > 1
+            ? `${activeMatches.length} 个相同配置分组运行中 · 查看最新`
+            : `分组 #${detailTaskGroupNumber(task)} · ${detailActiveTaskProgress(task)}`;
+        return {mode:'view', label, disabled:false, showForce:true, matchCount:activeMatches.length, task};
+    }
+    const unknownMatches = matching.filter(task => String(task?.status || '') === 'unknown').sort((left, right) => Number(right?.created_at || 0) - Number(left?.created_at || 0));
+    if(unknownMatches.length){
+        const task = unknownMatches[0];
+        return {mode:'view', label:`分组 #${detailTaskGroupNumber(task)} · 存在待回补结果`, disabled:false, showForce:false, matchCount:unknownMatches.length, task};
+    }
+    if(matching.some(task => DETAIL_TERMINAL_STATUSES.has(String(task?.status || '')))){
+        return {mode:'repeat', label:'再次生成', disabled:false, showForce:false, matchCount:0, task:null};
+    }
+    if(detailRuntime.history.length){
+        return {mode:'new', label:'生成新分组', disabled:false, showForce:false, matchCount:0, task:null};
+    }
+    return {mode:'create', label:'开始生成', disabled:false, showForce:false, matchCount:0, task:null};
+}
+
+function detailCreateSubmissionId(){
+    if(globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, char => {
+        const value = Math.floor(Math.random() * 16);
+        return (char === 'x' ? value : (value & 3) | 8).toString(16);
+    });
+}
+
+function detailBeginSubmission(forceNew=false){
+    if(detailRuntime.isUploading) return '';
+    const signature = detailGenerationSignature();
+    const pending = detailRuntime.pendingSubmission;
+    const submissionId = pending && pending.signature === signature && pending.forceNew === Boolean(forceNew)
+        ? pending.id
+        : detailCreateSubmissionId();
+    detailRuntime.pendingSubmission = {id:submissionId, signature, forceNew:Boolean(forceNew)};
+    detailRuntime.isUploading = true;
+    return submissionId;
+}
+
+function detailEndSubmission(succeeded){
+    detailRuntime.isUploading = false;
+    if(succeeded) detailRuntime.pendingSubmission = null;
+}
+
+function detailRenderGenerateAction(){
+    const button = document.getElementById('analyzeBtn');
+    const forceButton = document.getElementById('forceGenerateBtn');
+    if(!button) return detailGenerationActionState();
+    const action = detailGenerationActionState();
+    button.disabled = action.disabled;
+    button.dataset.action = action.mode;
+    button.querySelector('span').textContent = action.label;
+    if(forceButton){
+        forceButton.hidden = !action.showForce;
+        forceButton.disabled = detailRuntime.isUploading;
+    }
+    return action;
+}
+
 function detailScreenStatusLabel(status){
-    return ({queued:'排队', generating:'生成中', succeeded:'已完成', failed:'生成失败', cancelled:'已取消', interrupted:'已中断'})[status] || '等待';
+    return ({queued:'排队', submitting:'正在提交', generating:'生成中', recovering:'恢复查询中', unknown:'结果未知', succeeded:'已完成', failed:'生成失败', cancelled:'已取消', interrupted:'已中断'})[status] || '等待';
 }
 
 function detailLlmTraceLabel(task){
@@ -617,6 +875,16 @@ function detailScreenCandidates(screen){
     if(candidates.length) return candidates;
     const legacy = screen?.result;
     return legacy ? [{id:'legacy', status:'succeeded', result:legacy, image_url:Array.isArray(legacy.images) ? legacy.images[0] : ''}] : [];
+}
+
+function detailCandidateSummary(candidates){
+    const items = Array.isArray(candidates) ? candidates : [];
+    const succeeded = items.filter(candidate => candidate?.status === 'succeeded').length;
+    const failed = items.filter(candidate => candidate?.status === 'failed').length;
+    const unknown = items.filter(candidate => candidate?.status === 'unknown').length;
+    const pending = Math.max(0, items.length - succeeded - failed - unknown);
+    if(!failed && !unknown && !pending) return `${succeeded} 个候选`;
+    return [`${succeeded} 成功`, unknown ? `${unknown} 待回补` : '', failed ? `${failed} 失败` : '', pending ? `${pending} 生成中` : ''].filter(Boolean).join(' · ');
 }
 
 function detailSelectedCandidateIndex(screen){
@@ -650,7 +918,6 @@ function detailRenderEmptyResults(title, message, active=false){
 
 function detailScreenCard(screen, locked){
     const imageUrl = detailResultImage(screen);
-    const prompt = detailPromptValue(screen, locked);
     const candidates = detailScreenCandidates(screen);
     const selectedCandidate = detailSelectedCandidateIndex(screen);
     const flags = [
@@ -660,30 +927,56 @@ function detailScreenCard(screen, locked){
     const preview = imageUrl
         ? `<button class="screen-image" type="button" data-preview-screen="${screen.screen_no}"><img src="${detailEscapeHtml(imageUrl)}" alt="第 ${screen.screen_no} 屏生成结果" loading="lazy"></button>`
         : `<div class="screen-placeholder ${screen.status === 'generating' ? 'is-generating' : ''}"><i data-lucide="${screen.status === 'generating' ? 'loader-circle' : 'image'}"></i><span>${detailEscapeHtml(detailScreenStatusLabel(screen.status))}</span></div>`;
-    const candidateStrip = candidates.length ? `<div class="candidate-strip"><span>${candidates.length} 个候选</span>${candidates.map((candidate, index) => `<button type="button" data-select-candidate="${index}" data-screen="${screen.screen_no}" class="${index === selectedCandidate ? 'active' : ''}" ${candidate.status !== 'succeeded' || locked ? 'disabled' : ''} title="${candidate.status === 'succeeded' ? `选择候选 ${index + 1}` : detailEscapeHtml(candidate.error || '候选失败')}">${index + 1}</button>`).join('')}</div>` : '';
-    const promptCandidates = Array.isArray(screen.prompt_candidates) ? screen.prompt_candidates : [];
-    const promptChoices = promptCandidates.length ? `<select class="prompt-candidates" data-prompt-candidate="${screen.screen_no}" ${locked ? 'disabled' : ''}><option value="">优化候选</option>${promptCandidates.map((item, index) => `<option value="${index}">候选 ${index + 1}</option>`).join('')}</select>` : '';
+    const candidateStrip = candidates.length ? `<div class="candidate-strip"><span class="candidate-summary">${detailEscapeHtml(detailCandidateSummary(candidates))}</span>${candidates.map((candidate, index) => {
+        const status = ['succeeded', 'failed', 'unknown', 'submitting', 'recovering', 'queued', 'generating'].includes(String(candidate?.status || '')) ? String(candidate.status) : 'queued';
+        const classes = [status, index === selectedCandidate ? 'active' : ''].filter(Boolean).join(' ');
+        const title = status === 'succeeded' ? `选择候选 ${index + 1}` : detailEscapeHtml(candidate?.error || (status === 'failed' ? '候选失败' : status === 'unknown' ? '结果未知' : '候选生成中'));
+        const stateLabel = status === 'succeeded' ? '生成成功' : status === 'failed' ? '生成失败' : status === 'unknown' ? '待回补' : '生成中';
+        const selector = `<button type="button" data-select-candidate="${index}" data-screen="${screen.screen_no}" class="${classes}" ${status !== 'succeeded' || locked ? 'disabled' : ''} title="${title}" aria-label="候选 ${index + 1}，${stateLabel}">${index + 1}</button>`;
+        const recover = status === 'unknown' && candidate?.upstream_task_id
+            ? `<button type="button" class="candidate-recover-action" data-recover-candidate="${detailEscapeHtml(candidate.id || '')}" data-screen="${screen.screen_no}" ${locked ? 'disabled' : ''} title="只查询原上游任务，不会重新生图">回补</button>`
+            : '';
+        return selector + recover;
+    }).join('')}</div>` : '';
     const error = screen.error ? `<p class="screen-error">${detailEscapeHtml(screen.error)}</p>` : '';
     const regenerationLocked = detailScreenRegenerationLocked(screen);
     return `<article class="result-card" data-screen-no="${screen.screen_no}" draggable="${locked ? 'false' : 'true'}">
-        <header class="screen-card-head"><div><span class="screen-number">第 ${screen.screen_no} 屏 · ${detailEscapeHtml(screen.screen_type || '详情页')}</span><strong>${detailEscapeHtml(screen.title)}</strong></div><span class="screen-state ${detailEscapeHtml(screen.status)}">${detailEscapeHtml(detailScreenStatusLabel(screen.status))}</span></header>
-        <div class="screen-flags">${flags}</div>
+        <header class="screen-card-head"><div class="screen-card-title"><span class="screen-number">第 ${screen.screen_no} 屏 · ${detailEscapeHtml(screen.screen_type || '详情页')}</span><strong>${detailEscapeHtml(screen.title)}</strong></div><div class="screen-card-meta"><span class="screen-state ${detailEscapeHtml(screen.status)}">${detailEscapeHtml(detailScreenStatusLabel(screen.status))}</span>${flags ? `<div class="screen-flags">${flags}</div>` : ''}</div></header>
         ${preview}
         ${candidateStrip}
-        <p class="screen-purpose">${detailEscapeHtml(screen.purpose)}</p>
         ${error}
-        <label class="screen-prompt"><span>生图提示词</span><textarea data-screen-prompt="${screen.screen_no}" rows="7" ${locked ? 'readonly' : ''}>${detailEscapeHtml(prompt)}</textarea></label>
-        <footer class="screen-card-actions">${promptChoices}<button type="button" data-save-screen="${screen.screen_no}" ${locked ? 'disabled' : ''} title="保存提示词"><i data-lucide="save"></i></button><button type="button" data-optimize-screen="${screen.screen_no}" ${locked ? 'disabled' : ''}><i data-lucide="sparkles"></i><span>优化</span></button><button type="button" data-screen-params="${screen.screen_no}" ${locked ? 'disabled' : ''} title="单屏参数"><i data-lucide="sliders-horizontal"></i></button><button type="button" data-regenerate-screen="${screen.screen_no}" data-count="1" ${regenerationLocked ? 'disabled' : ''}><i data-lucide="refresh-cw"></i><span>重刷</span></button><button type="button" data-regenerate-screen="${screen.screen_no}" data-count="4" ${regenerationLocked ? 'disabled' : ''}><span>×4</span></button><button type="button" data-delete-screen="${screen.screen_no}" ${locked ? 'disabled' : ''} title="删除分屏"><i data-lucide="trash-2"></i></button></footer>
+        <footer class="screen-card-actions"><button type="button" data-open-prompt="${screen.screen_no}"><i data-lucide="file-text"></i><span>提示词</span></button><button type="button" data-screen-params="${screen.screen_no}" ${locked ? 'disabled' : ''} title="单屏参数"><i data-lucide="sliders-horizontal"></i></button><button type="button" data-regenerate-screen="${screen.screen_no}" data-count="1" ${regenerationLocked ? 'disabled' : ''}><i data-lucide="refresh-cw"></i><span>重刷</span></button><button type="button" data-delete-screen="${screen.screen_no}" ${locked ? 'disabled' : ''} title="删除分屏"><i data-lucide="trash-2"></i></button></footer>
     </article>`;
+}
+
+function detailRenderTaskTitle(task){
+    const heading = document.getElementById('resultGroupTitle');
+    const renameButton = document.getElementById('renameTaskBtn');
+    const form = document.getElementById('taskTitleForm');
+    const input = document.getElementById('taskTitleInput');
+    if(!heading || !renameButton || !form || !input) return;
+    const taskId = String(task?.id || '');
+    const editing = Boolean(taskId && detailRuntime.renamingTaskId === taskId);
+    heading.textContent = detailTaskHeading(task);
+    heading.hidden = editing;
+    renameButton.hidden = !taskId || editing;
+    form.hidden = !editing;
+    if(editing && input.dataset.taskId !== taskId){
+        input.dataset.taskId = taskId;
+        input.value = String(task?.title || '');
+    } else if(!editing){
+        input.dataset.taskId = '';
+    }
 }
 
 function detailRenderTask(){
     const task = detailRuntime.task;
-    const status = detailRuntime.isUploading ? 'uploading' : String(task?.status || '');
+    const status = String(task?.status || '');
     const active = detailTaskIsActive(task);
+    detailRenderTaskTitle(task);
     const screens = Array.isArray(task?.screens) ? [...task.screens] : [];
     const sorted = document.getElementById('directionToggle')?.checked ? screens.reverse() : screens;
-    const completed = screens.filter(screen => ['succeeded', 'failed', 'cancelled', 'interrupted'].includes(screen.status)).length;
+    const completed = screens.filter(screen => ['succeeded', 'failed', 'unknown', 'cancelled', 'interrupted'].includes(screen.status)).length;
     document.getElementById('resultCount').textContent = screens.length ? `${completed}/${screens.length} 屏` : '0 屏';
     const resultStatus = document.getElementById('resultStatus');
     resultStatus.textContent = detailTaskStatusLabel(status);
@@ -692,6 +985,10 @@ function detailRenderTask(){
     const llmTraceText = detailLlmTraceLabel(task);
     llmTrace.textContent = llmTraceText;
     llmTrace.hidden = !llmTraceText;
+    const importMediaWarning = document.getElementById('importMediaWarning');
+    const missingMediaCount = Array.isArray(task?.import_missing_media) ? task.import_missing_media.length : 0;
+    importMediaWarning.textContent = task?.import_warning || (missingMediaCount ? `导入记录中有 ${missingMediaCount} 个媒体文件缺失，请删除或替换后再生成。` : '');
+    importMediaWarning.hidden = !importMediaWarning.textContent;
     const cancelButton = document.getElementById('cancelTaskBtn');
     cancelButton.hidden = !active;
     const resumable = screens.some(screen => ['failed', 'cancelled', 'interrupted', 'queued'].includes(screen.status));
@@ -713,10 +1010,9 @@ function detailRenderTask(){
         `图片 API 参数：\n${JSON.stringify(preview.image_request || task?.settings || {}, null, 2)}`,
         `最终规划请求：\n${preview.request}`,
     ].join('\n\n') : '';
-    const analyzeButton = document.getElementById('analyzeBtn');
-    analyzeButton.disabled = active;
-    analyzeButton.querySelector('span').textContent = active ? detailTaskStatusLabel(status) : '开始生成';
-    detailSetConfigState(active ? detailTaskStatusLabel(status) : task ? detailTaskStatusLabel(status) : '配置就绪', status === 'failed');
+    const generationAction = detailRenderGenerateAction();
+    const configLabel = generationAction.mode === 'view' ? detailActiveTaskProgress(generationAction.task) : task ? detailTaskStatusLabel(status) : '配置就绪';
+    detailSetConfigState(detailRuntime.isUploading ? '正在提交' : configLabel, status === 'failed');
 
     if(!screens.length){
         if(status === 'uploading') detailRenderEmptyResults('正在上传图片', '上传完成后自动开始视觉分析', true);
@@ -739,18 +1035,14 @@ function detailRenderTask(){
         document.querySelectorAll('[data-preview-screen]').forEach(button => button.addEventListener('click', () => {
             detailOpenResultPreview(Number(button.dataset.previewScreen));
         }));
-        document.querySelectorAll('[data-screen-prompt]').forEach(textarea => textarea.addEventListener('input', () => {
-            detailRuntime.promptDrafts.set(Number(textarea.dataset.screenPrompt), textarea.value);
-        }));
+        document.querySelectorAll('[data-open-prompt]').forEach(button => button.addEventListener('click', () => detailOpenPromptEditor(Number(button.dataset.openPrompt))));
         document.querySelectorAll('[data-regenerate-screen]').forEach(button => button.addEventListener('click', () => {
             detailRegenerateScreen(Number(button.dataset.regenerateScreen), Number(button.dataset.count) || 1);
         }));
-        document.querySelectorAll('[data-save-screen]').forEach(button => button.addEventListener('click', () => detailSaveScreen(Number(button.dataset.saveScreen))));
-        document.querySelectorAll('[data-optimize-screen]').forEach(button => button.addEventListener('click', () => detailOptimizeScreen(Number(button.dataset.optimizeScreen))));
         document.querySelectorAll('[data-screen-params]').forEach(button => button.addEventListener('click', () => detailEditScreenParams(Number(button.dataset.screenParams))));
         document.querySelectorAll('[data-delete-screen]').forEach(button => button.addEventListener('click', () => detailDeleteScreen(Number(button.dataset.deleteScreen))));
         document.querySelectorAll('[data-select-candidate]').forEach(button => button.addEventListener('click', () => detailSelectCandidate(Number(button.dataset.screen), Number(button.dataset.selectCandidate))));
-        document.querySelectorAll('[data-prompt-candidate]').forEach(select => select.addEventListener('change', () => detailApplyPromptCandidate(Number(select.dataset.promptCandidate), Number(select.value))));
+        document.querySelectorAll('[data-recover-candidate]').forEach(button => button.addEventListener('click', () => detailRecoverCandidate(Number(button.dataset.screen), button.dataset.recoverCandidate, button)));
         detailBindScreenReorder();
     }
     lucide.createIcons();
@@ -773,84 +1065,185 @@ function detailOpenResultPreview(screenNo){
     detailOpenViewer(items, index, Math.max(0, items[index]?.selected || 0));
 }
 
+function detailRememberTask(task, options={}){
+    const id = String(task?.id || '').trim();
+    if(!id) return null;
+    detailRuntime.taskCache.set(id, task);
+    const existing = detailRuntime.history.findIndex(item => String(item?.id) === id);
+    if(existing >= 0) detailRuntime.history.splice(existing, 1, task);
+    else detailRuntime.history.push(task);
+    detailRuntime.history.sort((left, right) => Number(right?.updated_at || right?.created_at || 0) - Number(left?.updated_at || left?.created_at || 0));
+    if(detailTaskIsActive(task)) detailRuntime.activeTaskIds.add(id);
+    else detailRuntime.activeTaskIds.delete(id);
+    if(options.select) detailRuntime.viewTaskId = id;
+    if(detailRuntime.viewTaskId === id) detailRuntime.task = task;
+    return task;
+}
+
+function detailForgetTask(taskId){
+    const id = String(taskId || '');
+    detailRuntime.activeTaskIds.delete(id);
+    detailRuntime.taskCache.delete(id);
+    detailRuntime.history = detailRuntime.history.filter(task => String(task?.id) !== id);
+}
+
 function detailStopPolling(){
     clearTimeout(detailRuntime.pollTimer);
     detailRuntime.pollTimer = null;
 }
 
-async function detailPollTask(immediate=false){
+async function detailPollTasks(immediate=false){
     detailStopPolling();
     const poll = async () => {
-        if(!detailRuntime.taskId) return;
-        try {
-            const wasActive = detailTaskIsActive(detailRuntime.task);
-            const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}`);
-            detailRuntime.task = task;
-            detailRenderTask();
-            if(detailTaskIsActive(task)) detailRuntime.pollTimer = setTimeout(poll, 900);
-            else if(wasActive) detailLoadHistory(task.id);
-        } catch(error) {
-            detailRuntime.task = {...(detailRuntime.task || {}), status:'failed', error:error.message};
-            detailRenderTask();
-            detailShowToast(error.message, 'error');
+        if(detailRuntime.pollInFlight){ detailRuntime.pollTimer = setTimeout(poll, 300); return; }
+        const taskIds = [...detailRuntime.activeTaskIds];
+        if(!taskIds.length) return;
+        detailRuntime.pollInFlight = true;
+        let viewedChanged = false;
+        const results = await Promise.allSettled(taskIds.map(async taskId => ({
+            taskId,
+            task:await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(taskId)}`),
+        })));
+        results.forEach((result, index) => {
+            const taskId = taskIds[index];
+            if(result.status === 'fulfilled'){
+                detailRememberTask(result.value.task);
+                if(taskId === detailRuntime.viewTaskId) viewedChanged = true;
+                return;
+            }
+            const error = result.reason;
+            if(Number(error?.status) === 404){
+                detailRuntime.activeTaskIds.delete(taskId);
+                const cached = detailRuntime.taskCache.get(taskId);
+                if(cached) detailRememberTask({...cached, status:'failed', error:'任务记录不可用'});
+                if(taskId === detailRuntime.viewTaskId) viewedChanged = true;
+                detailShowToast('一个后台详情页任务已不存在，已停止跟踪', 'error');
+            }
+        });
+        detailRuntime.pollInFlight = false;
+        detailRenderHistory();
+        if(viewedChanged) detailRenderTask();
+        if(detailRuntime.activeTaskIds.size){
+            detailRuntime.pollTimer = setTimeout(poll, 900);
         }
     };
     if(immediate) await poll();
     else detailRuntime.pollTimer = setTimeout(poll, 300);
 }
 
-async function detailAnalyzeDraft(){
+async function detailValidatePersistedImages(){
+    const images = [...detailState.images.product, ...detailState.images.reference].filter(image => image?.persisted && image?.url);
+    if(!images.length || typeof Image === 'undefined') return '';
+    const failures = await Promise.all(images.map(image => new Promise(resolve => {
+        const probe = new Image();
+        let settled = false;
+        const finish = missing => {
+            if(settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            image.missing = missing;
+            if(!missing){ image.width ||= probe.naturalWidth || 0; image.height ||= probe.naturalHeight || 0; }
+            resolve(missing);
+        };
+        const timeout = setTimeout(() => finish(true), 8000);
+        probe.onload = () => finish(false);
+        probe.onerror = () => finish(true);
+        probe.src = image.url;
+    })));
+    if(failures.some(Boolean)){
+        detailRenderUploads();
+        return '历史记录中的部分原始图片已无法访问，请删除后重新添加';
+    }
+    return '';
+}
+
+async function detailHandleGenerateClick(){
+    const action = detailGenerationActionState();
+    if(action.mode === 'view' && action.task){
+        await detailOpenHistoryTask(action.task.id, {skipConfirm:true});
+        return;
+    }
+    await detailAnalyzeDraft();
+}
+
+async function detailForceGenerate(){
+    const action = detailGenerationActionState();
+    if(!action.showForce || detailRuntime.isUploading) return;
+    if(!window.confirm('相同配置已有任务正在运行。确定额外付费，再创建一个相同分组吗？')) return;
+    await detailAnalyzeDraft({forceNew:true});
+}
+
+async function detailAnalyzeDraft(options={}){
+    if(detailRuntime.isUploading) return;
+    if(!options.forceNew){
+        const action = detailGenerationActionState();
+        if(action.mode === 'view' && action.task){
+            await detailOpenHistoryTask(action.task.id, {skipConfirm:true});
+            return;
+        }
+    }
     const error = detailValidateDraft();
     if(error){ detailShowToast(error, 'error'); return; }
-    if(detailTaskIsActive()) return;
+    const submissionId = detailBeginSubmission(Boolean(options.forceNew));
+    if(!submissionId) return;
     detailSavePreset();
-    detailStopPolling();
-    detailRuntime.promptDrafts.clear();
-    detailRuntime.taskId = '';
-    detailRuntime.task = {status:'uploading', screens:[]};
-    detailRuntime.isUploading = true;
     detailRuntime.abortController = new AbortController();
     detailRenderTask();
     try {
+        const persistedError = await detailValidatePersistedImages();
+        if(persistedError) throw new Error(persistedError);
         const uploaded = await detailUploadTaskImages(detailRuntime.abortController.signal);
+        detailPromoteUploadedImages(uploaded);
+        detailRenderUploads();
+        if(detailRuntime.pendingSubmission) detailRuntime.pendingSubmission.signature = detailGenerationSignature();
+        const payload = detailTaskPayload(uploaded, {submissionId, forceNew:Boolean(options.forceNew)});
         detailSetConfigState('提交规划');
         const created = await detailFetchJson('/api/detail-page-tasks', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify(detailTaskPayload(uploaded)),
+            body:JSON.stringify(payload),
             signal:detailRuntime.abortController.signal,
         });
-        detailRuntime.taskId = String(created?.task_id || '');
-        if(!detailRuntime.taskId) throw new Error('详情页任务没有返回任务 ID');
-        detailRuntime.isUploading = false;
+        const taskId = String(created?.task_id || '');
+        if(!taskId) throw new Error('详情页任务没有返回任务 ID');
+        detailEndSubmission(true);
         detailRuntime.abortController = null;
-        detailRuntime.task = {status:'planning', screens:[]};
+        detailRuntime.promptDrafts.clear();
+        let task = null;
+        if(created?.reused){
+            try { task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(taskId)}`); }
+            catch(_) { task = null; }
+        }
+        detailRememberTask(task || {
+            id:taskId, type:'detail-page', title:detailDefaultTaskTitle(payload.product_name), group_no:Number(created?.group_no) || 0, status:String(created?.status || 'planning'), settings:payload,
+            screens:[], created_at:Date.now() / 1000, updated_at:Date.now() / 1000,
+        }, {select:true});
+        detailMarkDraftBaseline();
+        detailRenderHistory();
         detailRenderTask();
-        await detailPollTask(true);
+        if(created?.reused){
+            detailShowToast(created.reuse_reason === 'submission_id' ? '重复提交已拦截，已打开原分组' : '相同配置正在运行，已打开原分组');
+        }
+        await detailPollTasks(true);
     } catch(error) {
-        detailRuntime.isUploading = false;
+        detailEndSubmission(false);
         detailRuntime.abortController = null;
         if(error?.name === 'AbortError'){
-            detailRuntime.task = {status:'cancelled', screens:[]};
             detailShowToast('任务已取消');
         } else {
-            detailRuntime.task = {status:'failed', screens:[], error:error.message || '任务提交失败'};
             detailShowToast(error.message || '任务提交失败', 'error');
+            detailSetConfigState('提交失败', true);
         }
         detailRenderTask();
     }
 }
 
 async function detailCancelTask(){
-    if(detailRuntime.isUploading){
-        detailRuntime.abortController?.abort();
-        return;
-    }
-    if(!detailRuntime.taskId || !detailTaskIsActive()) return;
+    if(!detailRuntime.viewTaskId || !detailTaskIsActive()) return;
     try {
-        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/cancel`, {method:'POST'});
-        detailRuntime.task = task;
-        detailStopPolling();
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/cancel`, {method:'POST'});
+        detailRememberTask(task);
+        detailRenderHistory();
         detailRenderTask();
         detailShowToast('详情页任务已取消');
     } catch(error) {
@@ -858,34 +1251,84 @@ async function detailCancelTask(){
     }
 }
 
+function detailPromptEditorScreen(){
+    return (detailRuntime.task?.screens || []).find(item => Number(item.screen_no) === Number(detailRuntime.promptEditorScreenNo));
+}
+
+function detailRenderPromptEditor(){
+    const modal = document.getElementById('promptEditorModal');
+    if(!modal || modal.hidden) return;
+    const screen = detailPromptEditorScreen();
+    if(!screen){ detailClosePromptEditor(); return; }
+    const locked = detailTaskIsActive();
+    const screenNo = Number(screen.screen_no);
+    document.getElementById('promptEditorNumber').textContent = `第 ${screenNo} 屏 · ${screen.screen_type || '详情页'}`;
+    document.getElementById('promptEditorTitle').textContent = screen.title || '生图提示词';
+    const purpose = document.getElementById('promptEditorPurpose');
+    purpose.textContent = String(screen.purpose || '');
+    purpose.hidden = !purpose.textContent;
+    const textarea = document.getElementById('promptEditorText');
+    textarea.value = detailPromptValue(screen, locked);
+    textarea.readOnly = locked;
+    const candidates = Array.isArray(screen.prompt_candidates) ? screen.prompt_candidates : [];
+    const candidateWrap = document.getElementById('promptEditorCandidates');
+    const candidateSelect = document.getElementById('promptEditorCandidateSelect');
+    candidateWrap.hidden = !candidates.length;
+    candidateSelect.innerHTML = '<option value="">请选择候选</option>' + candidates.map((item, index) => `<option value="${index}">候选 ${index + 1}</option>`).join('');
+    candidateSelect.disabled = locked;
+    document.getElementById('promptEditorInstruction').disabled = locked;
+    document.getElementById('promptEditorOptimize').disabled = locked;
+    document.getElementById('promptEditorSave').disabled = locked;
+    lucide.createIcons();
+}
+
+function detailOpenPromptEditor(screenNo){
+    const screen = (detailRuntime.task?.screens || []).find(item => Number(item.screen_no) === Number(screenNo));
+    if(!screen) return;
+    detailRuntime.promptEditorScreenNo = Number(screenNo);
+    if(!detailRuntime.promptDrafts.has(Number(screenNo))) detailRuntime.promptDrafts.set(Number(screenNo), String(screen.prompt || ''));
+    document.getElementById('promptEditorModal').hidden = false;
+    document.getElementById('promptEditorInstruction').value = '';
+    detailRenderPromptEditor();
+    document.getElementById('promptEditorText').focus();
+}
+
+function detailClosePromptEditor(){
+    const modal = document.getElementById('promptEditorModal');
+    if(modal) modal.hidden = true;
+    detailRuntime.promptEditorScreenNo = 0;
+}
+
 async function detailSaveScreen(screenNo){
-    if(!detailRuntime.taskId || detailTaskIsActive()) return;
+    if(!detailRuntime.viewTaskId || detailTaskIsActive()) return;
     const screen = (detailRuntime.task?.screens || []).find(item => Number(item.screen_no) === Number(screenNo));
     if(!screen) return;
     const prompt = String(detailRuntime.promptDrafts.get(screenNo) ?? screen.prompt ?? '').trim();
     if(!prompt){ detailShowToast('提示词不能为空', 'error'); return; }
     try {
-        detailRuntime.task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/screens/${screenNo}`, {
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/${screenNo}`, {
             method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({prompt}),
         });
+        detailRememberTask(task);
         detailRuntime.promptDrafts.set(screenNo, prompt);
         detailRenderTask();
+        detailRenderPromptEditor();
         detailShowToast(`第 ${screenNo} 屏提示词已保存`);
     } catch(error) { detailShowToast(error.message || '保存失败', 'error'); }
 }
 
-async function detailOptimizeScreen(screenNo){
-    if(!detailRuntime.taskId || detailTaskIsActive()) return;
-    const instruction = window.prompt('输入本屏提示词修改要求');
-    if(!instruction?.trim()) return;
+async function detailOptimizeScreen(screenNo, instruction=''){
+    if(!detailRuntime.viewTaskId || detailTaskIsActive()) return;
+    const requestedInstruction = String(instruction || '').trim() || '在保持产品一致性、当前购买任务和整体设计系统不变的前提下，优化画面表达与提示词清晰度';
     const screen = (detailRuntime.task?.screens || []).find(item => Number(item.screen_no) === Number(screenNo));
     const prompt = String(detailRuntime.promptDrafts.get(screenNo) ?? screen?.prompt ?? '').trim();
     try {
-        const result = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/screens/${screenNo}/optimize-prompt`, {
-            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({instruction:instruction.trim(), prompt, candidate_count:2}),
+        const result = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/${screenNo}/optimize-prompt`, {
+            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({instruction:requestedInstruction, prompt, candidate_count:2}),
         });
         screen.prompt_candidates = result.prompt_candidates || [];
         detailRenderTask();
+        detailRenderPromptEditor();
         detailShowToast('已生成提示词候选');
     } catch(error) { detailShowToast(error.message || '优化失败', 'error'); }
 }
@@ -896,7 +1339,7 @@ function detailApplyPromptCandidate(screenNo, candidateIndex){
     const prompt = screen?.prompt_candidates?.[candidateIndex]?.prompt;
     if(!prompt) return;
     detailRuntime.promptDrafts.set(screenNo, prompt);
-    const textarea = document.querySelector(`[data-screen-prompt="${screenNo}"]`);
+    const textarea = document.getElementById('promptEditorText');
     if(textarea) textarea.value = prompt;
 }
 
@@ -914,9 +1357,10 @@ async function detailEditScreenParams(screenNo){
     const size = window.prompt('输出尺寸', current.size || base.size || '');
     if(size === null) return;
     try {
-        detailRuntime.task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/screens/${screenNo}`, {
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/${screenNo}`, {
             method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({generation_params:{image_model:imageModel, aspect_ratio:aspectRatio, resolution, size, quality:current.quality || base.quality || 'auto'}}),
         });
+        detailRememberTask(task);
         detailRenderTask();
         detailShowToast(`第 ${screenNo} 屏参数已保存`);
     } catch(error) { detailShowToast(error.message || '参数保存失败', 'error'); }
@@ -924,29 +1368,51 @@ async function detailEditScreenParams(screenNo){
 
 async function detailSelectCandidate(screenNo, candidateIndex){
     try {
-        detailRuntime.task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/screens/${screenNo}`, {
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/${screenNo}`, {
             method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({selected_candidate:candidateIndex}),
         });
+        detailRememberTask(task);
         detailRenderTask();
     } catch(error) { detailShowToast(error.message || '候选切换失败', 'error'); }
 }
 
+async function detailRecoverCandidate(screenNo, candidateId, button){
+    if(!detailRuntime.viewTaskId || !candidateId) return;
+    if(button){ button.disabled = true; button.textContent = '查询中'; }
+    try {
+        const response = await detailFetchJson(
+            `/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/${screenNo}/candidates/${encodeURIComponent(candidateId)}/recover`,
+            {method:'POST'},
+        );
+        if(response?.task) detailRememberTask(response.task);
+        detailRenderTask();
+        detailRenderHistory();
+        detailPollTasks();
+        detailShowToast(response?.reused ? '该任务正在回补，请勿重复点击' : '已开始回补，只查询原任务，不会重复扣费');
+    } catch(error) {
+        if(button){ button.disabled = false; button.textContent = '回补'; }
+        detailShowToast(error.message || '回补查询失败', 'error');
+    }
+}
+
 async function detailRegenerateScreen(screenNo, count=1){
-    if(!detailRuntime.taskId) return;
+    if(!detailRuntime.viewTaskId) return;
     const screen = (detailRuntime.task?.screens || []).find(item => Number(item.screen_no) === Number(screenNo));
     if(!screen || detailScreenRegenerationLocked(screen)) return;
+    if(String(screen.status || '') === 'unknown' && !window.confirm('该分屏的上游结果状态未知，重新生成可能再次扣费。确定重新提交吗？')) return;
     const prompt = String(detailRuntime.promptDrafts.get(screenNo) ?? screen.prompt ?? '').trim();
     if(!prompt){ detailShowToast('提示词不能为空', 'error'); return; }
     try {
-        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/screens/${screenNo}/regenerate`, {
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/${screenNo}/regenerate`, {
             method:'POST',
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({prompt, count, generation_params:screen.generation_params || {}}),
         });
-        detailRuntime.task = task;
+        detailRememberTask(task);
         detailRuntime.promptDrafts.set(screenNo, prompt);
         detailRenderTask();
-        detailPollTask();
+        detailRenderHistory();
+        detailPollTasks();
         detailShowToast(count === 4 ? '已并发提交 4 个候选' : '已提交重新生成');
     } catch(error) {
         detailShowToast(error.message || '重新生成失败', 'error');
@@ -956,7 +1422,8 @@ async function detailRegenerateScreen(screenNo, count=1){
 async function detailDeleteScreen(screenNo){
     if(!window.confirm(`删除第 ${screenNo} 屏及其候选结果？`)) return;
     try {
-        detailRuntime.task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/screens/${screenNo}`, {method:'DELETE'});
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/${screenNo}`, {method:'DELETE'});
+        detailRememberTask(task);
         detailRuntime.promptDrafts.delete(screenNo);
         detailRenderTask();
     } catch(error) { detailShowToast(error.message || '删除分屏失败', 'error'); }
@@ -979,9 +1446,10 @@ async function detailReorderScreens(sourceNo, targetNo){
     if(source < 0 || target < 0) return;
     order.splice(target, 0, order.splice(source, 1)[0]);
     try {
-        detailRuntime.task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/screens/reorder`, {
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/reorder`, {
             method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({screen_order:order}),
         });
+        detailRememberTask(task);
         detailRenderTask();
     } catch(error) { detailShowToast(error.message || '顺序保存失败', 'error'); }
 }
@@ -989,59 +1457,126 @@ async function detailReorderScreens(sourceNo, targetNo){
 function detailHistoryLabel(task, index){
     const date = new Date((Number(task.updated_at) || 0) * 1000);
     const time = Number.isFinite(date.getTime()) ? date.toLocaleString('zh-CN', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}) : '';
-    return `分组 #${detailRuntime.history.length - index} · ${time} · ${detailTaskStatusLabel(task.status)}`;
+    const screens = Array.isArray(task?.screens) ? task.screens : [];
+    const completed = screens.filter(screen => ['succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(screen?.status || ''))).length;
+    const total = screens.length || Math.max(0, Number(task?.settings?.screen_count) || 0);
+    const status = detailTaskIsActive(task) ? `运行中 ${completed}/${total}` : detailTaskStatusLabel(task?.status);
+    const title = String(task?.title || '').trim();
+    const group = title ? `${title} · #${detailTaskGroupNumber(task)}` : `分组 #${detailTaskGroupNumber(task)}`;
+    return `${group} · ${time} · ${status}`;
+}
+
+function detailStartTaskRename(){
+    const taskId = String(detailRuntime.task?.id || '');
+    if(!taskId) return;
+    detailRuntime.renamingTaskId = taskId;
+    detailRenderTaskTitle(detailRuntime.task);
+    requestAnimationFrame(() => {
+        const input = document.getElementById('taskTitleInput');
+        input?.focus();
+        input?.select();
+    });
+}
+
+function detailCancelTaskRename(){
+    detailRuntime.renamingTaskId = '';
+    detailRenderTaskTitle(detailRuntime.task);
+}
+
+async function detailSaveTaskTitle(event){
+    event?.preventDefault();
+    const taskId = String(detailRuntime.renamingTaskId || '');
+    if(!taskId || taskId !== String(detailRuntime.viewTaskId || '')) return;
+    const input = document.getElementById('taskTitleInput');
+    const saveButton = document.getElementById('saveTaskTitleBtn');
+    const cancelButton = document.getElementById('cancelTaskTitleBtn');
+    const title = String(input?.value || '').replace(/\s+/g, ' ').trim().slice(0, 60).trim();
+    saveButton.disabled = true;
+    cancelButton.disabled = true;
+    try {
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(taskId)}`, {
+            method:'PATCH',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({title}),
+        });
+        detailRememberTask(task, {select:true});
+        detailRuntime.renamingTaskId = '';
+        detailRenderHistory();
+        detailRenderTask();
+        detailShowToast(title ? '分组名称已保存' : '已恢复默认分组名称');
+    } catch(error) {
+        detailShowToast(error.message || '分组名称保存失败', 'error');
+    } finally {
+        saveButton.disabled = false;
+        cancelButton.disabled = false;
+    }
 }
 
 function detailRenderHistory(){
     const select = document.getElementById('historySelect');
     select.innerHTML = detailRuntime.history.length ? detailRuntime.history.map((task, index) => `<option value="${detailEscapeHtml(task.id)}">${detailEscapeHtml(detailHistoryLabel(task, index))}</option>`).join('') : '<option value="">当前分组</option>';
-    select.value = detailRuntime.taskId || '';
+    select.value = detailRuntime.viewTaskId || '';
+    detailRenderGenerateAction();
 }
 
 async function detailLoadHistory(preferredId=''){
     try {
         const data = await detailFetchJson('/api/detail-page-tasks');
-        detailRuntime.history = Array.isArray(data.tasks) ? data.tasks : [];
+        detailRuntime.history = [];
+        detailRuntime.taskCache.clear();
+        detailRuntime.activeTaskIds.clear();
+        (Array.isArray(data.tasks) ? data.tasks : []).forEach(task => detailRememberTask(task));
         detailRenderHistory();
-        const targetId = preferredId || detailRuntime.taskId || detailRuntime.history[0]?.id;
-        if(targetId && targetId !== detailRuntime.taskId) await detailOpenHistoryTask(targetId);
+        const targetId = preferredId || detailRuntime.viewTaskId || detailRuntime.history[0]?.id;
+        if(targetId) await detailOpenHistoryTask(targetId, {skipConfirm:true});
+        if(detailRuntime.activeTaskIds.size) detailPollTasks();
     } catch(error) { detailShowToast(error.message || '历史加载失败', 'error'); }
 }
 
-async function detailOpenHistoryTask(taskId){
+async function detailOpenHistoryTask(taskId, options={}){
     if(!taskId) return;
-    detailStopPolling();
+    if(taskId !== detailRuntime.viewTaskId && !options.skipConfirm && detailHasUnsavedDraft() && !window.confirm('左侧有尚未提交的修改，切换历史后会被恢复内容替换。继续切换吗？')){
+        detailRenderHistory();
+        return;
+    }
     try {
-        detailRuntime.task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(taskId)}`);
-        detailRuntime.taskId = taskId;
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(taskId)}`);
+        detailRuntime.renamingTaskId = '';
+        detailRememberTask(task, {select:true});
         detailRuntime.promptDrafts.clear();
+        detailClosePromptEditor();
+        detailApplyRestoredSettings(task.settings || {});
         detailRenderHistory();
         detailRenderTask();
-        if(detailTaskIsActive()) detailPollTask();
     } catch(error) { detailShowToast(error.message || '分组加载失败', 'error'); }
 }
 
 async function detailResumeTask(){
-    if(!detailRuntime.taskId || detailTaskIsActive()) return;
+    if(!detailRuntime.viewTaskId || detailTaskIsActive()) return;
     try {
-        detailRuntime.task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/resume`, {method:'POST'});
-        detailRenderTask(); detailPollTask();
+        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/resume`, {method:'POST'});
+        detailRememberTask(task);
+        detailRenderTask(); detailRenderHistory(); detailPollTasks();
     } catch(error) { detailShowToast(error.message || '恢复失败', 'error'); }
 }
 
 async function detailDeleteTask(){
-    if(!detailRuntime.taskId || detailTaskIsActive() || !window.confirm('删除当前详情页分组？')) return;
+    if(!detailRuntime.viewTaskId || detailTaskIsActive() || !window.confirm('删除当前详情页分组？')) return;
     try {
-        await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}`, {method:'DELETE'});
-        detailRuntime.taskId = ''; detailRuntime.task = null; detailRuntime.promptDrafts.clear();
-        detailRenderTask(); await detailLoadHistory();
+        const deletedId = detailRuntime.viewTaskId;
+        await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(deletedId)}`, {method:'DELETE'});
+        detailForgetTask(deletedId);
+        detailRuntime.viewTaskId = ''; detailRuntime.task = null; detailRuntime.promptDrafts.clear();
+        const nextId = detailRuntime.history[0]?.id;
+        if(nextId) await detailOpenHistoryTask(nextId, {skipConfirm:true});
+        else { detailRenderHistory(); detailRenderTask(); }
     } catch(error) { detailShowToast(error.message || '删除分组失败', 'error'); }
 }
 
 function detailDownloadAll(){
-    if(!detailRuntime.taskId) return;
+    if(!detailRuntime.viewTaskId) return;
     const link = document.createElement('a');
-    link.href = `/api/detail-page-tasks/${encodeURIComponent(detailRuntime.taskId)}/download.zip`;
+    link.href = `/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/download.zip`;
     link.download = 'detail-page.zip'; link.click();
 }
 
@@ -1120,24 +1655,27 @@ function detailBindViewer(){
 }
 
 function detailBindControls(){
-    document.getElementById('imageModelSelect').addEventListener('change', event => { detailState.imageChoice = event.target.value; detailSyncResolutionOptions(); });
-    document.getElementById('llmModelSelect').addEventListener('change', event => { detailState.llmChoice = event.target.value; });
+    document.getElementById('imageModelSelect').addEventListener('change', event => { detailState.imageChoice = event.target.value; detailSyncResolutionOptions(); detailRenderGenerateAction(); });
+    document.getElementById('llmModelSelect').addEventListener('change', event => { detailState.llmChoice = event.target.value; detailRenderGenerateAction(); });
     document.querySelectorAll('[data-state]').forEach(control => control.addEventListener('change', () => {
         detailState[control.dataset.state] = control.value;
         if(control.dataset.state === 'resolution' || control.dataset.state === 'ratio') detailSyncSizeFields();
         if(control.dataset.state === 'modelSetting') detailSyncModelControls();
         if(['screenCount', 'modelUsage', 'reversalScreens'].includes(control.dataset.state)) detailClampCountSettings();
+        detailRenderGenerateAction();
     }));
-    document.querySelectorAll('[data-state][type="text"], textarea[data-state]').forEach(control => control.addEventListener('input', () => { detailState[control.dataset.state] = control.value; }));
+    document.querySelectorAll('[data-state][type="text"], textarea[data-state]').forEach(control => control.addEventListener('input', () => { detailState[control.dataset.state] = control.value; detailRenderGenerateAction(); }));
     ['customRatioWidth','customRatioHeight','customSizeWidth','customSizeHeight'].forEach(key => document.getElementById(key).addEventListener('input', event => {
         detailState[key] = event.target.value;
         detailSyncSizeFields();
+        detailRenderGenerateAction();
     }));
     document.getElementById('columnsSelect').addEventListener('change', event => document.getElementById('resultGrid').style.setProperty('--result-columns', event.target.value));
     document.getElementById('directionToggle').addEventListener('change', detailRenderTask);
     document.getElementById('savePresetBtn').addEventListener('click', detailSavePreset);
     document.getElementById('loadPresetBtn').addEventListener('click', detailLoadPreset);
-    document.getElementById('analyzeBtn').addEventListener('click', detailAnalyzeDraft);
+    document.getElementById('analyzeBtn').addEventListener('click', detailHandleGenerateClick);
+    document.getElementById('forceGenerateBtn').addEventListener('click', detailForceGenerate);
     document.getElementById('cancelTaskBtn').addEventListener('click', detailCancelTask);
     document.getElementById('resumeTaskBtn').addEventListener('click', detailResumeTask);
     document.getElementById('deleteTaskBtn').addEventListener('click', detailDeleteTask);
@@ -1145,14 +1683,27 @@ function detailBindControls(){
     document.getElementById('downloadAllBtn').addEventListener('click', detailDownloadAll);
     document.getElementById('requestPreviewBtn').addEventListener('click', () => { const panel = document.getElementById('requestPreview'); if(!panel.hidden) panel.open = !panel.open; });
     document.getElementById('historySelect').addEventListener('change', event => detailOpenHistoryTask(event.target.value));
+    document.getElementById('renameTaskBtn').addEventListener('click', detailStartTaskRename);
+    document.getElementById('taskTitleForm').addEventListener('submit', detailSaveTaskTitle);
+    document.getElementById('cancelTaskTitleBtn').addEventListener('click', detailCancelTaskRename);
     document.querySelectorAll('[data-open-assets]').forEach(button => button.addEventListener('click', detailOpenAssets));
     document.getElementById('closePreviewBtn').addEventListener('click', detailClosePreview);
     document.getElementById('imagePreview').addEventListener('click', event => { if(event.target.id === 'imagePreview') detailClosePreview(); });
+    document.getElementById('promptEditorText').addEventListener('input', event => {
+        if(detailRuntime.promptEditorScreenNo) detailRuntime.promptDrafts.set(detailRuntime.promptEditorScreenNo, event.target.value);
+    });
+    document.getElementById('promptEditorClose').addEventListener('click', detailClosePromptEditor);
+    document.getElementById('promptEditorModal').addEventListener('click', event => { if(event.target.id === 'promptEditorModal') detailClosePromptEditor(); });
+    document.getElementById('promptEditorSave').addEventListener('click', () => detailSaveScreen(detailRuntime.promptEditorScreenNo));
+    document.getElementById('promptEditorOptimize').addEventListener('click', () => detailOptimizeScreen(detailRuntime.promptEditorScreenNo, document.getElementById('promptEditorInstruction').value));
+    document.getElementById('promptEditorCandidateSelect').addEventListener('change', event => detailApplyPromptCandidate(detailRuntime.promptEditorScreenNo, Number(event.target.value)));
     document.addEventListener('paste', event => {
         const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
         if(files.length) detailAddFiles('product', files);
     });
     document.addEventListener('keydown', event => {
+        if(event.key === 'Escape' && detailRuntime.renamingTaskId){ detailCancelTaskRename(); return; }
+        if(event.key === 'Escape' && !document.getElementById('promptEditorModal').hidden){ detailClosePromptEditor(); return; }
         if(document.getElementById('imagePreview').hidden) return;
         if(event.key === 'Escape') detailClosePreview();
         else if(event.key === 'ArrowLeft') detailViewerStepScreen(-1);
@@ -1167,11 +1718,13 @@ function detailListenForConfigChanges(){
     window.addEventListener('message', event => {
         if(event.origin && event.origin !== location.origin) return;
         if(['providers-changed','workflows-changed'].includes(event.data?.type)) detailRefreshConfig();
+        if(event.data?.type === 'detail-pages-changed') detailLoadHistory(detailRuntime.viewTaskId);
     });
     try {
         const channel = new BroadcastChannel('studio-api');
         channel.addEventListener('message', event => {
             if(['providers-changed','workflows-changed'].includes(event.data?.type)) detailRefreshConfig();
+            if(event.data?.type === 'detail-pages-changed') detailLoadHistory(detailRuntime.viewTaskId);
         });
     } catch(_) {}
     document.addEventListener('visibilitychange', () => { if(!document.hidden) detailRefreshConfig(); });
@@ -1184,6 +1737,7 @@ function detailInit(){
     detailListenForConfigChanges();
     detailApplyStateToControls();
     detailRenderUploads();
+    detailMarkDraftBaseline();
     detailRenderTask();
     detailRefreshConfig();
     detailLoadHistory();

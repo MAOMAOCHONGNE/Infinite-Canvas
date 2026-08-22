@@ -8,6 +8,10 @@ const idInput = document.getElementById('idInput');
 const baseInput = document.getElementById('baseInput');
 const protocolInput = document.getElementById('protocolInput');
 const imageRequestModeInput = document.getElementById('imageRequestModeInput');
+const imageAsyncRecoveryBlock = document.getElementById('imageAsyncRecoveryBlock');
+const imageAsyncEnabledInput = document.getElementById('imageAsyncEnabledInput');
+const imageTaskEndpointInput = document.getElementById('imageTaskEndpointInput');
+const imageAsyncRecoveryHint = document.getElementById('imageAsyncRecoveryHint');
 const imageEditRouteInput = document.getElementById('imageEditRouteInput');
 const keyInput = document.getElementById('keyInput');
 const keyHint = document.getElementById('keyHint');
@@ -357,6 +361,11 @@ function applyLockedRecommendedProtocol(item){
     item.protocol = String(api.protocol || 'openai').toLowerCase();
     item.image_request_mode = normalizeImageRequestMode(api.image_request_mode);
     return true;
+}
+
+function isComflyAsyncHost(baseUrl=''){
+    try { return new URL(String(baseUrl || '').trim()).hostname.toLowerCase() === 'ai.comfly.org'; }
+    catch(_error) { return false; }
 }
 
 function refreshIcons(){ if(window.lucide) lucide.createIcons(); }
@@ -863,6 +872,11 @@ function syncEditor(){
     );
     item.image_generation_endpoint = '';
     item.image_edit_endpoint = '';
+    const asyncUnsupported = item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(selectedProtocol) || selectedProtocol !== 'openai';
+    const automaticAsync = !asyncUnsupported && isComflyAsyncHost(item.base_url);
+    item.image_async_enabled = asyncUnsupported || automaticAsync ? false : Boolean(imageAsyncEnabledInput?.checked);
+    item.image_task_endpoint = asyncUnsupported ? '' : String(imageTaskEndpointInput?.value || item.image_task_endpoint || '').trim();
+    if((automaticAsync || item.image_async_enabled) && !item.image_task_endpoint) item.image_task_endpoint = '/v1/images/tasks/{task_id}';
     item.rh_apps = normalizeRhEntries(item.rh_apps || [], 'app');
     item.rh_workflows = normalizeRhEntries(item.rh_workflows || [], 'workflow');
     const key = keyInput.value.trim();
@@ -2730,6 +2744,8 @@ function recommendedProviderForApi(api){
         image_edit_route:normalizeImageEditRoute(api.image_edit_route),
         image_generation_endpoint:'',
         image_edit_endpoint:'',
+        image_async_enabled:Boolean(api.image_async_enabled),
+        image_task_endpoint:String(api.image_task_endpoint || ''),
         enabled:true,
         primary:false,
         image_models:api.empty_models_on_save ? [] : (Array.isArray(api.image_models) ? [...api.image_models] : []),
@@ -2922,6 +2938,25 @@ function renderEditor(){
     if(imageEditRouteInput){
         imageEditRouteInput.value = normalizeImageEditRoute(item.image_edit_route);
         imageEditRouteInput.disabled = item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
+    }
+    if(imageAsyncRecoveryBlock){
+        const currentProtocol = String(protocolInput?.value || item.protocol || 'openai').toLowerCase();
+        const supported = currentProtocol === 'openai' && !['modelscope','runninghub','volcengine'].includes(item.id) && !CLI_PROTOCOLS.has(currentProtocol);
+        const automatic = supported && isComflyAsyncHost(item.base_url);
+        imageAsyncRecoveryBlock.hidden = !supported;
+        if(imageAsyncEnabledInput){
+            imageAsyncEnabledInput.checked = automatic || Boolean(item.image_async_enabled);
+            imageAsyncEnabledInput.disabled = automatic;
+        }
+        if(imageTaskEndpointInput){
+            imageTaskEndpointInput.value = String(item.image_task_endpoint || (automatic ? '/v1/images/tasks/{task_id}' : ''));
+            imageTaskEndpointInput.disabled = !supported;
+        }
+        if(imageAsyncRecoveryHint){
+            imageAsyncRecoveryHint.textContent = automatic
+                ? '已识别 Comfly：详情页会使用 async=true，并在断线后继续查询原任务。'
+                : '仅在中转站明确兼容 OpenAI async=true 与任务查询接口时开启。';
+        }
     }
     keyInput.value = '';
     keyInput.placeholder = item.has_key ? `${tr('api.keepCurrentKey')} ${item.key_preview || ''}` : tr('api.enterKey');
@@ -4062,7 +4097,7 @@ function addProvider(){
     let id = 'custom-api';
     let index = 2;
     while(providers.some(item => item.id === id)) id = `custom-api-${index++}`;
-    providers.push({id, name:'API', base_url:'', protocol:'openai', image_request_mode:'openai', image_edit_route:'general', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], model_names:{}, model_protocols:{}, model_image_strategies:{}, image_model_resolution_maps:{}, has_key:false, key_preview:''});
+    providers.push({id, name:'API', base_url:'', protocol:'openai', image_request_mode:'openai', image_edit_route:'general', image_generation_endpoint:'', image_edit_endpoint:'', image_async_enabled:false, image_task_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], model_names:{}, model_protocols:{}, model_image_strategies:{}, image_model_resolution_maps:{}, has_key:false, key_preview:''});
     selectedId = id;
     renderEditor();
 }
@@ -4085,6 +4120,8 @@ async function addCliProvider(kind){
             image_edit_route:'general',
             image_generation_endpoint:'',
             image_edit_endpoint:'',
+            image_async_enabled:false,
+            image_task_endpoint:'',
             enabled:true,
             primary:false,
             image_models:[],
@@ -4369,6 +4406,8 @@ async function loadProviders(){
             item.model_protocols = (item.model_protocols && typeof item.model_protocols === 'object') ? item.model_protocols : {};
             item.model_image_strategies = (item.model_image_strategies && typeof item.model_image_strategies === 'object') ? item.model_image_strategies : {};
             item.image_model_resolution_maps = (item.image_model_resolution_maps && typeof item.image_model_resolution_maps === 'object') ? item.image_model_resolution_maps : {};
+            item.image_async_enabled = Boolean(item.image_async_enabled);
+            item.image_task_endpoint = String(item.image_task_endpoint || '');
         });
         selectedId = providers.some(item => item.id === previousSelectedId)
             ? previousSelectedId
@@ -4424,6 +4463,14 @@ async function saveProviders(){
         }
         item.image_generation_endpoint = '';
         item.image_edit_endpoint = '';
+        if(isCliProtocol || item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || item.protocol !== 'openai'){
+            item.image_async_enabled = false;
+            item.image_task_endpoint = '';
+        } else {
+            const automaticAsync = isComflyAsyncHost(item.base_url);
+            item.image_async_enabled = automaticAsync ? false : Boolean(item.image_async_enabled);
+            if((automaticAsync || item.image_async_enabled) && !item.image_task_endpoint) item.image_task_endpoint = '/v1/images/tasks/{task_id}';
+        }
         item.image_models = unique(item.image_models || []);
         item.chat_models = unique(item.chat_models || []);
         item.video_models = unique(item.video_models || []);
@@ -4482,6 +4529,8 @@ async function saveProviders(){
                 image_edit_route:item.image_edit_route || 'general',
                 image_generation_endpoint:item.image_generation_endpoint || '',
                 image_edit_endpoint:item.image_edit_endpoint || '',
+                image_async_enabled:Boolean(item.image_async_enabled),
+                image_task_endpoint:item.image_task_endpoint || '',
                 enabled:item.enabled !== false,
                 primary:false,
                 image_models:item.image_models || [],
@@ -4588,7 +4637,20 @@ window.onload = () => {
     // 平台名输入时实时预览生成的 ID
     if(nameInput) nameInput.addEventListener('input', updateIdPreview);
     if(protocolInput) protocolInput.addEventListener('change', updateProtocolFromInput);
-    if(baseInput) baseInput.addEventListener('input', () => updateApimartDomesticHint());
+    if(baseInput) baseInput.addEventListener('input', () => {
+        updateApimartDomesticHint();
+        const item = provider();
+        if(!item || !imageAsyncEnabledInput) return;
+        const automatic = isComflyAsyncHost(baseInput.value);
+        imageAsyncEnabledInput.checked = automatic || Boolean(item.image_async_enabled);
+        imageAsyncEnabledInput.disabled = automatic;
+        if(automatic && imageTaskEndpointInput && !imageTaskEndpointInput.value.trim()){
+            imageTaskEndpointInput.value = '/v1/images/tasks/{task_id}';
+        }
+        if(imageAsyncRecoveryHint) imageAsyncRecoveryHint.textContent = automatic
+            ? '已识别 Comfly：详情页会使用 async=true，并在断线后继续查询原任务。'
+            : '仅在中转站明确兼容 OpenAI async=true 与任务查询接口时开启。';
+    });
     if(imageRequestModeInput) imageRequestModeInput.addEventListener('change', () => {
         const item = provider();
         if(!item) return;
@@ -4603,6 +4665,18 @@ window.onload = () => {
         const item = provider();
         if(!item) return;
         item.image_edit_route = normalizeImageEditRoute(imageEditRouteInput.value);
+    });
+    if(imageAsyncEnabledInput) imageAsyncEnabledInput.addEventListener('change', () => {
+        const item = provider();
+        if(!item) return;
+        item.image_async_enabled = Boolean(imageAsyncEnabledInput.checked);
+        if(item.image_async_enabled && imageTaskEndpointInput && !imageTaskEndpointInput.value.trim()){
+            imageTaskEndpointInput.value = '/v1/images/tasks/{task_id}';
+        }
+    });
+    if(imageTaskEndpointInput) imageTaskEndpointInput.addEventListener('input', () => {
+        const item = provider();
+        if(item) item.image_task_endpoint = imageTaskEndpointInput.value.trim();
     });
     [keyInput, rhFreeKeyInput, rhWalletKeyInput].forEach(input => {
         if(input) input.addEventListener('input', () => {

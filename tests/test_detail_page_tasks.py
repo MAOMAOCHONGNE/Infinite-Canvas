@@ -193,12 +193,126 @@ class DetailPagePlannerTests(unittest.TestCase):
 
 
 class DetailPageTaskLifecycleTests(unittest.TestCase):
+    def test_new_task_uses_product_name_as_its_editable_display_title(self):
+        payload = detail_payload(product_name="圣诞香水")
+        record = main.new_detail_page_task_record("detail_test_auto_title", payload)
+        self.assertEqual(record["title"], "圣诞香水详情页")
+        self.assertNotIn("title", record["settings"])
+
+    def test_rename_changes_only_the_persisted_display_title(self):
+        task_id = "detail_page_test_rename_title"
+        payload = detail_payload(product_name="旧名称")
+        record = main.new_detail_page_task_record(task_id, payload)
+        original_updated_at = record["updated_at"]
+        original_fingerprint = record["config_fingerprint"]
+        main.CANVAS_TASKS[task_id] = record
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(main, "DETAIL_PAGE_TASK_DIR", folder):
+            renamed = asyncio.run(main.rename_detail_page_task(
+                task_id,
+                main.DetailPageTaskRenameRequest(title="  圣诞   香水礼盒  "),
+            ))
+            with open(main.detail_page_task_file(task_id), "r", encoding="utf-8") as handle:
+                persisted = json.load(handle)
+
+        self.assertEqual(renamed["title"], "圣诞 香水礼盒")
+        self.assertEqual(persisted["title"], "圣诞 香水礼盒")
+        self.assertEqual(renamed["updated_at"], original_updated_at)
+        self.assertEqual(renamed["config_fingerprint"], original_fingerprint)
+        self.assertEqual(renamed["status"], "planning")
+
+    def test_source_image_metadata_is_optional_and_persisted_with_task_settings(self):
+        payload = detail_payload(
+            product_image_meta=[{"url": "https://example.test/product.png", "name": "产品原图.png", "width": 1200, "height": 1600}],
+            reference_image_meta=[{"url": "https://example.test/reference.png", "name": "参考风格.png", "width": 900, "height": 1200}],
+        )
+        record = main.new_detail_page_task_record("detail_test_source_meta", payload)
+        self.assertEqual(record["settings"]["product_image_meta"][0]["name"], "产品原图.png")
+        self.assertEqual(record["settings"]["reference_image_meta"][0]["width"], 900)
+        legacy = detail_payload()
+        self.assertEqual(legacy.product_image_meta, [])
+        self.assertEqual(legacy.reference_image_meta, [])
+
     def tearDown(self):
         for task_id in list(main.CANVAS_TASKS):
-            if str(task_id).startswith(("detail_test_", "detail_page_test_")):
+            task = main.CANVAS_TASKS.get(task_id) or {}
+            if str(task_id).startswith(("detail_test_", "detail_page_test_")) or str(task.get("submission_id") or "") in {
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+                "33333333-3333-4333-8333-333333333333",
+            }:
                 main.CANVAS_TASKS.pop(task_id, None)
         main.DETAIL_PAGE_BACKGROUND_TASKS.clear()
         main.DETAIL_PAGE_SCREEN_TASKS.clear()
+
+    def test_config_fingerprint_uses_generation_inputs_but_ignores_submission_metadata(self):
+        first = detail_payload(
+            submission_id="11111111-1111-4111-8111-111111111111",
+            product_image_meta=[{"url": "https://example.test/product.png", "name": "旧名称.png", "width": 800, "height": 1200}],
+        )
+        same_generation = detail_payload(
+            submission_id="22222222-2222-4222-8222-222222222222",
+            force_new=True,
+            product_image_meta=[{"url": "https://example.test/product.png", "name": "新名称.png", "width": 1600, "height": 2400}],
+        )
+        changed_generation = detail_payload(
+            submission_id="33333333-3333-4333-8333-333333333333",
+            image_model="another-image-model",
+        )
+
+        first_fingerprint = main.detail_page_config_fingerprint(first)
+        self.assertEqual(first_fingerprint, main.detail_page_config_fingerprint(same_generation))
+        self.assertNotEqual(first_fingerprint, main.detail_page_config_fingerprint(changed_generation))
+        self.assertRegex(first_fingerprint, r"^[0-9a-f]{64}$")
+
+    def test_create_is_idempotent_by_submission_and_reuses_an_active_matching_config(self):
+        first_submission = "11111111-1111-4111-8111-111111111111"
+        second_submission = "22222222-2222-4222-8222-222222222222"
+        first_payload = detail_payload(submission_id=first_submission)
+        matching_payload = detail_payload(submission_id=second_submission)
+        runner = AsyncMock(return_value=None)
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(main, "DETAIL_PAGE_TASK_DIR", folder), patch.object(main, "run_detail_page_task", runner):
+            first = asyncio.run(main.create_detail_page_task(first_payload))
+            repeated_transport = asyncio.run(main.create_detail_page_task(first_payload))
+            reused_config = asyncio.run(main.create_detail_page_task(matching_payload))
+            main.CANVAS_TASKS[first["task_id"]]["status"] = "succeeded"
+            repeated_reuse = asyncio.run(main.create_detail_page_task(matching_payload))
+
+        self.assertFalse(first["reused"])
+        self.assertEqual(first["reuse_reason"], "")
+        self.assertEqual(repeated_transport["task_id"], first["task_id"])
+        self.assertEqual(repeated_transport["reuse_reason"], "submission_id")
+        self.assertEqual(reused_config["task_id"], first["task_id"])
+        self.assertEqual(reused_config["reuse_reason"], "active_config")
+        self.assertEqual(repeated_reuse["task_id"], first["task_id"])
+        self.assertEqual(repeated_reuse["reuse_reason"], "submission_id")
+        self.assertEqual(runner.await_count, 1)
+        stored = main.CANVAS_TASKS[first["task_id"]]
+        self.assertEqual(stored["submission_id"], first_submission)
+        self.assertEqual(stored["submission_ids"], [first_submission, second_submission])
+        self.assertEqual(stored["config_fingerprint"], main.detail_page_config_fingerprint(first_payload))
+
+    def test_force_new_bypasses_only_active_config_reuse_and_terminal_tasks_do_not_block(self):
+        original_payload = detail_payload(submission_id="11111111-1111-4111-8111-111111111111")
+        forced_payload = detail_payload(submission_id="22222222-2222-4222-8222-222222222222", force_new=True)
+        after_terminal_payload = detail_payload(submission_id="33333333-3333-4333-8333-333333333333")
+        runner = AsyncMock(return_value=None)
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(main, "DETAIL_PAGE_TASK_DIR", folder), patch.object(main, "run_detail_page_task", runner):
+            first = asyncio.run(main.create_detail_page_task(original_payload))
+            forced = asyncio.run(main.create_detail_page_task(forced_payload))
+            repeated_forced = asyncio.run(main.create_detail_page_task(forced_payload))
+            main.CANVAS_TASKS[first["task_id"]]["status"] = "succeeded"
+            main.CANVAS_TASKS[forced["task_id"]]["status"] = "succeeded"
+            after_terminal = asyncio.run(main.create_detail_page_task(after_terminal_payload))
+
+        self.assertNotEqual(forced["task_id"], first["task_id"])
+        self.assertFalse(forced["reused"])
+        self.assertEqual(repeated_forced["task_id"], forced["task_id"])
+        self.assertEqual(repeated_forced["reuse_reason"], "submission_id")
+        self.assertNotIn(after_terminal["task_id"], {first["task_id"], forced["task_id"]})
+        self.assertEqual(runner.await_count, 3)
 
     def test_normal_flow_uses_one_selected_visual_llm_and_concurrent_images(self):
         payload = detail_payload()

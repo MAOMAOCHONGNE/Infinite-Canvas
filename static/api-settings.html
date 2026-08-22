@@ -16,12 +16,12 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.20-custom.1.1787287297"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.08.20-custom.1.1787287297"></script>
-    <script src="/static/js/theme.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/i18n.js?v=2026.08.20-custom.1.1787287296"></script>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.20-custom.1.1787287296">
-    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.08.20-custom.1.1787287296">
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.22-custom.1.1785863220"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.08.22-custom.1.1785863219"></script>
+    <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
+    <script src="/static/js/i18n.js?v=2026.08.22-custom.1.1786958929"></script>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.22-custom.1.1785863189">
+    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.08.22-custom.1.1786971584">
 </head>
 <body>
     <div class="page">
@@ -315,6 +315,15 @@
                                         <option value="tudou-async">图片：土豆 GPT-Image-2 异步</option>
                                     </select>
                                 </div>
+                            </div>
+                            <div id="imageAsyncRecoveryBlock" class="field full" style="padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-soft,#f8fafc);gap:8px">
+                                <label style="display:flex;align-items:center;gap:8px;font-size:12px;font-weight:800;color:var(--text)">
+                                    <input id="imageAsyncEnabledInput" type="checkbox">
+                                    <span>异步生图自动恢复</span>
+                                </label>
+                                <span class="label">任务查询地址模板</span>
+                                <div class="field-frame"><input id="imageTaskEndpointInput" type="text" placeholder="/v1/images/tasks/{task_id}"></div>
+                                <span id="imageAsyncRecoveryHint" class="hint">仅在中转站明确兼容 OpenAI async=true 与任务查询接口时开启。Comfly 会自动启用。</span>
                             </div>
                             <div id="verifyResult" style="display:none;padding:2px 0;grid-column:1/-1"></div>
                         </div>
@@ -631,9 +640,9 @@
         </div>
     </div>
 
-    <script src="/static/js/runninghub-config-transfer.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/model-config.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/api-settings.js?v=2026.08.20-custom.1.1787287296"></script>
-    <script src="/static/js/global-prompt-library.js?v=2026.08.20-custom.1.1787287296"></script>
+    <script src="/static/js/runninghub-config-transfer.js?v=2026.08.22-custom.1.1786187495"></script>
+    <script src="/static/js/model-config.js?v=2026.08.22-custom.1.1786809997"></script>
+    <script src="/static/js/api-settings.js?v=2026.08.22-custom.1.1787382820"></script>
+    <script src="/static/js/global-prompt-library.js?v=2026.08.22-custom.1.1786676777"></script>
 </body>
 </html>
