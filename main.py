@@ -264,7 +264,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.09.05-custom.1"
+APP_VERSION = "2026.09.05-custom.2"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
