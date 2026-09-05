@@ -80,7 +80,14 @@ class ImageGenerationAdminTests(unittest.TestCase):
             item for item in self.store.list_modes(include_admin=True)
             if isinstance(item.get("example"), dict)
         )
-        response = self.client.get(f"/api/image-generation/modes/{example_mode['id']}")
+        example_url = example_mode["example"]["output_media"]["url"]
+        relative = example_url.removeprefix("/static/")
+        static_root = Path(self.temp_dir.name) / "static"
+        example_path = static_root / relative
+        example_path.parent.mkdir(parents=True, exist_ok=True)
+        example_path.write_bytes(b"test-static-example")
+        with patch.object(main, "STATIC_DIR", str(static_root)):
+            response = self.client.get(f"/api/image-generation/modes/{example_mode['id']}")
         self.assertEqual(response.status_code, 200, response.text)
         example = response.json()["example"]
         urls = [item["media"]["url"] for item in example["input_media"]]

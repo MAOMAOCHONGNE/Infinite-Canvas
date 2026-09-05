@@ -65,9 +65,9 @@ test('studio sidebar places one global backup entry directly above more settings
     const popover = html.slice(html.indexOf('id="global-backup-popover"'), html.indexOf('</div>\n        <script>', html.indexOf('id="global-backup-popover"')));
     assert.match(popover, /data-backup-action="export"/);
     assert.match(popover, /data-backup-action="import"/);
-    assert.match(html, /pendingGlobalBackupAction/);
-    assert.match(html, /type:'studio-backup-action'/);
-    assert.match(html, /flushPendingBackupAction\(f\)/);
+    assert.match(html, /id="backupModal"/);
+    assert.match(html, /InfiniteCanvasBackup\?\.openBackupAction\?\./);
+    assert.doesNotMatch(html, /pendingGlobalBackupAction|flushPendingBackupAction/);
 
     const canvasList = fs.readFileSync(path.join(ROOT, 'static', 'canvas-list.html'), 'utf8');
     assert.doesNotMatch(canvasList, /data-backup-action="export"/);

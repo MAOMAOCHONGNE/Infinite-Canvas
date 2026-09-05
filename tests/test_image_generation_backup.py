@@ -734,6 +734,10 @@ class ImageGenerationBackupServiceTests(unittest.TestCase):
         data_root = root / "data"
         self.store = ImageGenerationStore(data_root, SEED_PATH)
         self.store.initialize()
+        for mode in self.store.list_modes(include_admin=True):
+            if mode.get("example") is not None:
+                mode["example"] = None
+                self.store._write_json(self.store._mode_path(mode["id"]), mode)
         self.media = ImageGenerationMediaStore(root)
         self.paths = {
             "DATA_DIR": str(data_root),
@@ -885,10 +889,33 @@ class ImageGenerationBackupServiceTests(unittest.TestCase):
             self.assertEqual(manifest["version"], 4)
 
     def test_official_cases_are_archived_even_when_normal_assets_are_disabled(self):
-        archive_path, _ = main.build_backup_archive(main.BackupExportRequest(
-            include_image_generation_modes=True,
-            include_assets=False,
-        ))
+        static_root = Path(self.temp.name) / "static"
+        mode = self.store.list_modes(include_admin=True)[0]
+        payload = _png_bytes((31, 63, 95, 255))
+        digest = __import__("hashlib").sha256(payload).hexdigest()
+        example_path = static_root / "image-generation-examples" / mode["id"] / f"{digest}.png"
+        example_path.parent.mkdir(parents=True, exist_ok=True)
+        example_path.write_bytes(payload)
+        self.store.save_example(mode["id"], {
+            "title": "独立静态案例",
+            "input_media": [],
+            "output_media": {
+                "id": digest,
+                "sha256": digest,
+                "url": f"/static/image-generation-examples/{mode['id']}/{digest}.png",
+                "media_type": "image/png",
+                "size": len(payload),
+                "width": 2,
+                "height": 2,
+            },
+            "sample_user_prompt": "",
+            "show_user_prompt": True,
+        })
+        with patch.object(main, "STATIC_DIR", str(static_root)):
+            archive_path, _ = main.build_backup_archive(main.BackupExportRequest(
+                include_image_generation_modes=True,
+                include_assets=False,
+            ))
         self.addCleanup(lambda: os.path.exists(archive_path) and os.remove(archive_path))
         with zipfile.ZipFile(archive_path, "r") as archive:
             manifest = json.loads(archive.read("manifest.json"))
@@ -953,6 +980,13 @@ class ImageGenerationBackupServiceTests(unittest.TestCase):
             public = main._image_generation_public_mode_with_example(self.mode_id)
 
         self.assertEqual(result["image_generation_modes_imported"], exported_mode_count)
+        for field in (
+            "image_generation_modes_created",
+            "image_generation_modes_updated",
+            "image_generation_modes_reactivated",
+            "image_generation_modes_archived",
+        ):
+            self.assertIn(field, result)
         self.assertTrue(imported["example"]["output_media"]["url"].startswith(
             "/assets/image-generation/media/"
         ))

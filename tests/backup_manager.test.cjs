@@ -60,16 +60,24 @@ test('export request contains identifiers only and never configuration values', 
     assert.doesNotMatch(encoded, /api[_-]?key|secret|password|base_url/i);
 });
 
-test('workspace keeps the backup modal in the canvas frame while the shell owns its entry point', () => {
-    const html = fs.readFileSync(path.join(ROOT, 'static', 'canvas-list.html'), 'utf8');
-    const css = fs.readFileSync(path.join(ROOT, 'static', 'css', 'canvas-list.css'), 'utf8');
+test('studio shell owns the backup modal and opens it without changing the active page', () => {
+    const shell = fs.readFileSync(path.join(ROOT, 'static', 'index.html'), 'utf8');
+    const canvasHtml = fs.readFileSync(path.join(ROOT, 'static', 'canvas-list.html'), 'utf8');
+    const css = fs.readFileSync(path.join(ROOT, 'static', 'css', 'backup-manager.css'), 'utf8');
     const backend = fs.readFileSync(path.join(ROOT, 'main.py'), 'utf8');
     const manager = fs.readFileSync(MODULE_PATH, 'utf8');
 
-    assert.doesNotMatch(html, /id="backupMenuBtn"/);
-    assert.doesNotMatch(html, /class="backup-menu-wrap"/);
-    assert.match(html, /id="backupModal"/);
-    assert.match(html, /backup-manager\.js/);
+    assert.doesNotMatch(canvasHtml, /id="backupMenuBtn"/);
+    assert.doesNotMatch(canvasHtml, /class="backup-menu-wrap"/);
+    assert.match(shell, /id="backupModal"/);
+    assert.match(shell, /backup-manager\.css/);
+    assert.match(shell, /backup-manager\.js/);
+    assert.match(shell, /InfiniteCanvasBackup\?\.openBackupAction\?\./);
+    const handler = shell.match(/function handleGlobalBackupAction\(action\)\s*\{[\s\S]*?\n\s*\}/)?.[0] || '';
+    assert.doesNotMatch(handler, /switchUI\(/);
+    assert.doesNotMatch(shell, /pendingGlobalBackupAction|flushPendingBackupAction/);
+    assert.match(manager, /function openBackupAction\(/);
+    assert.match(manager, /returnFocusTarget/);
     assert.match(manager, /studio-backup-action/);
     assert.match(manager, /event\.source !== window\.parent/);
     assert.match(manager, /event\.origin !== location\.origin/);
@@ -109,7 +117,7 @@ test('backup import defaults to backup policies, reports skips, and refreshes af
 });
 
 test('backup modal gives its middle content a definite scrollable viewport', () => {
-    const css = fs.readFileSync(path.join(ROOT, 'static', 'css', 'canvas-list.css'), 'utf8');
+    const css = fs.readFileSync(path.join(ROOT, 'static', 'css', 'backup-manager.css'), 'utf8');
     const modalRule = css.match(/\.backup-modal\s*\{[^}]+\}/)?.[0] || '';
     const bodyRule = css.match(/\.backup-modal-body\s*\{[^}]+\}/)?.[0] || '';
 
@@ -121,7 +129,7 @@ test('backup modal gives its middle content a definite scrollable viewport', () 
 
 test('backup tree keeps selection separate from collapsible section and group controls', () => {
     const manager = fs.readFileSync(MODULE_PATH, 'utf8');
-    const css = fs.readFileSync(path.join(ROOT, 'static', 'css', 'canvas-list.css'), 'utf8');
+    const css = fs.readFileSync(path.join(ROOT, 'static', 'css', 'backup-manager.css'), 'utf8');
 
     assert.match(manager, /const collapsedGroups\s*=\s*new Set\(\)/);
     assert.match(manager, /data-backup-collapse=/);

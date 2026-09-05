@@ -1304,7 +1304,10 @@ class ImageGenerationStore:
         the content-addressed media store before import.
         """
         with self._lock:
-            modes = self.list_modes(include_admin=True)
+            modes = [
+                mode for mode in self.list_modes(include_admin=True)
+                if mode.get("status") == "active"
+            ]
             # A complete configuration export is the maintainer's content
             # package.  Older locally-created official modes may predate the
             # source identity field, so stamp a stable identity into the
@@ -1780,16 +1783,21 @@ class ImageGenerationStore:
             clean_tasks = [backup_io.prepare_exported_image_generation_task(task) for task in task_sources]
 
             meta = self._read_meta()
-            current_content_version = str(meta.get("official_content_version") or "").strip()
-            if _version_is_older(incoming_content_version, current_content_version):
-                raise ValueError("官方图片生成内容版本不能降级")
 
             local_modes = [normalize_mode(item) for item in self._iter_records(self.mode_dir, "模式")]
             local_by_id = {str(item.get("id") or ""): item for item in local_modes}
+            local_by_number: dict[int, dict[str, Any]] = {}
             local_by_source: dict[str, dict[str, Any]] = {}
             legacy_official_by_number: dict[int, dict[str, Any]] = {}
             local_custom_numbers: set[int] = set()
             for local in local_modes:
+                number = local.get("mode_no")
+                if isinstance(number, int) and not isinstance(number, bool):
+                    if incoming_official_complete and number in local_by_number:
+                        raise ValueError(f"duplicate local mode number: {number}")
+                    local_by_number[number] = local
+                if incoming_official_complete:
+                    continue
                 identity = self._source_identity_for_mode(local)
                 has_explicit_source = isinstance(local.get("source_id"), str) and bool(local.get("source_id").strip())
                 if local.get("builtin") is True and not has_explicit_source:
@@ -1811,6 +1819,7 @@ class ImageGenerationStore:
 
             incoming_official_by_id: dict[str, str] = {}
             incoming_official_numbers: set[int] = set()
+            local_match_by_incoming_id: dict[str, dict[str, Any]] = {}
             for source_mode in normalized_modes:
                 identity = self._source_identity_for_mode(source_mode)
                 if not identity:
@@ -1823,15 +1832,14 @@ class ImageGenerationStore:
                     if number in incoming_official_numbers:
                         raise ValueError("官方模式编号重复")
                     incoming_official_numbers.add(number)
+                elif incoming_official_complete:
+                    raise ValueError("完整图片生成内容包中的模式必须有固定编号")
+                if incoming_official_complete:
+                    local = local_by_number.get(number)
+                    if local is not None:
+                        local_match_by_incoming_id[source_mode["id"]] = local
+                    continue
                 local = local_by_source.get(identity)
-                if local is None and incoming_official_complete:
-                    legacy_local = local_by_id.get(str(source_mode.get("id") or ""))
-                    if (
-                        legacy_local is not None
-                        and legacy_local.get("mode_no") == number
-                    ):
-                        local = legacy_local
-                        local_by_source[identity] = legacy_local
                 if local is None and isinstance(number, int) and number in legacy_official_by_number:
                     local = legacy_official_by_number[number]
                     local_by_source[identity] = local
@@ -1840,6 +1848,8 @@ class ImageGenerationStore:
                         raise ValueError("官方模式编号冲突：不能覆盖本机自定义模式")
                     if self._mode_path(source_mode["id"]).exists():
                         raise ValueError("官方模式身份冲突：不能覆盖本机自定义模式")
+                else:
+                    local_match_by_incoming_id[source_mode["id"]] = local
 
             version_id_maps = {
                 old_mode_id: {
@@ -1849,8 +1859,7 @@ class ImageGenerationStore:
                 for old_mode_id, versions in indexed_versions.items()
             }
             for source_mode in normalized_modes:
-                identity = incoming_official_by_id.get(source_mode["id"])
-                local = local_by_source.get(identity) if identity else None
+                local = local_match_by_incoming_id.get(source_mode["id"])
                 if local is not None:
                     current_version_id = str(local.get("current_version_id") or "")
                     version_id_maps[source_mode["id"]] = {
@@ -1881,6 +1890,14 @@ class ImageGenerationStore:
             mode_id_map: dict[str, str] = {}
             imported_mode_ids: list[str] = []
             imported_tasks: list[dict[str, Any]] = []
+            mode_counts = {
+                "created": 0,
+                "updated": 0,
+                "reactivated": 0,
+                "archived": 0,
+                "unchanged": 0,
+            }
+            reserved_mode_ids = set(local_by_id)
             unavailable = {str(item) for item in (unavailable_urls or set()) if str(item)}
             missing_official_cases = []
             for mode in normalized_modes:
@@ -1896,7 +1913,7 @@ class ImageGenerationStore:
                 for source_mode in normalized_modes:
                     old_mode_id = source_mode["id"]
                     identity = incoming_official_by_id.get(old_mode_id)
-                    local = local_by_source.get(identity) if identity else None
+                    local = local_match_by_incoming_id.get(old_mode_id)
                     is_official = bool(identity)
                     should_apply = True
                     version_id_map = version_id_maps[old_mode_id]
@@ -1911,35 +1928,47 @@ class ImageGenerationStore:
                     if is_official and local is not None:
                         new_mode_id = local["id"]
                         mode_id_map[old_mode_id] = new_mode_id
-                        local_revision = str(local.get("source_updated_at") or "")
-                        revision_newer = bool(
-                            source_revision
-                            and (not local_revision or _version_is_older(local_revision, source_revision))
-                        )
-                        content_changed = any(
-                            deepcopy(rewritten_mode.get(field)) != deepcopy(local.get(field))
-                            for field in _OFFICIAL_MODE_FIELDS
-                            if field in rewritten_mode
-                            and (
-                                field != "example"
-                                or "example" in source_mode
-                                or incoming_content_version
-                                or incoming_official_complete
+                        if incoming_official_complete:
+                            content_changed = any(
+                                deepcopy(rewritten_mode.get(field)) != deepcopy(local.get(field))
+                                for field in (*_OFFICIAL_MODE_FIELDS, "status")
                             )
-                        )
-                        should_apply = revision_newer or content_changed
+                            should_apply = content_changed or any((
+                                str(local.get("source_id") or "") != identity,
+                                local.get("builtin") is not True,
+                                str(local.get("source_updated_at") or "") != source_revision,
+                            ))
+                        else:
+                            local_revision = str(local.get("source_updated_at") or "")
+                            revision_newer = bool(
+                                source_revision
+                                and (not local_revision or _version_is_older(local_revision, source_revision))
+                            )
+                            content_changed = any(
+                                deepcopy(rewritten_mode.get(field)) != deepcopy(local.get(field))
+                                for field in _OFFICIAL_MODE_FIELDS
+                                if field in rewritten_mode
+                                and (
+                                    field != "example"
+                                    or "example" in source_mode
+                                    or incoming_content_version
+                                )
+                            )
+                            should_apply = revision_newer or content_changed
                         if should_apply:
                             updated = deepcopy(local)
                             for field in _OFFICIAL_MODE_FIELDS:
                                 if field == "example":
                                     if (
-                                        "example" in rewritten_mode
+                                        incoming_official_complete
+                                        or "example" in rewritten_mode
                                         or incoming_content_version
-                                        or incoming_official_complete
                                     ):
                                         updated[field] = deepcopy(rewritten_mode.get(field))
                                 elif field in rewritten_mode:
                                     updated[field] = deepcopy(rewritten_mode[field])
+                            if incoming_official_complete:
+                                updated["status"] = rewritten_mode.get("status", "active")
                             updated.update({
                                 "source_id": identity,
                                 "builtin": True,
@@ -1959,8 +1988,17 @@ class ImageGenerationStore:
                                 }
                                 self._write_json(self._version_path(version_id), version)
                             rewritten_mode = updated
+                            if (
+                                incoming_official_complete
+                                and local.get("status") != "active"
+                                and rewritten_mode.get("status") == "active"
+                            ):
+                                mode_counts["reactivated"] += 1
+                            else:
+                                mode_counts["updated"] += 1
                         else:
                             rewritten_mode = deepcopy(local)
+                            mode_counts["unchanged"] += 1
                         version_id_map = {
                             old_version_id: str(rewritten_mode.get("current_version_id") or "")
                             for old_version_id in indexed_versions[old_mode_id]
@@ -1969,6 +2007,9 @@ class ImageGenerationStore:
                         # A new official mode keeps its stable source ID and
                         # package number, but gets fresh local prompt records.
                         new_mode_id = old_mode_id
+                        if new_mode_id in reserved_mode_ids or self._mode_path(new_mode_id).exists():
+                            new_mode_id = str(uuid4())
+                        reserved_mode_ids.add(new_mode_id)
                         mode_id_map[old_mode_id] = new_mode_id
                         mode_no = source_mode.get("mode_no")
                         if not isinstance(mode_no, int):
@@ -1987,8 +2028,10 @@ class ImageGenerationStore:
                             ],
                             "updated_at": _utc_now(),
                         })
+                        mode_counts["created"] += 1
                     else:
                         new_mode_id = str(uuid4())
+                        reserved_mode_ids.add(new_mode_id)
                         mode_id_map[old_mode_id] = new_mode_id
                         rewritten_mode.update({
                             "id": new_mode_id,
@@ -2003,6 +2046,7 @@ class ImageGenerationStore:
                             "updated_at": _utc_now(),
                         })
                         meta["next_mode_no"] += 1
+                        mode_counts["created"] += 1
                     if isinstance(rewritten_mode.get("example"), dict):
                         rewritten_mode["example"]["mode_id"] = new_mode_id
                         example_source = rewritten_mode["example"].get("source")
@@ -2083,12 +2127,29 @@ class ImageGenerationStore:
 
                 if incoming_official_complete:
                     for local in local_modes:
-                        identity = self._source_identity_for_mode(local)
-                        if identity and identity not in set(incoming_official_by_id.values()):
-                            archived = deepcopy(local)
-                            archived["status"] = "archived"
-                            archived["updated_at"] = _utc_now()
-                            self._write_json(self._mode_path(archived["id"]), normalize_mode(archived))
+                        if local.get("mode_no") in incoming_official_numbers:
+                            continue
+                        should_archive = local.get("status") != "archived"
+                        should_detach_identity = bool(
+                            local.get("source_id")
+                            or local.get("builtin") is True
+                            or local.get("source_updated_at")
+                        )
+                        if not should_archive and not should_detach_identity:
+                            continue
+                        archived = deepcopy(local)
+                        archived.update({
+                            "status": "archived",
+                            "source_id": "",
+                            "builtin": False,
+                            "source_updated_at": "",
+                            "updated_at": _utc_now(),
+                        })
+                        self._write_json(
+                            self._mode_path(archived["id"]), normalize_mode(archived)
+                        )
+                        if should_archive:
+                            mode_counts["archived"] += 1
 
                 for source_task in clean_tasks:
                     old_task_id = str(source_task.get("id") or "")
@@ -2118,10 +2179,7 @@ class ImageGenerationStore:
                         )
                     self._write_json(self._task_path(new_task_id), task)
                     imported_tasks.append(task)
-                if incoming_content_version and (
-                    not current_content_version
-                    or _version_is_older(current_content_version, incoming_content_version)
-                ):
+                if incoming_official_complete or incoming_content_version:
                     meta["official_content_version"] = incoming_content_version
                 self._write_meta(meta)
             except Exception as exc:
@@ -2135,6 +2193,7 @@ class ImageGenerationStore:
             return {
                 "mode_id_map": mode_id_map,
                 "mode_ids": imported_mode_ids,
+                "mode_counts": deepcopy(mode_counts),
                 "tasks": deepcopy(imported_tasks),
             }
 

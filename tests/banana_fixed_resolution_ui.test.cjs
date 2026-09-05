@@ -8,6 +8,11 @@ const classic = fs.readFileSync(path.join(ROOT, 'static/js/canvas.js'), 'utf8');
 const smart = fs.readFileSync(path.join(ROOT, 'static/js/smart-canvas.js'), 'utf8');
 const classicHtml = fs.readFileSync(path.join(ROOT, 'static/canvas.html'), 'utf8');
 const smartHtml = fs.readFileSync(path.join(ROOT, 'static/smart-canvas.html'), 'utf8');
+const releaseVersion = fs.readFileSync(path.join(ROOT, 'VERSION'), 'utf8').trim();
+
+function escapedRegex(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 test('both canvases identify fixed Banana suffixes while leaving the base model dynamic', () => {
     for (const source of [classic, smart]) {
@@ -31,6 +36,6 @@ test('smart canvas renders a fixed-only picker and guards stale size events', ()
 });
 
 test('both pages load the cache-busted controllers after the fixed-resolution change', () => {
-    assert.match(classicHtml, /canvas\.js\?v=2026\.08\.\d{2}-custom\.\d+\.\d+/);
-    assert.match(smartHtml, /smart-canvas\.js\?v=2026\.08\.\d{2}-custom\.\d+\.\d+/);
+    assert.match(classicHtml, new RegExp(`canvas\\.js\\?v=${escapedRegex(releaseVersion)}\\.\\d+`));
+    assert.match(smartHtml, new RegExp(`smart-canvas\\.js\\?v=${escapedRegex(releaseVersion)}\\.\\d+`));
 });

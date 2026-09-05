@@ -298,7 +298,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.09.05-custom.4"
+APP_VERSION = "2026.09.05-custom.5"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -29317,7 +29317,18 @@ def import_backup_path(path, selection):
             imported_preferences = {}
             imported_detail_records = []
             imported_main_image_records = []
-            imported_image_generation = {"mode_ids": [], "tasks": [], "mode_id_map": {}}
+            imported_image_generation = {
+                "mode_ids": [],
+                "tasks": [],
+                "mode_id_map": {},
+                "mode_counts": {
+                    "created": 0,
+                    "updated": 0,
+                    "reactivated": 0,
+                    "archived": 0,
+                    "unchanged": 0,
+                },
+            }
             image_generation_snapshot = (
                 IMAGE_GENERATION_STORE.snapshot_backup_state()
                 if image_generation_sources or image_generation_bundle["modes"] else None
@@ -29649,6 +29660,18 @@ def import_backup_path(path, selection):
                         str(item.get("id") or "") for item in imported_image_generation["tasks"]
                     ],
                     "image_generation_modes_imported": len(imported_image_generation["mode_ids"]),
+                    "image_generation_modes_created": int(
+                        imported_image_generation.get("mode_counts", {}).get("created") or 0
+                    ),
+                    "image_generation_modes_updated": int(
+                        imported_image_generation.get("mode_counts", {}).get("updated") or 0
+                    ),
+                    "image_generation_modes_reactivated": int(
+                        imported_image_generation.get("mode_counts", {}).get("reactivated") or 0
+                    ),
+                    "image_generation_modes_archived": int(
+                        imported_image_generation.get("mode_counts", {}).get("archived") or 0
+                    ),
                     "image_generation_examples_imported": sum(
                         1 for mode in image_generation_bundle["modes"]
                         if isinstance(mode.get("example"), dict)

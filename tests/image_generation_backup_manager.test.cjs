@@ -54,6 +54,11 @@ test('import result reports image-generation counts, missing media and refresh e
     const source = fs.readFileSync(MODULE_PATH, 'utf8');
     assert.match(source, /result\.image_generations/);
     assert.match(source, /result\.image_generation_modes_imported/);
+    assert.match(source, /result\.image_generation_modes_created/);
+    assert.match(source, /result\.image_generation_modes_updated/);
+    assert.match(source, /result\.image_generation_modes_reactivated/);
+    assert.match(source, /result\.image_generation_modes_archived/);
+    assert.match(source, /停用/);
     assert.match(source, /result\.image_generation_examples_imported/);
     assert.match(source, /result\.image_generation_missing_media/);
     assert.match(source, /result\.image_generations_skipped/);

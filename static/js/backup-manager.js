@@ -199,7 +199,10 @@
         return date.toLocaleString(locale || undefined, {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
     }
 
+    let managerInstance = null;
+
     function initBackupManager(){
+        if(managerInstance) return managerInstance;
         const modal = document.getElementById('backupModal');
         const modalTitle = document.getElementById('backupModalTitle');
         const modalSub = document.getElementById('backupModalSub');
@@ -208,7 +211,7 @@
         const modalCancel = document.getElementById('backupModalCancel');
         const modalPrimary = document.getElementById('backupModalPrimary');
         const fileInput = document.getElementById('backupFileInput');
-        if(!modal || !modalBody || modal.dataset.backupBound === '1') return;
+        if(!modal || !modalBody) return null;
         modal.dataset.backupBound = '1';
 
         const zh = (cn, en) => window.StudioI18n?.lang?.() === 'en' ? en : cn;
@@ -220,10 +223,19 @@
         let inspectResult = null;
         let conflictPolicies = {project_conflict:'copy', provider_conflict:'backup', runninghub_conflict:'backup'};
         let busy = false;
+        let returnFocusTarget = null;
         const collapsedGroups = new Set();
 
         function refreshIcons(){ if(window.lucide) window.lucide.createIcons(); }
-        function openModal(){ modal.classList.add('open'); modal.setAttribute('aria-hidden', 'false'); document.body.classList.add('backup-modal-open'); }
+        function openModal(){
+            modal.classList.add('open');
+            modal.setAttribute('aria-hidden', 'false');
+            document.body.classList.add('backup-modal-open');
+            window.requestAnimationFrame(() => {
+                const target = modal.querySelector('[data-backup-choose-file]') || modalClose || modalPrimary;
+                target?.focus?.({preventScroll:true});
+            });
+        }
         function closeModal(){
             if(busy) return;
             modal.classList.remove('open'); modal.setAttribute('aria-hidden', 'true'); document.body.classList.remove('backup-modal-open');
@@ -231,6 +243,9 @@
             collapsedGroups.clear();
             conflictPolicies = {project_conflict:'copy', provider_conflict:'backup', runninghub_conflict:'backup'};
             if(fileInput) fileInput.value = '';
+            const focusTarget = returnFocusTarget;
+            returnFocusTarget = null;
+            window.requestAnimationFrame(() => focusTarget?.focus?.({preventScroll:true}));
         }
         function setBusy(value, label=''){
             busy = Boolean(value);
@@ -582,7 +597,21 @@
                 if(Number(result.detail_pages || 0)) importedParts.push(zh(`详情页历史 ${result.detail_pages} 组`, `${result.detail_pages} detail-page histories`));
                 if(Number(result.main_images || 0)) importedParts.push(zh(`一键主图历史 ${result.main_images} 组`, `${result.main_images} main-image histories`));
                 if(Number(result.image_generations || 0)) importedParts.push(zh(`图片生成历史 ${result.image_generations} 组`, `${result.image_generations} image-generation histories`));
-                if(Number(result.image_generation_modes_imported || 0)) importedParts.push(zh(`图片生成模式 ${result.image_generation_modes_imported} 个`, `${result.image_generation_modes_imported} image-generation modes`));
+                const modeSyncZh = [];
+                const modeSyncEn = [];
+                const modeCreated = Number(result.image_generation_modes_created || 0);
+                const modeUpdated = Number(result.image_generation_modes_updated || 0);
+                const modeReactivated = Number(result.image_generation_modes_reactivated || 0);
+                const modeArchived = Number(result.image_generation_modes_archived || 0);
+                if(modeCreated) { modeSyncZh.push(`新增 ${modeCreated} 个`); modeSyncEn.push(`${modeCreated} created`); }
+                if(modeUpdated) { modeSyncZh.push(`更新 ${modeUpdated} 个`); modeSyncEn.push(`${modeUpdated} updated`); }
+                if(modeReactivated) { modeSyncZh.push(`重新启用 ${modeReactivated} 个`); modeSyncEn.push(`${modeReactivated} reactivated`); }
+                if(modeArchived) { modeSyncZh.push(`停用 ${modeArchived} 个`); modeSyncEn.push(`${modeArchived} archived`); }
+                if(modeSyncZh.length) {
+                    importedParts.push(zh(`图片生成模式：${modeSyncZh.join('、')}`, `Image-generation modes: ${modeSyncEn.join(', ')}`));
+                } else if(Number(result.image_generation_modes_imported || 0)) {
+                    importedParts.push(zh(`图片生成模式 ${result.image_generation_modes_imported} 个`, `${result.image_generation_modes_imported} image-generation modes`));
+                }
                 if(Number(result.image_generation_examples_imported || 0)) importedParts.push(zh(`图片生成示范 ${result.image_generation_examples_imported} 个`, `${result.image_generation_examples_imported} image-generation examples`));
                 if(result.preferences && Object.keys(result.preferences).length) importedParts.push(zh('界面与使用偏好 1 组', '1 interface preference set'));
                 if(Number(result.providers_skipped || 0)) skippedParts.push(zh(`API 平台 ${result.providers_skipped} 个`, `${result.providers_skipped} API providers`));
@@ -637,8 +666,8 @@
                 try { window.parent?.postMessage(detailChangeMessage, location.origin); } catch(_error) {}
                 try { window.parent?.postMessage(mainImageChangeMessage, location.origin); } catch(_error) {}
                 try { window.parent?.postMessage(imageGenerationChangeMessage, location.origin); } catch(_error) {}
-                // The backup UI runs in an iframe in the main studio shell. Reload the
-                // top-level shell so every iframe rebuilds its in-memory provider/workflow state.
+                // Reload the top-level shell so every iframe rebuilds its in-memory
+                // provider/workflow state, whether this manager runs in the shell or a frame.
                 try {
                     const topWindow = window.top;
                     if(topWindow && topWindow.location){
@@ -649,6 +678,14 @@
             } catch(error){ setBusy(false); showError(error.message); }
         }
 
+        function openAction(action, focusTarget=null){
+            if(action !== 'export' && action !== 'import') return false;
+            returnFocusTarget = focusTarget?.focus ? focusTarget : document.activeElement;
+            if(action === 'export') void openExport();
+            else showImportChooser();
+            return true;
+        }
+
         // The backup entry lives in the parent studio shell. Accept only the
         // same-origin, parent-originated command so unrelated frames cannot
         // open or mutate the backup workflow.
@@ -656,8 +693,7 @@
             if(event.source !== window.parent) return;
             if(event.origin !== location.origin) return;
             const action = event.data?.type === 'studio-backup-action' ? event.data.action : '';
-            if(action === 'export') openExport();
-            else if(action === 'import') showImportChooser();
+            openAction(action);
         });
         modalBody.addEventListener('change', event => {
             const input = event.target.closest('input[data-backup-kind]');
@@ -682,6 +718,16 @@
         modalPrimary.addEventListener('click', () => mode === 'import' ? runImport() : runExport());
         window.addEventListener('keydown', event => { if(event.key === 'Escape' && modal.classList.contains('open')) closeModal(); });
         refreshIcons();
+        managerInstance = {
+            openAction,
+            close:closeModal,
+            isOpen:() => modal.classList.contains('open'),
+        };
+        return managerInstance;
+    }
+
+    function openBackupAction(action, focusTarget=null){
+        return Boolean(initBackupManager()?.openAction(action, focusTarget));
     }
 
     return {
@@ -697,5 +743,6 @@
         formatBytes,
         formatBackupDate,
         initBackupManager,
+        openBackupAction,
     };
 });
