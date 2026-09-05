@@ -518,6 +518,107 @@ class ImageGenerationBackupStoreTests(unittest.TestCase):
                 writer.assert_not_called()
                 self.assertEqual(self.target.snapshot_backup_state(), before)
 
+    def test_complete_bundle_accepts_full_static_example_media_and_promotes_legacy_mode(self):
+        bundle = self._bundle_for_one_mode()
+        mode = bundle["modes"][0]
+        mode["source_id"] = ""
+        mode["builtin"] = False
+        media_id = "c" * 64
+        static_media = {
+            "id": media_id,
+            "sha256": media_id,
+            "url": f"/static/image-generation-examples/{mode['id']}/{media_id}.png",
+            "media_type": "image/png",
+            "size": 10,
+            "width": 2,
+            "height": 2,
+        }
+        required_slots = [
+            item["key"] for item in mode.get("reference_images") or []
+            if item.get("required")
+        ]
+        mode["example"] = {
+            "id": "legacy-static-example",
+            "mode_id": mode["id"],
+            "updated_at": "2026-09-05T00:00:00+08:00",
+            "title": "旧版静态案例",
+            "caption": "",
+            "sample_user_prompt": "",
+            "show_user_prompt": True,
+            "input_media": [
+                {"slot_key": slot_key, "media": copy.deepcopy(static_media)}
+                for slot_key in required_slots
+            ],
+            "output_media": copy.deepcopy(static_media),
+            "source": {},
+        }
+        bundle.update({
+            "official_content_version": "2026.09.05-content.1",
+            "official_complete": True,
+        })
+        legacy_local = self.target.get_mode(mode["id"], include_admin=True)
+        legacy_local["source_id"] = ""
+        legacy_local["builtin"] = False
+        legacy_local["example"] = copy.deepcopy(mode["example"])
+        self.target._write_json(self.target._mode_path(mode["id"]), legacy_local)
+        restored_url = f"/assets/image-generation/media/{media_id[:2]}/{media_id}.png"
+        result = self.target.import_backup_bundle(
+            bundle,
+            [],
+            imported_at=1.0,
+            url_mapping={static_media["url"]: restored_url},
+        )
+        imported = self.target.get_mode(result["mode_id_map"][mode["id"]], include_admin=True)
+        self.assertEqual(imported["source_id"], mode["id"])
+        self.assertTrue(imported["builtin"])
+        self.assertEqual(imported["example"]["output_media"]["url"], restored_url)
+
+    def test_complete_export_stamps_stable_identity_without_mutating_legacy_mode(self):
+        legacy = self.source.get_mode(self.mode_id, include_admin=True)
+        legacy["source_id"] = ""
+        legacy["builtin"] = False
+        self.source._write_json(self.source._mode_path(self.mode_id), legacy)
+
+        exported = next(
+            item for item in self.source.export_backup_bundle()["modes"]
+            if item["id"] == self.mode_id
+        )
+        live = self.source.get_mode(self.mode_id, include_admin=True)
+
+        self.assertEqual(exported["source_id"], self.mode_id)
+        self.assertTrue(exported["builtin"])
+        self.assertEqual(live.get("source_id", ""), "")
+        self.assertFalse(live.get("builtin", False))
+
+    def test_full_static_example_media_still_rejects_unsafe_path_and_identity(self):
+        media_id = "d" * 64
+        valid = {
+            "id": media_id,
+            "sha256": media_id,
+            "url": f"/static/image-generation-examples/mode/{media_id}.png",
+            "media_type": "image/png",
+            "size": 10,
+            "width": 2,
+            "height": 2,
+        }
+        self.assertEqual(
+            ImageGenerationStore._validate_backup_media_reference(
+                valid, "example media", allow_static=True
+            ),
+            valid,
+        )
+        for invalid in (
+            {**valid, "url": f"/static/image-generation-examples/../{media_id}.png"},
+            {**valid, "url": f"/static/image-generation-examples/mode/{'e' * 64}.png"},
+            {**valid, "sha256": "e" * 64},
+            {**valid, "media_type": "image/jpeg"},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "example media"):
+                    ImageGenerationStore._validate_backup_media_reference(
+                        invalid, "example media", allow_static=True
+                    )
+
     def test_bundle_import_rejects_media_identity_change_from_url_mapping_before_write(self):
         source_id = "a" * 64
         target_id = "b" * 64
@@ -800,6 +901,63 @@ class ImageGenerationBackupServiceTests(unittest.TestCase):
                 str(item.get("file") or "").startswith("image-generation-resources/")
                 for item in static_resources
             ))
+
+    def test_static_example_round_trip_rewrites_missing_release_path_to_cas(self):
+        static_root = Path(self.temp.name) / "static"
+        example_root = static_root / "image-generation-examples" / self.mode_id
+        example_root.mkdir(parents=True, exist_ok=True)
+
+        def static_media(content):
+            digest = __import__("hashlib").sha256(content).hexdigest()
+            path = example_root / f"{digest}.png"
+            path.write_bytes(content)
+            with Image.open(BytesIO(content)) as image:
+                width, height = image.size
+            return {
+                "id": digest,
+                "sha256": digest,
+                "url": f"/static/image-generation-examples/{self.mode_id}/{digest}.png",
+                "media_type": "image/png",
+                "size": len(content),
+                "width": width,
+                "height": height,
+            }, path
+
+        input_record, input_path = static_media(_png_bytes((11, 22, 33, 255)))
+        output_record, output_path = static_media(_png_bytes((44, 55, 66, 255)))
+        for mode in self.store.list_modes(include_admin=True):
+            if mode["id"] != self.mode_id and mode.get("example") is not None:
+                mode["example"] = None
+                self.store._write_json(self.store._mode_path(mode["id"]), mode)
+        exported_mode_count = len(self.store.list_modes(include_admin=True))
+        self.store.save_example(self.mode_id, {
+            "title": "静态案例迁移",
+            "input_media": [{"slot_key": self.required_slot, "media": input_record}],
+            "output_media": output_record,
+            "sample_user_prompt": "",
+            "show_user_prompt": True,
+        })
+        with patch.object(main, "STATIC_DIR", str(static_root)):
+            archive_path, _ = main.build_backup_archive(main.BackupExportRequest(
+                include_image_generation_modes=True,
+                include_assets=False,
+            ))
+            self.addCleanup(lambda: os.path.exists(archive_path) and os.remove(archive_path))
+            input_path.unlink()
+            output_path.unlink()
+            result = main.import_backup_path(archive_path, {
+                "include_image_generation_modes": True,
+                "include_assets": False,
+            })
+            imported = self.store.get_mode(self.mode_id, include_admin=True)
+            public = main._image_generation_public_mode_with_example(self.mode_id)
+
+        self.assertEqual(result["image_generation_modes_imported"], exported_mode_count)
+        self.assertTrue(imported["example"]["output_media"]["url"].startswith(
+            "/assets/image-generation/media/"
+        ))
+        self.assertIsNotNone(self.media.media_record(output_record["id"]))
+        self.assertIsNotNone(public.get("example"))
 
     def test_import_restores_media_to_cas_and_repeat_import_is_independent(self):
         archive_path = self.export_image_generation()

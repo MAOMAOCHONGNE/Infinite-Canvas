@@ -1305,6 +1305,14 @@ class ImageGenerationStore:
         """
         with self._lock:
             modes = self.list_modes(include_admin=True)
+            # A complete configuration export is the maintainer's content
+            # package.  Older locally-created official modes may predate the
+            # source identity field, so stamp a stable identity into the
+            # exported copy without mutating the live installation.
+            for mode in modes:
+                if not self._source_identity_for_mode(mode):
+                    mode["source_id"] = str(mode["id"])
+                    mode["builtin"] = True
             versions: list[dict[str, Any]] = []
             drafts: list[dict[str, Any]] = []
             for mode in modes:
@@ -1384,9 +1392,41 @@ class ImageGenerationStore:
         if allow_static and isinstance(raw, Mapping):
             value = deepcopy(dict(raw))
             url = value.get("url")
-            optional = {"url", "media_type", "size", "width", "height"}
-            if set(value).issubset(optional) and isinstance(url, str) and _STATIC_EXAMPLE_URL.fullmatch(url):
-                return value
+            allowed = {"id", "sha256", "url", "media_type", "size", "width", "height"}
+            if not set(value).issubset(allowed) or not isinstance(url, str) or not _STATIC_EXAMPLE_URL.fullmatch(url):
+                return ImageGenerationStore._validate_backup_media_record(raw, label)
+            prefix = "/static/image-generation-examples/"
+            relative = url[len(prefix):] if url.startswith(prefix) else ""
+            parts = relative.split("/")
+            suffix = Path(relative).suffix.lower()
+            if (
+                not relative
+                or any(part in {"", ".", ".."} for part in parts)
+                or suffix not in _BACKUP_MEDIA_TYPES
+            ):
+                raise ValueError(f"{label} is invalid")
+            media_id = value.get("id")
+            media_sha = value.get("sha256")
+            if media_id is not None or media_sha is not None:
+                if (
+                    not isinstance(media_id, str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", media_id)
+                    or media_sha != media_id
+                    or Path(relative).stem != media_id
+                ):
+                    raise ValueError(f"{label} is invalid")
+            media_type = value.get("media_type")
+            if media_type is not None and media_type != _BACKUP_MEDIA_TYPES[suffix]:
+                raise ValueError(f"{label} is invalid")
+            for field, maximum in (("size", 50 * 1024 * 1024), ("width", None), ("height", None)):
+                item = value.get(field)
+                if item is None:
+                    continue
+                if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+                    raise ValueError(f"{label} is invalid")
+                if maximum is not None and item > maximum:
+                    raise ValueError(f"{label} is invalid")
+            return value
         return ImageGenerationStore._validate_backup_media_record(raw, label)
 
     @staticmethod
@@ -1679,6 +1719,15 @@ class ImageGenerationStore:
         raw_modes = [backup_io.prepare_exported_image_generation_config(item) for item in raw_modes]
         raw_versions = [backup_io.prepare_exported_image_generation_config(item) for item in raw_versions]
         raw_drafts = [backup_io.prepare_exported_image_generation_config(item) for item in raw_drafts]
+        incoming_content_version = str(bundle.get("official_content_version") or "").strip()
+        incoming_official_complete = bundle.get("official_complete") is True
+        if incoming_official_complete:
+            for mode in raw_modes:
+                if isinstance(mode, dict) and not self._source_identity_for_mode(mode):
+                    mode_id = mode.get("id")
+                    if isinstance(mode_id, str) and mode_id:
+                        mode["source_id"] = mode_id
+                        mode["builtin"] = True
         if len(task_sources) > task_limit:
             raise ValueError("image-generation backup contains too many tasks")
         self._validate_backup_media_url_mapping(url_mapping)
@@ -1730,14 +1779,13 @@ class ImageGenerationStore:
                 )
             clean_tasks = [backup_io.prepare_exported_image_generation_task(task) for task in task_sources]
 
-            incoming_content_version = str(bundle.get("official_content_version") or "").strip()
-            incoming_official_complete = bundle.get("official_complete") is True
             meta = self._read_meta()
             current_content_version = str(meta.get("official_content_version") or "").strip()
             if _version_is_older(incoming_content_version, current_content_version):
                 raise ValueError("官方图片生成内容版本不能降级")
 
             local_modes = [normalize_mode(item) for item in self._iter_records(self.mode_dir, "模式")]
+            local_by_id = {str(item.get("id") or ""): item for item in local_modes}
             local_by_source: dict[str, dict[str, Any]] = {}
             legacy_official_by_number: dict[int, dict[str, Any]] = {}
             local_custom_numbers: set[int] = set()
@@ -1776,6 +1824,14 @@ class ImageGenerationStore:
                         raise ValueError("官方模式编号重复")
                     incoming_official_numbers.add(number)
                 local = local_by_source.get(identity)
+                if local is None and incoming_official_complete:
+                    legacy_local = local_by_id.get(str(source_mode.get("id") or ""))
+                    if (
+                        legacy_local is not None
+                        and legacy_local.get("mode_no") == number
+                    ):
+                        local = legacy_local
+                        local_by_source[identity] = legacy_local
                 if local is None and isinstance(number, int) and number in legacy_official_by_number:
                     local = legacy_official_by_number[number]
                     local_by_source[identity] = local
