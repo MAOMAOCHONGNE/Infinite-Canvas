@@ -57,6 +57,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import backup_transfer as backup_io
+import image_generation_store as image_generation_store_module
 import detail_page_v4 as detail_v4
 from image_generation_store import (
     ImageGenerationStore,
@@ -88,6 +89,39 @@ from canvas_creative_agent import (
     sanitize_creative_references_for_storage,
     should_include_canvas_context,
 )
+
+
+def _install_image_generation_backup_media_compatibility() -> None:
+    """Keep mixed-version installs safe during the first post-release update."""
+    media_url_pattern = getattr(image_generation_store_module, "_BACKUP_MEDIA_URL", None)
+    if media_url_pattern is None:
+        return
+
+    def validate(mapping: Mapping[str, str] | None) -> None:
+        if mapping is None:
+            return
+        if not isinstance(mapping, Mapping):
+            raise ValueError("image-generation backup media URL mapping is invalid")
+        for source, target in mapping.items():
+            if not isinstance(source, str) or not isinstance(target, str):
+                raise ValueError("image-generation backup media URL mapping is invalid")
+            source_match = media_url_pattern.fullmatch(source)
+            if not source_match:
+                continue
+            source_id = source_match.group(2)
+            target_match = media_url_pattern.fullmatch(target)
+            if (
+                target_match is None
+                or source_match.group(1) != source_id[:2]
+                or target_match.group(1) != target_match.group(2)[:2]
+                or target_match.group(2) != source_id
+            ):
+                raise ValueError("image-generation backup media identity mapping is invalid")
+
+    ImageGenerationStore._validate_backup_media_url_mapping = staticmethod(validate)
+
+
+_install_image_generation_backup_media_compatibility()
 
 QUIET_ACCESS_PATHS = {
     "/api/queue_status",
@@ -264,7 +298,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.09.05-custom.2"
+APP_VERSION = "2026.09.05-custom.3"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -3209,9 +3243,14 @@ def update_allowed_file(path: str) -> bool:
         return False
     root_files = {
         "main.py",
+        "backup_transfer.py",
+        "image_generation_cleanup.py",
+        "image_generation_examples.py",
         "image_generation_store.py",
         "image_generation_modes.py",
         "image_generation_media.py",
+        "main_image_v4.py",
+        "storage_cleanup.py",
         "VERSION",
         "README.md",
         "新手运行与使用教程.md",
@@ -3689,7 +3728,9 @@ def validate_staged_update(staging_root: str, root_files: List[str], static_file
     with open(main_path, "rb") as f:
         compile(f.read(), main_path, "exec")
     for module_name in (
+        "backup_transfer.py", "image_generation_cleanup.py", "image_generation_examples.py",
         "image_generation_store.py", "image_generation_modes.py", "image_generation_media.py",
+        "main_image_v4.py", "storage_cleanup.py",
     ):
         if module_name not in root_files:
             continue
