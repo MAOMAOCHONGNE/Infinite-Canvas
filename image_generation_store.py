@@ -1391,7 +1391,7 @@ class ImageGenerationStore:
 
     @staticmethod
     def _validate_backup_media_url_mapping(mapping: Mapping[str, str] | None) -> None:
-        """CAS URLs are content identities and cannot be remapped to another object."""
+        """CAS URLs may normalize extensions, but never change content identity."""
         if mapping is None:
             return
         if not isinstance(mapping, Mapping):
@@ -1399,7 +1399,17 @@ class ImageGenerationStore:
         for source, target in mapping.items():
             if not isinstance(source, str) or not isinstance(target, str):
                 raise ValueError("image-generation backup media URL mapping is invalid")
-            if _BACKUP_MEDIA_URL.fullmatch(source) and source != target:
+            source_match = _BACKUP_MEDIA_URL.fullmatch(source)
+            if not source_match:
+                continue
+            source_id = source_match.group(2)
+            target_match = _BACKUP_MEDIA_URL.fullmatch(target)
+            if (
+                target_match is None
+                or source_match.group(1) != source_id[:2]
+                or target_match.group(1) != target_match.group(2)[:2]
+                or target_match.group(2) != source_id
+            ):
                 raise ValueError("image-generation backup media identity mapping is invalid")
 
     @staticmethod

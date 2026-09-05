@@ -554,6 +554,19 @@ class ImageGenerationBackupStoreTests(unittest.TestCase):
         writer.assert_not_called()
         self.assertEqual(self.target.snapshot_backup_state(), before)
 
+    def test_bundle_import_allows_same_media_identity_with_normalized_extension(self):
+        media_id = "a" * 64
+        source_url = f"/assets/image-generation/media/{media_id[:2]}/{media_id}.png"
+        normalized_url = f"/assets/image-generation/media/{media_id[:2]}/{media_id}.webp"
+        ImageGenerationStore._validate_backup_media_url_mapping({source_url: normalized_url})
+
+    def test_bundle_import_rejects_cas_mapping_with_invalid_target_shard(self):
+        media_id = "a" * 64
+        source_url = f"/assets/image-generation/media/{media_id[:2]}/{media_id}.png"
+        target_url = f"/assets/image-generation/media/bb/{media_id}.webp"
+        with self.assertRaisesRegex(ValueError, "media.*identity"):
+            ImageGenerationStore._validate_backup_media_url_mapping({source_url: target_url})
+
     def test_bundle_import_enforces_fixed_example_slot_contract_before_write(self):
         media_id = "e" * 64
         media = {
