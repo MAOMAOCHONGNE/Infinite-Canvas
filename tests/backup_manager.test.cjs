@@ -60,15 +60,19 @@ test('export request contains identifiers only and never configuration values', 
     assert.doesNotMatch(encoded, /api[_-]?key|secret|password|base_url/i);
 });
 
-test('workspace wires a global Backup menu, modal, and backend endpoints', () => {
+test('workspace keeps the backup modal in the canvas frame while the shell owns its entry point', () => {
     const html = fs.readFileSync(path.join(ROOT, 'static', 'canvas-list.html'), 'utf8');
     const css = fs.readFileSync(path.join(ROOT, 'static', 'css', 'canvas-list.css'), 'utf8');
     const backend = fs.readFileSync(path.join(ROOT, 'main.py'), 'utf8');
+    const manager = fs.readFileSync(MODULE_PATH, 'utf8');
 
-    assert.match(html, /id="backupMenuBtn"/);
-    assert.match(html, /id="backupMenu"/);
+    assert.doesNotMatch(html, /id="backupMenuBtn"/);
+    assert.doesNotMatch(html, /class="backup-menu-wrap"/);
     assert.match(html, /id="backupModal"/);
     assert.match(html, /backup-manager\.js/);
+    assert.match(manager, /studio-backup-action/);
+    assert.match(manager, /event\.source !== window\.parent/);
+    assert.match(manager, /event\.origin !== location\.origin/);
     assert.match(css, /\.backup-modal-overlay/);
     assert.match(css, /\.backup-tree/);
     assert.match(backend, /@app\.get\("\/api\/backups\/options"\)/);

@@ -49,6 +49,17 @@ test('backend updater exposes only the user-owned GitHub and ModelScope channels
     assert.match(updateEndpoint, /source_order\.append\(other\)/);
 });
 
+test('updater ships the image-generation migration runtime with the GitHub seed', () => {
+    const source = read('main.py');
+    for (const file of [
+        'image_generation_store.py', 'image_generation_modes.py', 'image_generation_media.py',
+    ]) {
+        assert.match(source, new RegExp(`root_files\\s*=\\s*\\{[\\s\\S]*?"${file.replace('.', '\\.') }"`));
+        assert.match(source, new RegExp(`compile\\(f\\.read\\(\\), module_path, "exec"\\)`));
+    }
+    assert.match(source, /path\.startswith\("static\/"\)/);
+});
+
 test('main page identifies qianse70 and keeps the upstream project link', () => {
     const html = fs.readFileSync(INDEX_PATH, 'utf8');
     const i18n = fs.readFileSync(COMMON_I18N_PATH, 'utf8');

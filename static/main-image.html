@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-studio-scale="off">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="/static/images/logo.png" type="image/png">
+    <title>一键主图</title>
+    <script>
+        (function(){
+            try {
+                var theme = localStorage.getItem('studio_theme') || localStorage.getItem('canvas_theme') || 'light';
+                if(theme === 'dark') document.documentElement.classList.add('studio-theme-dark', 'theme-dark');
+            } catch(e) {}
+        })();
+    </script>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.22-custom.1.1785863189">
+    <link rel="stylesheet" href="/static/css/main-image.css?v=2026.08.22-custom.1.1788417523">
+    <script src="/static/vendor/js/lucide.js?v=2026.08.22-custom.1.1785863219"></script>
+    <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
+    <script src="/static/js/model-config.js?v=2026.08.22-custom.1.1786809997"></script>
+    <script src="/static/js/adaptive-image-ratio.js?v=2026.08.22-custom.1.1786809997"></script>
+</head>
+<body>
+    <div class="detail-app">
+        <aside class="detail-config" aria-label="主图参数">
+            <header class="config-heading">
+                <div>
+                    <span class="config-kicker">电商主图</span>
+                    <h1>一键主图</h1>
+                </div>
+                <span id="configState" class="config-state">配置就绪</span>
+            </header>
+
+            <div class="config-scroll">
+                <section class="upload-section" aria-labelledby="productImagesTitle">
+                    <div class="section-heading compact">
+                        <div>
+                            <h2 id="productImagesTitle">产品图（包含模特图）</h2>
+                            <p>产品图 + 参考图合计最多 6 张</p>
+                        </div>
+                        <button class="text-tool" type="button" data-open-assets title="打开素材库">
+                            <i data-lucide="folder-open"></i><span>素材库</span>
+                        </button>
+                    </div>
+                    <div id="productUpload" class="upload-zone" data-upload-kind="product" tabindex="0" role="button" aria-label="添加产品图">
+                        <div class="upload-empty">
+                            <i data-lucide="image-plus"></i>
+                            <strong>产品图</strong>
+                            <span>拖入或选择图片</span>
+                        </div>
+                        <div class="upload-list" data-upload-list="product"></div>
+                        <input id="productFileInput" type="file" accept="image/*" multiple hidden>
+                    </div>
+                </section>
+
+                <section class="upload-section" aria-labelledby="referenceImagesTitle">
+                    <div class="section-heading compact">
+                        <div>
+                            <h2 id="referenceImagesTitle">参考图（设计风格参考）</h2>
+                            <p>风格、配色、版式参考</p>
+                        </div>
+                        <button class="text-tool" type="button" data-open-assets title="打开素材库">
+                            <i data-lucide="folder-open"></i><span>素材库</span>
+                        </button>
+                    </div>
+                    <div id="referenceUpload" class="upload-zone" data-upload-kind="reference" tabindex="0" role="button" aria-label="添加参考图">
+                        <div class="upload-empty">
+                            <i data-lucide="layout-template"></i>
+                            <strong>设计参考图</strong>
+                            <span>拖入或选择图片</span>
+                        </div>
+                        <div class="upload-list" data-upload-list="reference"></div>
+                        <input id="referenceFileInput" type="file" accept="image/*" multiple hidden>
+                    </div>
+                </section>
+
+                <div class="preset-actions">
+                    <button id="savePresetBtn" class="secondary-command" type="button"><i data-lucide="save"></i><span>保存预设</span></button>
+                    <button id="loadPresetBtn" class="secondary-command" type="button"><i data-lucide="folder-input"></i><span>加载预设</span></button>
+                </div>
+
+                <section class="parameter-section" aria-labelledby="baseParametersTitle">
+                    <div class="section-heading">
+                        <h2 id="baseParametersTitle">基础参数</h2>
+                    </div>
+                    <div class="form-grid">
+                        <label class="field wide">
+                            <span>主图类型</span>
+                            <select id="mainImageMode" data-state="mainImageMode">
+                                <option value="continuous" selected>连续主图</option>
+                                <option value="creative">创意主图</option>
+                            </select>
+                        </label>
+                        <label class="field wide">
+                            <span>图片模型</span>
+                            <select id="imageModelSelect" aria-label="图片模型"></select>
+                        </label>
+                        <label class="field wide">
+                            <span>视觉 LLM</span>
+                            <select id="llmModelSelect" aria-label="视觉 LLM 模型"></select>
+                        </label>
+                        <label class="field">
+                            <span>图片比例</span>
+                            <select id="ratioSelect" data-state="ratio">
+                                <option value="1:1">1:1</option>
+                                <option value="1:4">1:4</option>
+                                <option value="1:8">1:8</option>
+                                <option value="2:3">2:3</option>
+                                <option value="3:2">3:2</option>
+                                <option value="3:4">3:4</option>
+                                <option value="4:1">4:1</option>
+                                <option value="4:3">4:3</option>
+                                <option value="4:5">4:5</option>
+                                <option value="5:4">5:4</option>
+                                <option value="8:1">8:1</option>
+                                <option value="9:16">9:16</option>
+                                <option value="16:9">16:9</option>
+                                <option value="21:9">21:9</option>
+                                <option value="source">拉伸适配</option>
+                                <option value="adaptive">自适应</option>
+                                <option value="custom">自定义</option>
+                            </select>
+                        </label>
+                        <label class="field">
+                            <span>分辨率</span>
+                            <select id="resolutionSelect" data-state="resolution"></select>
+                        </label>
+                        <div id="customRatioFields" class="inline-fields wide" hidden>
+                            <label><span>比例宽</span><input id="customRatioWidth" type="number" min="1" max="100" value="1"></label>
+                            <span class="field-divider">:</span>
+                            <label><span>比例高</span><input id="customRatioHeight" type="number" min="1" max="100" value="1"></label>
+                        </div>
+                        <div id="customSizeFields" class="inline-fields wide" hidden>
+                            <label><span>宽度</span><input id="customSizeWidth" type="number" min="64" max="16384" step="8" value="2048"></label>
+                            <span class="field-divider">×</span>
+                            <label><span>高度</span><input id="customSizeHeight" type="number" min="64" max="16384" step="8" value="2048"></label>
+                        </div>
+                        <label class="field">
+                            <span>输出尺寸</span>
+                            <output id="outputSize" class="field-output">2048 × 2048</output>
+                        </label>
+                        <label class="field">
+                            <span>生成数量</span>
+                            <select id="screenCount" data-state="screenCount">
+                                <option>1</option><option>2</option><option>3</option><option selected>4</option>
+                                <option>5</option><option>6</option><option>7</option><option>8</option>
+                                <option>9</option><option>10</option><option>11</option><option>12</option>
+                            </select>
+                        </label>
+                        <label class="field">
+                            <span>文案设置</span>
+                            <select id="copywriting" data-state="copywriting">
+                                <option value="required">需要文案</option>
+                                <option value="blank">文案留空</option>
+                                <option value="poster">无文案纯海报</option>
+                            </select>
+                        </label>
+                        <label class="field">
+                            <span>画面丰富</span>
+                            <select id="richness" data-state="richness">
+                                <option value="concise">精简</option>
+                                <option value="medium">中等</option>
+                                <option value="rich">丰富</option>
+                            </select>
+                        </label>
+                        <label class="field">
+                            <span>字体风格</span>
+                            <select id="fontStyle" data-state="fontStyle">
+                                <option value="auto">自动判断</option>
+                                <option value="modern-sans">现代中性无衬线</option>
+                                <option value="humanist-sans">人文柔和无衬线</option>
+                                <option value="rounded">圆润可爱字体</option>
+                                <option value="elegant-serif">典雅简约衬线</option>
+                                <option value="modern-song">现代宋意字体</option>
+                                <option value="brush">新中式毛笔字体</option>
+                                <option value="tech">几何科技字体</option>
+                                <option value="industrial">工业力量字体</option>
+                                <option value="handwritten">潮流手写展示字体</option>
+                            </select>
+                        </label>
+                        <label class="field">
+                            <span>输出语种</span>
+                            <input id="outputLanguage" data-state="outputLanguage" type="text" value="自动识别" maxlength="30" list="outputLanguageOptions">
+                            <datalist id="outputLanguageOptions"><option value="自动识别"></option><option value="中文"></option><option value="英文"></option><option value="日文"></option><option value="韩文"></option></datalist>
+                        </label>
+                        <label class="field">
+                            <span>模特设置</span>
+                            <select id="modelSetting" data-state="modelSetting">
+                                <option value="none" selected>无模特</option>
+                                <option value="use">使用模特</option>
+                            </select>
+                        </label>
+                        <label class="field">
+                            <span>模特姿态</span>
+                            <select id="modelPose" data-state="modelPose">
+                                <option value="normal">常规姿态</option>
+                                <option value="specific">特定姿态</option>
+                            </select>
+                        </label>
+                        <label class="field">
+                            <span>模特使用率</span>
+                            <select id="modelUsage" data-state="modelUsage">
+                                <option>0</option><option>1</option><option>2</option><option>3</option><option selected>4</option>
+                                <option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option><option>12</option>
+                            </select>
+                        </label>
+                    </div>
+                </section>
+
+                <section class="parameter-section content-inputs" aria-labelledby="contentInputTitle">
+                    <div class="section-heading smart-analysis-heading">
+                        <h2 id="contentInputTitle">内容输入（可选）</h2>
+                        <button id="smartAnalyzeBtn" class="text-tool" type="button"><i data-lucide="scan-search"></i><span>智能识别</span></button>
+                    </div>
+                    <p class="analysis-cost-note">智能识别会调用所选视觉 LLM 并消耗 Token；不识别也可以直接生成。</p>
+                    <label class="field wide">
+                        <span>产品名称</span>
+                        <input id="productName" data-state="productName" type="text" placeholder="例：蓝牙耳机" maxlength="160">
+                    </label>
+                    <label class="field wide">
+                        <span>产品特点</span>
+                        <textarea id="productFacts" data-state="productFacts" rows="5" placeholder="填写产品外观、功能或卖点，每行一条（可不输入）"></textarea>
+                    </label>
+                    <label class="field wide">
+                        <span>用户指令</span>
+                        <textarea id="userInstruction" data-state="userInstruction" rows="5" placeholder="指定某张主图的内容、文案或整组视觉要求"></textarea>
+                    </label>
+                </section>
+            </div>
+
+            <footer class="config-footer">
+                <button id="analyzeBtn" class="primary-command" type="button">
+                    <i data-lucide="wand-sparkles"></i><span>一键生成主图</span>
+                </button>
+                <button id="forceGenerateBtn" class="secondary-command" type="button" hidden>
+                    <i data-lucide="copy-plus"></i><span>相同配置再次生成</span>
+                </button>
+            </footer>
+        </aside>
+
+        <main class="detail-workspace">
+            <header class="workspace-toolbar">
+                <div class="group-tabs" role="tablist" aria-label="主图任务分组">
+                    <label class="history-select"><i data-lucide="history"></i><select id="historySelect" aria-label="历史分组"><option value="">当前分组</option></select></label>
+                    <button id="deleteTaskBtn" class="icon-tool" type="button" title="删除当前分组" aria-label="删除当前分组" disabled><i data-lucide="trash-2"></i></button>
+                </div>
+                <div class="workspace-controls">
+                    <label class="compact-select"><span>每行展示</span><select id="columnsSelect"><option>3</option><option>4</option><option selected>5</option><option>6</option></select></label>
+                    <label class="direction-toggle"><span>正向排序</span><input id="directionToggle" type="checkbox" role="switch"><span class="toggle-track" aria-hidden="true"></span></label>
+                </div>
+            </header>
+
+            <section class="result-group" aria-labelledby="resultGroupTitle">
+                <div class="result-group-head">
+                    <div class="result-title-line">
+                        <div class="task-title-control">
+                            <h2 id="resultGroupTitle">新分组</h2>
+                            <button id="renameTaskBtn" class="rename-task-btn" type="button" title="修改分组名称" aria-label="修改分组名称" hidden><i data-lucide="pencil"></i></button>
+                            <form id="taskTitleForm" class="task-title-form" hidden>
+                                <input id="taskTitleInput" type="text" maxlength="60" autocomplete="off" aria-label="分组名称">
+                                <button id="saveTaskTitleBtn" type="submit" title="保存名称" aria-label="保存名称"><i data-lucide="check"></i></button>
+                                <button id="cancelTaskTitleBtn" type="button" title="取消修改" aria-label="取消修改"><i data-lucide="x"></i></button>
+                            </form>
+                        </div>
+                        <span id="resultCount" class="result-count">0 张</span>
+                        <span id="resultStatus" class="result-status">待生成</span>
+                        <span id="llmTrace" class="llm-trace" hidden></span>
+                    </div>
+                    <div class="result-actions">
+                        <button id="cancelTaskBtn" class="cancel-task" type="button" hidden><i data-lucide="square"></i><span>取消任务</span></button>
+                        <button id="resumeTaskBtn" type="button" hidden><i data-lucide="play"></i><span>恢复</span></button>
+                        <button id="requestPreviewBtn" type="button" disabled><i data-lucide="braces"></i><span>实际请求</span></button>
+                        <button id="collageBtn" type="button" disabled><i data-lucide="layout-grid"></i><span>拼图预览</span></button>
+                        <button id="downloadAllBtn" type="button" disabled><i data-lucide="download"></i><span>下载全部</span></button>
+                    </div>
+                </div>
+                <div id="importMediaWarning" class="import-media-warning" hidden role="status"></div>
+                <details id="requestPreview" class="request-preview" hidden><summary>实际请求</summary><pre id="requestPreviewText"></pre></details>
+                <div id="resultGrid" class="result-grid" style="--result-columns:5">
+                    <div class="empty-results">
+                        <i data-lucide="panels-top-left"></i>
+                        <strong>暂无主图任务</strong>
+                        <span>配置完成后将自动规划提示词并生成主图</span>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="promptEditorModal" class="prompt-editor-modal" hidden role="dialog" aria-modal="true" aria-labelledby="promptEditorTitle">
+        <section class="prompt-editor-dialog">
+            <header class="prompt-editor-head">
+                <div><span id="promptEditorNumber" class="screen-number"></span><h2 id="promptEditorTitle">生图提示词</h2></div>
+                <button id="promptEditorClose" type="button" aria-label="关闭提示词编辑" title="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <p id="promptEditorPurpose" class="prompt-editor-purpose" hidden></p>
+            <textarea id="promptEditorText" aria-label="生图提示词" spellcheck="false"></textarea>
+            <div id="promptEditorCandidates" class="prompt-editor-candidates" hidden>
+                <label><span>优化候选</span><select id="promptEditorCandidateSelect"><option value="">请选择候选</option></select></label>
+            </div>
+            <label class="prompt-editor-instruction"><span>优化要求（可选）</span><input id="promptEditorInstruction" type="text" maxlength="4000" placeholder="例如：画面更克制、突出透明材质"></label>
+            <footer class="prompt-editor-actions">
+                <button id="promptEditorOptimize" type="button"><i data-lucide="sparkles"></i><span>优化提示词</span></button>
+                <button id="promptEditorSave" class="primary" type="button"><i data-lucide="save"></i><span>保存提示词</span></button>
+            </footer>
+        </section>
+    </div>
+
+    <div id="smartAnalysisModal" class="prompt-editor-modal" hidden role="dialog" aria-modal="true" aria-labelledby="smartAnalysisTitle">
+        <section class="prompt-editor-dialog smart-analysis-dialog">
+            <header class="prompt-editor-head">
+                <div><span class="screen-number">识别结果</span><h2 id="smartAnalysisTitle">确认产品资料</h2></div>
+                <button id="smartAnalysisClose" type="button" aria-label="关闭智能识别" title="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <p class="analysis-cost-note">以下内容不会自动覆盖已有输入。确认后仅将空字段补入左侧配置。</p>
+            <label class="field wide"><span>产品名称</span><input id="smartProductName" type="text" maxlength="160"></label>
+            <label class="field wide"><span>产品特点</span><textarea id="smartProductFacts" rows="9"></textarea></label>
+            <label class="field wide"><span>无法确认的项目（仅供检查，不会写入）</span><textarea id="smartUncertainItems" rows="4" readonly></textarea></label>
+            <footer class="prompt-editor-actions">
+                <button id="smartAnalysisCancel" type="button"><i data-lucide="x"></i><span>暂不使用</span></button>
+                <button id="smartAnalysisApply" class="primary" type="button"><i data-lucide="check"></i><span>补充空字段</span></button>
+            </footer>
+        </section>
+    </div>
+
+    <div id="imagePreview" class="image-preview" hidden role="dialog" aria-modal="true" aria-label="图片预览">
+        <button id="closePreviewBtn" type="button" class="preview-close" aria-label="关闭预览" title="关闭"><i data-lucide="x"></i></button>
+        <div class="preview-toolbar">
+            <button id="previewPrevCandidate" type="button" title="上一个候选" aria-label="上一个候选"><i data-lucide="chevron-up"></i></button>
+            <span id="previewCounter"></span>
+            <button id="previewNextCandidate" type="button" title="下一个候选" aria-label="下一个候选"><i data-lucide="chevron-down"></i></button>
+            <button id="previewResetBtn" type="button" title="复位" aria-label="复位"><i data-lucide="scan"></i></button>
+            <button id="previewDownloadBtn" type="button" title="下载当前图片" aria-label="下载当前图片"><i data-lucide="download"></i></button>
+            <button id="previewCopyBtn" type="button" title="复制当前图片" aria-label="复制当前图片"><i data-lucide="copy"></i></button>
+        </div>
+        <button id="previewPrevScreen" class="preview-nav preview-nav-prev" type="button" title="上一张" aria-label="上一张"><i data-lucide="chevron-left"></i></button>
+        <div id="previewStage" class="preview-stage"><img id="previewImage" alt="" draggable="false"></div>
+        <button id="previewNextScreen" class="preview-nav preview-nav-next" type="button" title="下一张" aria-label="下一张"><i data-lucide="chevron-right"></i></button>
+        <span id="previewName"></span>
+    </div>
+    <dialog id="deleteTaskDialog" class="delete-task-dialog" aria-labelledby="deleteTaskDialogTitle" aria-describedby="deleteTaskDialogDescription">
+        <form method="dialog" class="delete-task-dialog-form">
+            <h2 id="deleteTaskDialogTitle">删除当前主图分组？</h2>
+            <p id="deleteTaskDialogDescription">分组记录会立即删除，图片将在后台清理；仍被其他分组使用的图片会保留。</p>
+            <footer class="delete-task-dialog-actions">
+                <button id="deleteTaskCancelBtn" type="button">取消</button>
+                <button id="deleteTaskConfirmBtn" class="danger" type="button">删除分组</button>
+            </footer>
+        </form>
+    </dialog>
+    <div id="detailToast" class="detail-toast" role="status" aria-live="polite"></div>
+
+    <script src="/static/js/main-image.js?v=2026.08.22-custom.1.1788546920"></script>
+</body>
+</html>

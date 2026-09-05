@@ -19,7 +19,7 @@
     <script src="/static/vendor/js/lucide.js?v=2026.08.22-custom.1.1785863219"></script>
     <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.22-custom.1.1785863189">
-    <link rel="stylesheet" href="/static/css/asset-manager.css?v=2026.08.22-custom.1.1786691828">
+    <link rel="stylesheet" href="/static/css/asset-manager.css?v=2026.08.22-custom.1.1788496076">
 <link rel="stylesheet" href="/static/css/prompt-template-thumbnails.css?v=2026.08.22-custom.1.1786691114">
 </head>
 <body>
@@ -30,8 +30,9 @@
                 <div class="asset-sub">按库、分组、内容和预览管理素材与提示词。</div>
             </div>
             <div class="asset-head-actions">
-                <div id="assetStatus" class="asset-status">准备就绪</div>
+                <div id="assetStatus" class="asset-status">已就绪</div>
                 <button id="storageSettingsBtn" class="asset-btn" type="button"><i data-lucide="settings"></i><span>偏好设置</span></button>
+                <button id="storageCleanupBtn" class="asset-btn storage-cleanup-trigger" type="button"><i data-lucide="hard-drive-download"></i><span>存储清理</span></button>
                 <button id="refreshBtn" class="asset-btn" type="button"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
             </div>
         </header>
@@ -49,7 +50,7 @@
 
     <input id="assetUploadInput" type="file" accept="image/*,video/*,audio/*,.json,.zip,application/json,application/zip" multiple hidden>
     <script src="/static/js/prompt-template-thumbnails.js?v=2026.08.22-custom.1.1786691716"></script>
-    <script src="/static/js/asset-manager.js?v=2026.08.22-custom.1.1786691807"></script>
+    <script src="/static/js/asset-manager.js?v=2026.08.22-custom.1.1788581214"></script>
     <script src="/static/js/global-prompt-library.js?v=2026.08.22-custom.1.1786676777"></script>
 </body>
 </html>

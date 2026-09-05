@@ -5,6 +5,7 @@ import base64
 import hashlib
 import inspect
 import hmac
+import secrets
 import datetime
 import urllib.request
 import urllib.parse
@@ -28,12 +29,15 @@ import math
 import shlex
 import functools
 import html
+import stat
 import ipaddress
 import socket
 import xml.etree.ElementTree as ET
+from contextvars import ContextVar
 from contextlib import asynccontextmanager
-from typing import List, Dict, Any, Optional, Tuple
-from threading import Lock, Thread
+from pathlib import Path
+from typing import List, Dict, Any, Iterable, Mapping, Optional, Tuple, Literal
+from threading import BoundedSemaphore, Lock, RLock, Thread
 import httpx
 from PIL import Image, ImageOps
 from io import BytesIO
@@ -41,7 +45,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Uplo
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 
@@ -54,6 +58,18 @@ if PROJECT_ROOT not in sys.path:
 
 import backup_transfer as backup_io
 import detail_page_v4 as detail_v4
+from image_generation_store import (
+    ImageGenerationStore,
+    image_generation_redact_sensitive_text,
+    image_generation_redact_sensitive_value,
+)
+from image_generation_media import ImageGenerationMediaStore
+from image_generation_examples import ImageGenerationExampleOptimizer
+from image_generation_cleanup import ImageGenerationCleanupTransaction
+from image_generation_modes import compose_final_prompt, normalize_mode
+import storage_cleanup
+from storage_cleanup import StorageCleanupTransaction
+import main_image_v4 as main_image_v4
 from canvas_agent_readonly import (
     CanvasAgentConversationCreate,
     CanvasAgentStreamRequest,
@@ -102,8 +118,29 @@ logging.getLogger("uvicorn.access").addFilter(QuietAccessLogFilter())
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global GLOBAL_LOOP
     await run_startup_initialization()
-    yield
+    try:
+        yield
+    finally:
+        await stop_one_click_cleanup_worker()
+        migration_task = IMAGE_GENERATION_EXAMPLE_MIGRATION_TASK
+        if migration_task and not migration_task.done():
+            migration_task.cancel()
+            try:
+                await migration_task
+            except asyncio.CancelledError:
+                pass
+        # Test clients and orderly server shutdowns close their event loop
+        # immediately after this context exits.  Do not leave the closed loop
+        # in the process-global broadcaster target; later synchronous helpers
+        # may otherwise try to schedule a coroutine on it.
+        try:
+            active_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            active_loop = None
+        if GLOBAL_LOOP is active_loop:
+            GLOBAL_LOOP = None
 
 app = FastAPI(lifespan=lifespan)
 
@@ -118,11 +155,17 @@ NO_CACHE_STATIC_PATHS = {
     "/static/canvas-list.html",
     "/static/api-settings.html",
     "/static/detail-page.html",
+    "/static/main-image.html",
+    "/static/image-generation.html",
     "/static/js/backup-manager.js",
     "/static/js/canvas-list.js",
     "/static/js/api-settings.js",
     "/static/js/detail-page.js",
+    "/static/js/main-image.js",
+    "/static/js/image-generation.js",
     "/static/css/detail-page.css",
+    "/static/css/main-image.css",
+    "/static/css/image-generation.css",
 }
 
 @app.middleware("http")
@@ -221,7 +264,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.08.22-custom.1"
+APP_VERSION = "2026.09.05-custom.1"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -236,15 +279,52 @@ MODELSCOPE_VERSION_URL = MODELSCOPE_FILE_API_ROOT + "VERSION"
 MODELSCOPE_UPDATE_NOTES_URL = MODELSCOPE_FILE_API_ROOT + "static/update-notes.json"
 MODELSCOPE_TREE_URL = "https://www.modelscope.cn/api/v1/studio/qisese70/Infinite-Canvas/repo/files?Revision=master&Recursive=true"
 
+
+async def purge_expired_image_generation_media():
+    """Best-effort local trash maintenance with no network/provider behavior."""
+    try:
+        await asyncio.to_thread(IMAGE_GENERATION_MEDIA_STORE.purge_expired_trash)
+    except Exception as exc:
+        print(f"清理图片生成过期素材失败: {exc}")
+
+
 async def run_startup_initialization():
     global GLOBAL_LOOP
     GLOBAL_LOOP = asyncio.get_running_loop()
     sync_static_html_versions()
     try:
+        await asyncio.to_thread(
+            StorageCleanupTransaction.recover_pending,
+            storage_cleanup_manifest_root(),
+            storage_cleanup_recovery_roots(),
+        )
+    except Exception as exc:
+        print(f"恢复存储清理事务失败: {exc}")
+    try:
+        load_one_click_cleanup_jobs()
+        start_one_click_cleanup_worker()
+    except Exception as exc:
+        print(f"加载一键分组图片清理任务失败: {exc}")
+    try:
         load_persisted_detail_page_tasks()
         schedule_detail_page_candidate_recoveries()
     except Exception as exc:
         print(f"加载详情页历史失败: {exc}")
+    try:
+        load_persisted_main_image_tasks()
+        schedule_main_image_candidate_recoveries()
+    except Exception as exc:
+        print(f"加载主图历史失败: {exc}")
+    try:
+        IMAGE_GENERATION_STORE.initialize()
+        ImageGenerationCleanupTransaction.recover_pending(
+            IMAGE_GENERATION_MEDIA_STORE.root, image_generation_cleanup_allowed_roots()
+        )
+        load_persisted_image_generation_tasks()
+        schedule_image_generation_candidate_recoveries()
+        schedule_image_generation_example_migration()
+    except Exception as exc:
+        print(f"加载图片生成历史失败: {exc}")
     # 启动时整理资产库：给所有图片分组（含默认角色/场景）建好文件夹，并把根目录里的旧素材归整进去。
     try:
         await asyncio.to_thread(migrate_asset_library_into_dirs)
@@ -297,6 +377,108 @@ PROMPT_THUMBNAIL_DIR = os.path.join(ASSETS_DIR, "prompt-thumbnails")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 API_ENV_FILE = os.path.join(BASE_DIR, "API", ".env")
 DATA_DIR = os.path.join(BASE_DIR, "data")
+IMAGE_GENERATION_STORE = ImageGenerationStore(
+    Path(DATA_DIR), Path(STATIC_DIR) / "data" / "image-generation-presets.v1.json"
+)
+IMAGE_GENERATION_MEDIA_STORE = ImageGenerationMediaStore(Path(BASE_DIR))
+IMAGE_GENERATION_RUNTIME_TASKS = {}
+IMAGE_GENERATION_RECOVERY_CANDIDATES = {}
+IMAGE_GENERATION_ACTIVE_STATUSES = {"queued", "submitting", "generating", "recovering"}
+IMAGE_GENERATION_TERMINAL_STATUSES = {"unknown", "succeeded", "failed", "cancelled", "deleted"}
+IMAGE_GENERATION_TASK_LOCK = RLock()
+IMAGE_GENERATION_HISTORY_CLEARING = False
+IMAGE_GENERATION_CLEANUP_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
+IMAGE_GENERATION_CLEANUP_CONFIRMATION_LOCK = Lock()
+IMAGE_GENERATION_CLEANUP_CONFIRMATION_TTL_SECONDS = 300
+STORAGE_CLEANUP_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
+STORAGE_CLEANUP_CONFIRMATION_LOCK = Lock()
+STORAGE_CLEANUP_EXECUTION_LOCK = Lock()
+STORAGE_CLEANUP_REFERENCE_COMMIT_LOCK = Lock()
+STORAGE_CLEANUP_CONFIRMATION_TTL_SECONDS = 300
+ONE_CLICK_CLEANUP_JOB_VERSION = 4
+ONE_CLICK_CLEANUP_JOB_DIR = os.path.join(DATA_DIR, "one_click_cleanup_jobs")
+ONE_CLICK_CLEANUP_JOBS: Dict[str, Dict[str, Any]] = {}
+ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS: Dict[str, Dict[str, Any]] = {}
+ONE_CLICK_CLEANUP_JOB_LOCK = RLock()
+ONE_CLICK_CLEANUP_COMPLETED_RECEIPT_TTL_SECONDS = 60
+ONE_CLICK_CLEANUP_COMPLETED_RECEIPT_LIMIT = 256
+ONE_CLICK_CLEANUP_REVIEW_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
+ONE_CLICK_CLEANUP_REVIEW_CONFIRMATION_LOCK = Lock()
+ONE_CLICK_CLEANUP_REVIEW_CONFIRMATION_TTL_SECONDS = 300
+ONE_CLICK_CLEANUP_WAKE_EVENT: Optional[asyncio.Event] = None
+ONE_CLICK_CLEANUP_WORKER_TASK: Optional[asyncio.Task] = None
+ONE_CLICK_CLEANUP_RETRY_BASE_SECONDS = 5
+ONE_CLICK_CLEANUP_POLL_SECONDS = 1
+# Storage cleanup has no age-based protection. Safety comes from the complete
+# reference scan, the second confirmation, and the Windows Recycle Bin.
+STORAGE_CLEANUP_PROTECTION_SECONDS = 0
+IMAGE_GENERATION_CANDIDATE_TASKS: Dict[str, asyncio.Task] = {}
+IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS: Dict[str, asyncio.Task] = {}
+IMAGE_GENERATION_SEMAPHORE: Optional[asyncio.Semaphore] = None
+IMAGE_GENERATION_SEMAPHORE_LOOP = None
+IMAGE_GENERATION_PROCESS_SEMAPHORE = BoundedSemaphore(6)
+IMAGE_GENERATION_INITIAL_ADMIN_PASSWORD = "451462"
+IMAGE_GENERATION_ADMIN_TOKENS: set[str] = set()
+IMAGE_GENERATION_ADMIN_TOKEN_LOCK = Lock()
+IMAGE_GENERATION_PERSIST_MODE: ContextVar[str] = ContextVar(
+    "image_generation_persist_mode", default="legacy_output"
+)
+IMAGE_GENERATION_EXAMPLE_MIGRATION_TASK: Optional[asyncio.Task] = None
+IMAGE_GENERATION_EXAMPLE_MIGRATION_LOCK = Lock()
+
+
+def image_generation_example_optimizer() -> ImageGenerationExampleOptimizer:
+    """Build an optimizer from the currently active stores.
+
+    Tests and maintenance tools replace the stores with isolated roots, so the
+    factory intentionally does not capture the process-global instances once
+    at import time.
+    """
+    return ImageGenerationExampleOptimizer(
+        IMAGE_GENERATION_MEDIA_STORE.root,
+        IMAGE_GENERATION_STORE,
+        IMAGE_GENERATION_MEDIA_STORE,
+    )
+
+
+async def run_image_generation_example_migration() -> None:
+    optimizer = image_generation_example_optimizer()
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            result = await asyncio.to_thread(optimizer.migrate_all)
+            if not result.get("failed"):
+                return
+            last_error = ValueError(
+                f"{len(result.get('failed') or [])} 个模式案例迁移失败"
+            )
+        except Exception as exc:
+            last_error = exc
+        if attempt < 3:
+            await asyncio.sleep(min(30, 2 ** attempt))
+    if last_error is not None:
+        print(f"后台优化图片生成模式案例失败: {last_error}")
+
+
+def schedule_image_generation_example_migration() -> None:
+    """Start one non-blocking, restartable migration after store init."""
+    global IMAGE_GENERATION_EXAMPLE_MIGRATION_TASK
+    if GLOBAL_LOOP is None:
+        return
+    with IMAGE_GENERATION_EXAMPLE_MIGRATION_LOCK:
+        if IMAGE_GENERATION_EXAMPLE_MIGRATION_TASK and not IMAGE_GENERATION_EXAMPLE_MIGRATION_TASK.done():
+            return
+        IMAGE_GENERATION_EXAMPLE_MIGRATION_TASK = asyncio.create_task(
+            run_image_generation_example_migration()
+        )
+
+
+def image_generation_cleanup_allowed_roots() -> tuple[Path, ...]:
+    return (
+        IMAGE_GENERATION_STORE.task_dir,
+        IMAGE_GENERATION_MEDIA_STORE.media_root,
+        IMAGE_GENERATION_MEDIA_STORE.metadata_root,
+    )
 CONVERSATION_DIR = os.path.join(DATA_DIR, "conversations")
 CANVAS_DIR = os.path.join(DATA_DIR, "canvases")
 MEDIA_PREVIEW_DIR = os.path.join(DATA_DIR, "media_previews")
@@ -363,6 +545,772 @@ def apply_storage_settings(dirs=None):
     LOCAL_UPLOAD_DIR = dirs.get("local") or LOCAL_UPLOAD_DIR
 
 apply_storage_settings()
+
+
+def load_persisted_image_generation_tasks(page_size=200):
+    """Register active image-generation records without resubmitting work.
+
+    Task execution belongs to the later image-generation runtime.  At startup
+    this boundary only makes durable active records available for that runtime
+    and leaves corrupted files isolated inside the repository.
+    """
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
+        raise ValueError("page_size must be a positive integer")
+    page_size = min(page_size, 200)
+    IMAGE_GENERATION_RUNTIME_TASKS.clear()
+    offset = 0
+    while True:
+        summaries = IMAGE_GENERATION_STORE.list_task_summaries(offset=offset, limit=page_size)
+        for summary in summaries:
+            if str(summary.get("status") or "") not in IMAGE_GENERATION_ACTIVE_STATUSES:
+                continue
+            task_id = str(summary.get("id") or "")
+            task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+            if task is not None:
+                changed = False
+                for candidate in task.get("candidates") or []:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_status = str(candidate.get("status") or "")
+                    upstream_id = str(candidate.get("upstream_task_id") or "")
+                    if upstream_id and candidate_status in {"submitting", "generating"}:
+                        candidate["status"] = "recovering"
+                        candidate["error"] = "服务重启后只查询已保存的上游任务，不会重新提交"
+                        changed = True
+                    elif not upstream_id and candidate_status in {"submitting", "generating", "recovering"}:
+                        candidate["status"] = "unknown"
+                        candidate["error"] = "服务重启前未保存上游任务编号，结果未知且不会自动重提"
+                        changed = True
+                    elif candidate_status == "queued":
+                        candidate["status"] = "cancelled"
+                        candidate["error"] = "服务重启前尚未提交；为避免重复付费未自动重提"
+                        changed = True
+                if changed:
+                    image_generation_refresh_summary(task)
+                    IMAGE_GENERATION_STORE.save_task(task)
+                IMAGE_GENERATION_RUNTIME_TASKS[task_id] = task
+        if len(summaries) < page_size:
+            break
+        offset += len(summaries)
+    return len(IMAGE_GENERATION_RUNTIME_TASKS)
+
+
+def schedule_image_generation_candidate_recoveries():
+    """Register recoverable candidates and, on an event loop, query them only."""
+    IMAGE_GENERATION_RECOVERY_CANDIDATES.clear()
+    for task_id, task in IMAGE_GENERATION_RUNTIME_TASKS.items():
+        for candidate in task.get("candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("status") or "") != "recovering":
+                continue
+            upstream_task_id = candidate.get("upstream_task_id")
+            if not upstream_task_id:
+                continue
+            candidate_id = str(candidate.get("id") or "")
+            IMAGE_GENERATION_RECOVERY_CANDIDATES[
+                f"{task_id}:{candidate_id}"
+            ] = {"task_id": task_id, "candidate_id": candidate_id, "upstream_task_id": upstream_task_id}
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Repository-only synchronous callers retain Task 2's registration
+        # boundary. Startup itself has a loop and consumes the registry below.
+        return len(IMAGE_GENERATION_RECOVERY_CANDIDATES)
+    for key, target in IMAGE_GENERATION_RECOVERY_CANDIDATES.items():
+        current = IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS.get(key)
+        if current and not current.done():
+            continue
+        job = asyncio.create_task(run_image_generation_candidate_recovery(
+            target["task_id"], target["candidate_id"]
+        ))
+        IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS[key] = job
+        job.add_done_callback(
+            lambda finished, recovery_key=key: image_generation_recovery_done(recovery_key, finished)
+        )
+    return len(IMAGE_GENERATION_RECOVERY_CANDIDATES)
+
+
+class ImageGenerationAdminUnlockRequest(BaseModel):
+    password: str = Field(default="", max_length=256)
+
+
+class ImageGenerationPromptDraftRequest(BaseModel):
+    prompt: str = Field(default="")
+    note: str = Field(default="", max_length=2_000)
+
+
+class ImageGenerationVersionRequest(BaseModel):
+    version_id: str = Field(min_length=1, max_length=160)
+
+
+class ImageGenerationDuplicateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=400)
+
+
+class ImageGenerationExampleCreateRequest(BaseModel):
+    task_id: str = Field(min_length=1, max_length=160)
+    candidate_id: str = Field(min_length=1, max_length=160)
+    sample_user_prompt: str = Field(default="", max_length=20_000)
+    title: str = Field(default="", max_length=400)
+    caption: str = Field(default="", max_length=2_000)
+    show_user_prompt: bool = True
+
+
+class ImageGenerationExampleUpdateRequest(BaseModel):
+    sample_user_prompt: str | None = Field(default=None, max_length=20_000)
+    title: str | None = Field(default=None, max_length=400)
+    caption: str | None = Field(default=None, max_length=2_000)
+    show_user_prompt: bool | None = None
+
+
+class ImageGenerationCleanupPreviewRequest(BaseModel):
+    retention: Literal["24h", "7d", "30d", "all"]
+
+
+class ImageGenerationCleanupConfirmRequest(BaseModel):
+    confirmation_id: str = Field(min_length=20, max_length=200)
+
+
+class ImageGenerationTerminalCleanupRequest(BaseModel):
+    """Request to remove a caller's snapshot of terminal invalid records.
+
+    The IDs are only a UI snapshot.  The endpoint re-reads every task under
+    ``IMAGE_GENERATION_TASK_LOCK`` and accepts only the failed/deleted visual
+    states, so stale clients cannot broaden the deletion scope.
+    """
+
+    task_ids: List[str] = Field(default_factory=list, max_length=50000)
+
+
+class StorageCleanupPreviewRequest(BaseModel):
+    kind: Literal["generated", "temporary-upload", "all"]
+
+
+class StorageCleanupConfirmRequest(BaseModel):
+    confirmation_id: str = Field(min_length=20, max_length=200)
+
+
+def require_image_generation_admin(request: Request) -> str:
+    """Return a live local-management token or reject the protected operation."""
+    token = str(request.headers.get("X-Image-Generation-Admin") or "")
+    with IMAGE_GENERATION_ADMIN_TOKEN_LOCK:
+        active = bool(token) and token in IMAGE_GENERATION_ADMIN_TOKENS
+    if not active:
+        raise HTTPException(status_code=403, detail="需要图片生成管理权限")
+    return token
+
+
+def _image_generation_mode_not_found(mode_id: str):
+    raise HTTPException(status_code=404, detail="图片生成模式不存在")
+
+
+def _image_generation_admin_mode_or_404(mode_id: str) -> dict:
+    mode = IMAGE_GENERATION_STORE.get_mode(mode_id, include_admin=True)
+    if mode is None:
+        _image_generation_mode_not_found(mode_id)
+    mode["prompt_versions"] = IMAGE_GENERATION_STORE.list_prompt_versions(mode_id)
+    return mode
+
+
+def _image_generation_invalid_mode_request():
+    raise HTTPException(status_code=422, detail="图片生成模式参数无效")
+
+
+def _image_generation_safe_media_record(media_id: Any) -> dict:
+    record = IMAGE_GENERATION_MEDIA_STORE.media_record(str(media_id or ""))
+    if record is None:
+        raise ValueError("图片生成素材不存在或不可读")
+    return record
+
+
+def _image_generation_reject_transient_value(value: Any) -> None:
+    """Keep drafts JSON-only and reject serialized binary or local/temp URLs."""
+    if isinstance(value, str):
+        lowered = value.strip().casefold()
+        if lowered.startswith(("data:", "file:")) or "base64," in lowered:
+            raise ValueError("草稿不能保存 Base64 或临时路径")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _image_generation_reject_transient_value(item)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _image_generation_reject_transient_value(item)
+        return
+    if value is None or isinstance(value, (bool, int, float)):
+        return
+    raise ValueError("草稿设置必须是 JSON 数据")
+
+
+_IMAGE_GENERATION_DRAFT_SETTING_LIMITS = {
+    "image_provider_id": 160,
+    "image_model": 400,
+    "ratio_mode": 20,
+    "custom_ratio_width": 3,
+    "custom_ratio_height": 3,
+    "aspect_ratio": 40,
+    "resolution": 40,
+    "size": 80,
+}
+
+_IMAGE_GENERATION_RATIO_MODES = {"fixed", "source", "adaptive", "custom"}
+_IMAGE_GENERATION_SUPPORTED_RATIOS = (
+    "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1",
+    "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9", "9:21",
+)
+_IMAGE_GENERATION_RES_LONG_SIDE = {"1k": 1536, "2k": 2048, "4k": 3840}
+_IMAGE_GENERATION_RES_PIXEL_LIMIT = {"1k": 1572864, "2k": 4194304, "4k": 8294400}
+
+
+def _image_generation_safe_generation_settings(value: Any) -> dict:
+    """Persist only the stable Task-5 generation selectors, never runtime data."""
+    if not isinstance(value, dict):
+        raise ValueError("草稿设置必须是对象")
+    allowed = set(_IMAGE_GENERATION_DRAFT_SETTING_LIMITS) | {"image_count"}
+    if set(value) - allowed:
+        raise ValueError("草稿设置包含不支持的字段")
+    normalized = {}
+    for key, limit in _IMAGE_GENERATION_DRAFT_SETTING_LIMITS.items():
+        if key not in value:
+            continue
+        item = value[key]
+        if not isinstance(item, str) or len(item) > limit:
+            raise ValueError("草稿设置字段无效")
+        _image_generation_reject_transient_value(item)
+        normalized[key] = item
+    ratio_mode = normalized.get("ratio_mode")
+    if ratio_mode is not None and ratio_mode not in _IMAGE_GENERATION_RATIO_MODES:
+        raise ValueError("草稿比例模式无效")
+    for key in ("custom_ratio_width", "custom_ratio_height"):
+        component = normalized.get(key)
+        if component is not None and component != "" and not re.fullmatch(r"[1-9]\d{0,2}", component):
+            raise ValueError("草稿自定义比例无效")
+    if "image_count" in value:
+        count = value["image_count"]
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 6:
+            raise ValueError("图片数量必须在 1 到 6 之间")
+        normalized["image_count"] = count
+    return normalized
+
+
+def _image_generation_validate_workspace_draft(mode_id: str, payload: Dict[str, Any]) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("草稿必须是对象")
+    allowed = {"inputs", "user_prompt", "generation_settings"}
+    if set(payload) - allowed:
+        raise ValueError("草稿包含不支持的字段")
+    mode = IMAGE_GENERATION_STORE.get_mode(mode_id, include_admin=True)
+    if mode is None or mode.get("status") != "active":
+        raise KeyError(mode_id)
+    inputs = payload.get("inputs", [])
+    if not isinstance(inputs, list) or len(inputs) > min(6, int(mode["max_upload_count"])):
+        raise ValueError("图片数量超出模式限制")
+    slot_definitions = {item["key"]: item for item in mode.get("reference_images") or []}
+    seen_slots: set[str] = set()
+    extra_count = 0
+    normalized_inputs: list[dict] = []
+    for item in inputs:
+        if not isinstance(item, dict):
+            raise ValueError("图片槽位无效")
+        slot_key = item.get("slot_key")
+        media_id = item.get("media_id")
+        if not isinstance(slot_key, str) or not slot_key or slot_key in seen_slots:
+            raise ValueError("图片槽位键必须唯一")
+        seen_slots.add(slot_key)
+        if slot_key not in slot_definitions:
+            if not mode.get("allow_extra_images"):
+                raise ValueError("当前模式不支持额外图片")
+            extra_count += 1
+            if extra_count > int(mode.get("extra_image_limit") or 0):
+                raise ValueError("额外图片数量超限")
+        normalized_inputs.append({"slot_key": slot_key, "media": _image_generation_safe_media_record(media_id)})
+    required_slots = {item["key"] for item in slot_definitions.values() if item.get("required")}
+    if not required_slots.issubset(seen_slots):
+        raise ValueError("缺少必填图片槽位")
+    user_prompt = payload.get("user_prompt", "")
+    settings = payload.get("generation_settings", {})
+    if not isinstance(user_prompt, str) or len(user_prompt) > 20_000 or not isinstance(settings, dict):
+        raise ValueError("草稿参数无效")
+    _image_generation_reject_transient_value(user_prompt)
+    settings = _image_generation_safe_generation_settings(settings)
+    return {
+        "inputs": normalized_inputs,
+        "user_prompt": user_prompt,
+        "generation_settings": settings,
+    }
+
+
+def _image_generation_public_workspace_draft(value: Any) -> dict | None:
+    """Project legacy disk drafts through the same safe media/settings boundary."""
+    if not isinstance(value, dict):
+        return None
+    inputs = []
+    for item in value.get("inputs") or []:
+        if not isinstance(item, dict):
+            continue
+        slot_key = item.get("slot_key")
+        media = item.get("media") if isinstance(item.get("media"), dict) else item
+        media_id = media.get("id") or item.get("media_id")
+        if not isinstance(slot_key, str) or not slot_key or not isinstance(media_id, str):
+            continue
+        try:
+            inputs.append({"slot_key": slot_key, "media": _image_generation_safe_media_record(media_id)})
+        except ValueError:
+            continue
+    user_prompt = value.get("user_prompt", "")
+    if not isinstance(user_prompt, str) or len(user_prompt) > 20_000:
+        user_prompt = ""
+    else:
+        try:
+            _image_generation_reject_transient_value(user_prompt)
+        except ValueError:
+            user_prompt = ""
+    try:
+        settings = _image_generation_safe_generation_settings(value.get("generation_settings", {}))
+    except ValueError:
+        settings = {}
+    result = {"inputs": inputs, "user_prompt": user_prompt, "generation_settings": settings}
+    if isinstance(value.get("mode_id"), str):
+        result["mode_id"] = value["mode_id"]
+    if isinstance(value.get("updated_at"), str):
+        result["updated_at"] = value["updated_at"]
+    return result
+
+
+def _image_generation_adopt_task_media(value: Any) -> dict:
+    """Normalize a task media record without downloading or trusting external URLs."""
+    if not isinstance(value, dict):
+        raise ValueError("任务媒体记录无效")
+    media = value.get("media") if isinstance(value.get("media"), dict) else value
+    media_id = media.get("id") or value.get("media_id")
+    if isinstance(media_id, str):
+        return _image_generation_safe_media_record(media_id)
+    url = media.get("url") or value.get("url") or value.get("image_url")
+    if isinstance(url, str):
+        adopted = IMAGE_GENERATION_MEDIA_STORE.adopt_local_url(url)
+        return IMAGE_GENERATION_MEDIA_STORE.media_record(adopted["id"]) or {}
+    raise ValueError("任务媒体没有受控本机记录")
+
+
+def _image_generation_public_example_media(value: Any) -> dict:
+    """Expose only CAS media or bundled official example assets."""
+    if not isinstance(value, dict):
+        raise ValueError("固定案例媒体记录无效")
+    media = value.get("media") if isinstance(value.get("media"), dict) else value
+    url = media.get("url") or value.get("url")
+    if isinstance(url, str) and url.startswith("/static/image-generation-examples/"):
+        relative = url[len("/static/image-generation-examples/"):]
+        if not relative or ".." in Path(relative).parts or Path(relative).is_absolute():
+            raise ValueError("固定案例静态地址无效")
+        target = (Path(STATIC_DIR) / "image-generation-examples" / relative).resolve()
+        root = (Path(STATIC_DIR) / "image-generation-examples").resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("固定案例静态地址越界") from exc
+        if not target.is_file():
+            raise ValueError("固定案例静态图片不存在")
+        return {"url": url}
+    return _image_generation_adopt_task_media(value)
+
+
+def _image_generation_public_example(example: Any) -> dict | None:
+    if not isinstance(example, dict):
+        return None
+    try:
+        input_media = []
+        for item in example.get("input_media") or []:
+            if not isinstance(item, dict):
+                continue
+            input_media.append({
+                "slot_key": str(item.get("slot_key") or ""),
+                "media": _image_generation_public_example_media(item.get("media") or item),
+            })
+        output_media = _image_generation_public_example_media(example.get("output_media") or {})
+    except ValueError:
+        return None
+    result = {
+        "id": str(example.get("id") or ""),
+        "title": str(example.get("title") or ""),
+        "caption": str(example.get("caption") or ""),
+        "input_media": input_media,
+        "output_media": output_media,
+        # Fixed-case descriptions are visible to every local user by default.
+        # Keep the stored flag for backup compatibility, but do not gate the
+        # public payload on its legacy value.
+        "sample_user_prompt": str(example.get("sample_user_prompt") or ""),
+    }
+    return result
+
+
+def _image_generation_public_mode_with_example(mode_id: str) -> dict | None:
+    public = IMAGE_GENERATION_STORE.get_mode(mode_id)
+    if public is None:
+        return None
+    admin = IMAGE_GENERATION_STORE.get_mode(mode_id, include_admin=True) or {}
+    example = _image_generation_public_example(admin.get("example"))
+    if example is not None:
+        public["example"] = example
+    return public
+
+
+@app.post("/api/image-generation/admin/unlock")
+def unlock_image_generation_admin(payload: ImageGenerationAdminUnlockRequest):
+    if not hmac.compare_digest(payload.password, IMAGE_GENERATION_INITIAL_ADMIN_PASSWORD):
+        raise HTTPException(status_code=403, detail="图片生成管理密码错误")
+    token = secrets.token_urlsafe(32)
+    with IMAGE_GENERATION_ADMIN_TOKEN_LOCK:
+        IMAGE_GENERATION_ADMIN_TOKENS.add(token)
+    return {"token": token, "active": True}
+
+
+@app.post("/api/image-generation/admin/lock")
+def lock_image_generation_admin(request: Request):
+    token = require_image_generation_admin(request)
+    with IMAGE_GENERATION_ADMIN_TOKEN_LOCK:
+        IMAGE_GENERATION_ADMIN_TOKENS.discard(token)
+    return {"active": False}
+
+
+@app.get("/api/image-generation/admin/session")
+def get_image_generation_admin_session(request: Request):
+    token = str(request.headers.get("X-Image-Generation-Admin") or "")
+    with IMAGE_GENERATION_ADMIN_TOKEN_LOCK:
+        active = bool(token) and token in IMAGE_GENERATION_ADMIN_TOKENS
+    return {"active": active}
+
+
+@app.get("/api/image-generation/admin/modes/{mode_id}")
+def get_image_generation_admin_mode(mode_id: str, request: Request):
+    require_image_generation_admin(request)
+    return {"item": _image_generation_admin_mode_or_404(mode_id)}
+
+
+@app.get("/api/image-generation/admin/modes")
+def list_image_generation_admin_modes(request: Request):
+    require_image_generation_admin(request)
+    return {
+        "items": IMAGE_GENERATION_STORE.list_modes(include_admin=True),
+        "next_mode_no": IMAGE_GENERATION_STORE.next_mode_no(),
+    }
+
+
+@app.get("/api/image-generation/admin/example-resize-status")
+def get_image_generation_example_resize_status(request: Request):
+    """Return the persisted status of the non-blocking example migration."""
+    require_image_generation_admin(request)
+    return image_generation_example_optimizer().status()
+
+
+@app.post("/api/image-generation/admin/modes")
+def create_image_generation_admin_mode(payload: Dict[str, Any], request: Request):
+    require_image_generation_admin(request)
+    try:
+        item = IMAGE_GENERATION_STORE.create_mode(payload)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"item": item}
+
+
+@app.get("/api/image-generation/modes")
+def list_image_generation_modes():
+    return {
+        "items": [
+            item for item in (
+                _image_generation_public_mode_with_example(mode["id"])
+                for mode in IMAGE_GENERATION_STORE.list_modes()
+            ) if item is not None
+        ]
+    }
+
+
+@app.get("/api/image-generation/modes/{mode_id}")
+def get_image_generation_mode(mode_id: str):
+    mode = _image_generation_public_mode_with_example(mode_id)
+    if mode is None:
+        _image_generation_mode_not_found(mode_id)
+    return mode
+
+
+@app.post("/api/image-generation/media")
+async def upload_image_generation_media(files: List[UploadFile] = File(...)):
+    if not 1 <= len(files) <= 6:
+        raise HTTPException(status_code=422, detail="每次只能上传 1 到 6 张图片")
+    records = []
+    for file in files:
+        try:
+            content = await file.read(50 * 1024 * 1024 + 1)
+            record = IMAGE_GENERATION_MEDIA_STORE.adopt_bytes(
+                content, str(file.filename or ""), str(file.content_type or "")
+            )
+            records.append(IMAGE_GENERATION_MEDIA_STORE.media_record(record["id"]))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"items": records}
+
+
+@app.patch("/api/image-generation/modes/{mode_id}/draft")
+def save_image_generation_workspace_draft(mode_id: str, payload: Dict[str, Any]):
+    try:
+        draft = _image_generation_validate_workspace_draft(mode_id, payload)
+        return {"item": IMAGE_GENERATION_STORE.save_workspace_draft(mode_id, draft)}
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+
+
+@app.get("/api/image-generation/modes/{mode_id}/draft")
+def get_image_generation_workspace_draft(mode_id: str):
+    if IMAGE_GENERATION_STORE.get_mode(mode_id) is None:
+        _image_generation_mode_not_found(mode_id)
+    return {"item": _image_generation_public_workspace_draft(
+        IMAGE_GENERATION_STORE.load_workspace_draft(mode_id)
+    )}
+
+
+@app.post("/api/image-generation/modes/{mode_id}/example")
+def create_image_generation_example(
+    mode_id: str, payload: ImageGenerationExampleCreateRequest, request: Request
+):
+    require_image_generation_admin(request)
+    try:
+        mode = _image_generation_admin_mode_or_404(mode_id)
+        task = IMAGE_GENERATION_STORE.load_task(payload.task_id, include_admin=True)
+        if task is None or task.get("mode_id") != mode_id:
+            raise ValueError("示范必须来自本模式任务的成功候选")
+        candidate = next(
+            (
+                item for item in task.get("candidates") or []
+                if isinstance(item, dict) and item.get("id") == payload.candidate_id
+                and item.get("status") == "succeeded"
+            ),
+            None,
+        )
+        if candidate is None:
+            raise ValueError("未找到成功候选")
+        input_media = []
+        for item in task.get("inputs") or []:
+            if not isinstance(item, dict):
+                raise ValueError("任务输入无效")
+            input_media.append({
+                "slot_key": str(item.get("slot_key") or ""),
+                "media": _image_generation_adopt_task_media(item),
+            })
+        output_media = _image_generation_adopt_task_media(candidate.get("image") or candidate)
+        # A fixed example is a release asset.  Keep the original CAS media
+        # untouched and materialise an optimised static copy before changing
+        # the mode record.  If any image cannot be processed, the mode write
+        # is skipped and the previous example remains intact.
+        optimizer = image_generation_example_optimizer()
+        optimised_inputs = []
+        created_case_paths: list[Path] = []
+        try:
+            for item in input_media:
+                optimised, created = optimizer.materialize_media(mode_id, item["media"])
+                created_case_paths.extend(created)
+                optimised_inputs.append({"slot_key": item["slot_key"], "media": optimised})
+            optimised_output, created = optimizer.materialize_media(mode_id, output_media)
+            created_case_paths.extend(created)
+        except Exception:
+            for path in created_case_paths:
+                try:
+                    if path.is_file():
+                        path.unlink()
+                except OSError:
+                    pass
+            raise
+        # All media has been successfully adopted before the single mode write.
+        generation_settings = (
+            task.get("generation_settings")
+            if isinstance(task.get("generation_settings"), dict)
+            else {}
+        )
+        try:
+            example = IMAGE_GENERATION_STORE.save_example(mode_id, {
+                "input_media": optimised_inputs,
+                "output_media": optimised_output,
+                "sample_user_prompt": payload.sample_user_prompt,
+                "title": payload.title,
+                "caption": payload.caption,
+                "show_user_prompt": True,
+                "source": {
+                    "task_id": payload.task_id,
+                    "candidate_id": payload.candidate_id,
+                    "aspect_ratio": generation_settings.get("aspect_ratio"),
+                    "resolution": generation_settings.get("resolution"),
+                    "model": generation_settings.get("image_model"),
+                    "prompt_version_id": task.get("prompt_version_id"),
+                },
+            })
+        except Exception:
+            for path in created_case_paths:
+                try:
+                    if path.is_file():
+                        path.unlink()
+                except OSError:
+                    pass
+            raise
+        return {"item": example, "mode": _image_generation_admin_mode_or_404(mode_id)}
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+
+
+@app.patch("/api/image-generation/modes/{mode_id}/example")
+def update_image_generation_example(
+    mode_id: str, payload: ImageGenerationExampleUpdateRequest, request: Request
+):
+    require_image_generation_admin(request)
+    try:
+        mode = _image_generation_admin_mode_or_404(mode_id)
+        existing = mode.get("example")
+        if not isinstance(existing, dict):
+            raise KeyError("example")
+        updated = copy.deepcopy(existing)
+        for field in ("sample_user_prompt", "title", "caption"):
+            value = getattr(payload, field)
+            if value is not None:
+                updated[field] = value
+        updated["show_user_prompt"] = True
+        return {"item": IMAGE_GENERATION_STORE.save_example(mode_id, updated)}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="固定示范不存在")
+    except ValueError:
+        _image_generation_invalid_mode_request()
+
+
+@app.delete("/api/image-generation/modes/{mode_id}/example")
+def delete_image_generation_example(mode_id: str, request: Request):
+    require_image_generation_admin(request)
+    try:
+        IMAGE_GENERATION_STORE.clear_example(mode_id)
+    except KeyError as exc:
+        if exc.args and exc.args[0] == mode_id:
+            _image_generation_mode_not_found(mode_id)
+        raise HTTPException(status_code=404, detail="固定示范不存在")
+    return {"deleted": True, "mode_id": mode_id}
+
+
+@app.post("/api/image-generation/modes/{mode_id}/prompt-draft")
+def save_image_generation_prompt_draft(
+    mode_id: str, payload: ImageGenerationPromptDraftRequest, request: Request
+):
+    require_image_generation_admin(request)
+    try:
+        version = IMAGE_GENERATION_STORE.save_prompt_draft(mode_id, payload.prompt, note=payload.note)
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"version": version, "item": _image_generation_admin_mode_or_404(mode_id)}
+
+
+@app.post("/api/image-generation/modes/{mode_id}/activate-prompt")
+def activate_image_generation_prompt(
+    mode_id: str, payload: ImageGenerationVersionRequest, request: Request
+):
+    require_image_generation_admin(request)
+    try:
+        version = IMAGE_GENERATION_STORE.activate_prompt_draft(mode_id, payload.version_id)
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"version": version, "item": _image_generation_admin_mode_or_404(mode_id)}
+
+
+@app.post("/api/image-generation/modes/{mode_id}/restore-prompt")
+def restore_image_generation_prompt(
+    mode_id: str, payload: ImageGenerationVersionRequest, request: Request
+):
+    require_image_generation_admin(request)
+    try:
+        version = IMAGE_GENERATION_STORE.restore_prompt_version(mode_id, payload.version_id)
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"version": version, "item": _image_generation_admin_mode_or_404(mode_id)}
+
+
+@app.post("/api/image-generation/modes/{mode_id}/duplicate")
+def duplicate_image_generation_mode(
+    mode_id: str, payload: ImageGenerationDuplicateRequest, request: Request
+):
+    require_image_generation_admin(request)
+    try:
+        item = IMAGE_GENERATION_STORE.duplicate_mode(mode_id, payload.display_name)
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"item": item}
+
+
+@app.patch("/api/image-generation/modes/{mode_id}")
+def patch_image_generation_mode(mode_id: str, payload: Dict[str, Any], request: Request):
+    require_image_generation_admin(request)
+    try:
+        item = IMAGE_GENERATION_STORE.update_mode(mode_id, payload)
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"item": item}
+
+
+@app.post("/api/image-generation/modes/{mode_id}/archive")
+def archive_image_generation_mode(mode_id: str, request: Request):
+    require_image_generation_admin(request)
+    try:
+        item = IMAGE_GENERATION_STORE.set_mode_status(mode_id, "archived")
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"item": item}
+
+
+@app.post("/api/image-generation/modes/{mode_id}/trash")
+def trash_image_generation_mode(mode_id: str, request: Request):
+    require_image_generation_admin(request)
+    try:
+        item = IMAGE_GENERATION_STORE.set_mode_status(mode_id, "trashed")
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"item": item}
+
+
+@app.post("/api/image-generation/modes/{mode_id}/restore")
+def restore_image_generation_mode(mode_id: str, request: Request):
+    require_image_generation_admin(request)
+    try:
+        item = IMAGE_GENERATION_STORE.set_mode_status(mode_id, "active")
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        _image_generation_invalid_mode_request()
+    return {"item": item}
+
+
+@app.delete("/api/image-generation/modes/{mode_id}")
+def permanently_delete_image_generation_mode(mode_id: str, request: Request, permanent: bool = False):
+    require_image_generation_admin(request)
+    if permanent is not True:
+        raise HTTPException(status_code=400, detail="永久删除需要 permanent=true 确认")
+    try:
+        IMAGE_GENERATION_STORE.delete_mode_permanently(mode_id)
+    except KeyError:
+        _image_generation_mode_not_found(mode_id)
+    except ValueError:
+        raise HTTPException(status_code=409, detail="模式仍被任务、草稿、示范或提示词版本引用")
+    return {"deleted": True, "id": mode_id}
 
 QUEUE = []
 QUEUE_LOCK = Lock()
@@ -1422,6 +2370,16 @@ def runninghub_endpoint_url(provider, path):
     base_url = str((provider or {}).get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL).strip().rstrip("/")
     return f"{base_url}{path}"
 
+def runninghub_execution_endpoint(provider, snapshot_key, path):
+    """Resolve a frozen Task 5 route without consulting mutable provider config."""
+    override = str((provider or {}).get(snapshot_key) or "").strip()
+    if override:
+        if re.match(r"^https?://", override, re.I):
+            return override.rstrip("/")
+        base_url = str((provider or {}).get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL).strip().rstrip("/")
+        return f"{base_url}{override if override.startswith('/') else '/' + override}"
+    return runninghub_endpoint_url(provider, path)
+
 def runninghub_openapi_base_url(provider=None):
     base_url = str((provider or {}).get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL).strip().rstrip("/")
     if base_url.endswith("/openapi/v2"):
@@ -2251,6 +3209,9 @@ def update_allowed_file(path: str) -> bool:
         return False
     root_files = {
         "main.py",
+        "image_generation_store.py",
+        "image_generation_modes.py",
+        "image_generation_media.py",
         "VERSION",
         "README.md",
         "新手运行与使用教程.md",
@@ -2727,6 +3688,14 @@ def validate_staged_update(staging_root: str, root_files: List[str], static_file
         raise RuntimeError("更新暂存缺少 main.py 或 VERSION")
     with open(main_path, "rb") as f:
         compile(f.read(), main_path, "exec")
+    for module_name in (
+        "image_generation_store.py", "image_generation_modes.py", "image_generation_media.py",
+    ):
+        if module_name not in root_files:
+            continue
+        module_path = os.path.join(staging_root, module_name)
+        with open(module_path, "rb") as f:
+            compile(f.read(), module_path, "exec")
     with open(version_path, "r", encoding="utf-8") as f:
         version = (f.read().strip().splitlines() or [""])[0].strip()
     if not version or len(version) > 80 or any(ch in version for ch in "<>\\r\\n"):
@@ -3210,6 +4179,25 @@ class GenerateRequest(BaseModel):
 class DeleteHistoryRequest(BaseModel):
     timestamp: float
 
+
+class CanvasAssetsReconcileDeleteRequest(BaseModel):
+    """A deletion acknowledgement from a canvas editor.
+
+    The editor sends the media URLs/task ids that disappeared from the local
+    canvas.  The server still re-scans every durable reference before it
+    recycles anything, so this payload is only a narrow ownership hint.
+    """
+
+    canvas_id: str = Field(default="", max_length=160)
+    task_ids: List[str] = Field(default_factory=list, max_length=2000)
+    urls: List[str] = Field(default_factory=list, max_length=20000)
+
+
+class CanvasAssetDeleteRequest(BaseModel):
+    """URLs selected from the read-only canvas orphan category."""
+
+    urls: List[str] = Field(default_factory=list, max_length=2000)
+
 class TokenRequest(BaseModel):
     token: str
 
@@ -3292,6 +4280,11 @@ class ImageTaskQueryRequest(BaseModel):
 
 CANVAS_TASKS: Dict[str, Dict[str, Any]] = {}
 CANVAS_TASK_LOCK = Lock()
+# Serialize one-click history commits with fast group deletion.  A provider
+# result can finish just as a group is being removed; keeping the ownership
+# check and history mutation under one lock prevents a late result from
+# recreating the deleted group's history row.
+ONE_CLICK_RECORD_MUTATION_LOCK = Lock()
 CANVAS_TASK_RUNTIME_ID = uuid.uuid4().hex
 CANVAS_LLM_BACKGROUND_TASKS = set()
 DETAIL_PAGE_BACKGROUND_TASKS: Dict[str, asyncio.Task] = {}
@@ -3300,6 +4293,11 @@ DETAIL_PAGE_CANDIDATE_RECOVERY_TASKS: Dict[str, asyncio.Task] = {}
 DETAIL_PAGE_TASK_DIR = os.path.join(DATA_DIR, "detail_page_tasks")
 DETAIL_PAGE_IMAGE_QUERY_TIMEOUT = 30 * 60
 DETAIL_PAGE_IMAGE_QUERY_INTERVALS = (2.0, 5.0, 10.0)
+MAIN_IMAGE_BACKGROUND_TASKS: Dict[str, asyncio.Task] = {}
+MAIN_IMAGE_SCREEN_TASKS: Dict[str, Dict[int, asyncio.Task]] = {}
+MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS: Dict[str, asyncio.Task] = {}
+MAIN_IMAGE_TASK_DIR = os.path.join(DATA_DIR, "main_image_tasks")
+MAIN_IMAGE_GENERATION_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
 class CanvasVideoRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=VIDEO_PROMPT_MAX_LENGTH)
@@ -3480,8 +4478,7 @@ class CanvasLLMTaskRequest(CanvasLLMRequest):
     display_message: str = Field(default="", max_length=LLM_MESSAGE_MAX_LENGTH)
 
 class DetailPageSchemaModel(BaseModel):
-    class Config:
-        extra = "forbid"
+    model_config = ConfigDict(extra="forbid")
 
 class DetailPageCopy(DetailPageSchemaModel):
     headline: str = Field(default="", max_length=240)
@@ -3601,6 +4598,111 @@ class DetailPagePromptOptimizeRequest(BaseModel):
 class DetailPageScreenReorderRequest(BaseModel):
     screen_order: List[int] = Field(min_length=1, max_length=12)
 
+
+class MainImageTaskRequest(BaseModel):
+    main_image_mode: str = Field(default="continuous", pattern="^(continuous|creative)$")
+    product_images: List[str] = Field(default_factory=list, max_length=6)
+    reference_images: List[str] = Field(default_factory=list, max_length=6)
+    product_image_meta: List[DetailPageSourceImage] = Field(default_factory=list, max_length=6)
+    reference_image_meta: List[DetailPageSourceImage] = Field(default_factory=list, max_length=6)
+    image_provider_id: str = Field(min_length=1, max_length=160)
+    image_model: str = Field(min_length=1, max_length=400)
+    llm_provider_id: str = Field(min_length=1, max_length=160)
+    llm_model: str = Field(min_length=1, max_length=400)
+    aspect_ratio: str = Field(default="1:1", max_length=40)
+    resolution: str = Field(default="2k", max_length=40)
+    size: str = Field(default="2048x2048", max_length=80)
+    ratio_mode: str = Field(default="1:1", max_length=40)
+    custom_ratio_width: Optional[int] = Field(default=None, ge=1, le=100)
+    custom_ratio_height: Optional[int] = Field(default=None, ge=1, le=100)
+    custom_size_width: Optional[int] = Field(default=None, ge=64, le=32768)
+    custom_size_height: Optional[int] = Field(default=None, ge=64, le=32768)
+    quality: str = Field(default="auto", max_length=40)
+    image_count: int = Field(default=4, ge=1, le=12)
+    copywriting: str = Field(default="required", max_length=40)
+    richness: str = Field(default="concise", max_length=40)
+    font_style: str = Field(default="auto", max_length=80)
+    output_language: str = Field(default="自动识别", max_length=30)
+    model_setting: str = Field(default="none", max_length=20)
+    model_pose: str = Field(default="normal", max_length=20)
+    model_usage: int = Field(default=0, ge=0, le=12)
+    product_name: str = Field(default="", max_length=160)
+    product_facts: str = Field(default="", max_length=6000)
+    selling_points: str = Field(default="", max_length=6000)
+    user_instruction: str = Field(default="", max_length=12000)
+    submission_id: Optional[str] = Field(default=None, max_length=80)
+    force_new: bool = False
+
+
+class MainImageAnalyzeRequest(BaseModel):
+    product_images: List[str] = Field(default_factory=list, min_length=1, max_length=6)
+    reference_images: List[str] = Field(default_factory=list, max_length=6)
+    llm_provider_id: str = Field(min_length=1, max_length=160)
+    llm_model: str = Field(min_length=1, max_length=400)
+    product_name: str = Field(default="", max_length=160)
+    product_facts: str = Field(default="", max_length=6000)
+    selling_points: str = Field(default="", max_length=6000)
+
+
+class MainImageRegenerateRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    generation_params: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MainImageScreenPatchRequest(BaseModel):
+    prompt: Optional[str] = Field(default=None, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    selected_candidate: Optional[int] = Field(default=None, ge=0)
+    generation_params: Optional[Dict[str, Any]] = None
+
+
+class MainImageTaskRenameRequest(BaseModel):
+    title: str = Field(default="", max_length=60)
+
+
+class MainImagePromptOptimizeRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=ONLINE_IMAGE_PROMPT_MAX_LENGTH)
+    instruction: str = Field(min_length=1, max_length=4000)
+
+
+class ImageGenerationTaskRequest(BaseModel):
+    mode_id: str = Field(min_length=1, max_length=160)
+    images: List[Dict[str, Any]] = Field(default_factory=list, max_length=6)
+    user_prompt: str = Field(default="", max_length=12000)
+    image_provider_id: str = Field(min_length=1, max_length=160)
+    image_model: str = Field(min_length=1, max_length=400)
+    ratio_mode: str = Field(default="fixed", max_length=20)
+    custom_ratio_width: str = Field(default="", max_length=16)
+    custom_ratio_height: str = Field(default="", max_length=16)
+    aspect_ratio: str = Field(default="1:1", max_length=40)
+    resolution: str = Field(default="2k", max_length=40)
+    size: str = Field(default="2048x2048", max_length=80)
+    image_count: int = Field(default=1, ge=1, le=6)
+    submission_id: str = Field(min_length=36, max_length=36)
+    force_new: bool = False
+    prompt_version_id: str = Field(default="", max_length=160)
+
+
+class ImageGenerationTaskRenameRequest(BaseModel):
+    name: str = Field(default="", max_length=80)
+
+
+class ImageGenerationCandidateRegenerateRequest(BaseModel):
+    confirm_cost: bool = False
+    submission_id: str = Field(min_length=36, max_length=36)
+
+
+class ImageGenerationCandidateDeleteItem(BaseModel):
+    task_id: str = Field(min_length=1, max_length=160)
+    candidate_id: str = Field(min_length=1, max_length=160)
+
+
+class ImageGenerationCandidateBatchDeleteRequest(BaseModel):
+    items: List[ImageGenerationCandidateDeleteItem] = Field(min_length=1, max_length=100)
+
+
+class MainImageScreenReorderRequest(BaseModel):
+    screen_order: List[int] = Field(min_length=1, max_length=12)
+
 class ConversationCreateRequest(BaseModel):
     title: str = "新对话"
 
@@ -3650,9 +4752,6 @@ class CanvasAssetDownloadRequest(BaseModel):
     items: List[Dict[str, Any]] = []
     filename: str = "canvas-output-images.zip"
 
-class CanvasAssetDeleteRequest(BaseModel):
-    urls: List[str] = []
-
 class CanvasWorkflowExportRequest(BaseModel):
     nodes: List[Dict[str, Any]] = []
     connections: List[Dict[str, Any]] = []
@@ -3666,6 +4765,9 @@ class BackupExportRequest(BaseModel):
     project_ids: List[str] = []
     canvas_ids: List[str] = []
     detail_page_task_ids: List[str] = []
+    main_image_task_ids: List[str] = []
+    image_generation_task_ids: List[str] = []
+    include_image_generation_modes: bool = False
     include_assets: bool = True
     include_logs: bool = False
     provider_ids: List[str] = []
@@ -4118,6 +5220,421 @@ def save_to_history(record):
         history.insert(0, record)
         with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
             json.dump(history[:5000], f, ensure_ascii=False, indent=4)
+
+
+def history_record_source_metadata(record: Dict[str, Any], metadata: Mapping[str, Any] | None) -> None:
+    """Attach an explicit producer marker to durable image history entries.
+
+    A one-click main-image group owns the history rows created while its
+    screens are rendered.  Keeping that ownership on the row lets group
+    deletion unlink only its own rows instead of guessing from shared input
+    images.  The helper intentionally accepts a mapping so the regular image
+    generation path remains unchanged when no metadata is supplied.
+    """
+    if not isinstance(record, dict) or not isinstance(metadata, Mapping):
+        return
+    for key in ("source_type", "source_task_id", "source_candidate_id", "source_screen_no"):
+        value = metadata.get(key)
+        if value is None or value == "":
+            continue
+        if key == "source_screen_no":
+            try:
+                record[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        else:
+            record[key] = str(value)[:160]
+
+
+def image_generation_history_record_media_paths(
+    record: Mapping[str, Any], *, outputs: bool
+) -> set[Path]:
+    """Collect legacy local paths from one image-generation history row."""
+    if not isinstance(record, Mapping):
+        return set()
+    roots = storage_cleanup_target_roots("generated" if outputs else "temporary-upload")
+    paths: set[Path] = set()
+    stack = [record]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple, set)):
+            stack.extend(current)
+        elif isinstance(current, str):
+            try:
+                candidates = storage_cleanup_paths_from_text(current)
+            except Exception:
+                candidates = set()
+            for candidate in candidates:
+                absolute = Path(os.path.abspath(candidate))
+                if any(storage_cleanup_path_within(absolute, root) for root in roots):
+                    paths.add(absolute)
+    return paths
+
+
+def image_generation_history_upstream_ids(candidate: Mapping[str, Any]) -> set[str]:
+    if not isinstance(candidate, Mapping):
+        return set()
+    values = [candidate.get("upstream_task_id")]
+    result = candidate.get("result") if isinstance(candidate.get("result"), Mapping) else {}
+    values.extend((result.get("task_id"), result.get("request_id")))
+    return {str(value) for value in values if str(value or "")}
+
+
+def image_generation_history_record_matches_task(
+    record: Mapping[str, Any], task: Mapping[str, Any], candidate_ids: set[str] | None = None
+) -> bool:
+    if not isinstance(record, Mapping) or not isinstance(task, Mapping):
+        return False
+    task_id = str(task.get("id") or "")
+    if not task_id:
+        return False
+    source_task_id = str(record.get("source_task_id") or "")
+    source_type = str(record.get("source_type") or "")
+    if source_type == "image-generation" and source_task_id == task_id:
+        source_candidate_id = str(record.get("source_candidate_id") or "")
+        return candidate_ids is None or not source_candidate_id or source_candidate_id in candidate_ids
+    if source_type or source_task_id:
+        return False
+    record_upstream = {
+        str(record.get(key) or "") for key in ("task_id", "request_id") if str(record.get(key) or "")
+    }
+    for candidate in task.get("candidates") or []:
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate_id = str(candidate.get("id") or "")
+        if candidate_ids is not None and candidate_id not in candidate_ids:
+            continue
+        if record_upstream & image_generation_history_upstream_ids(candidate):
+            return True
+    return False
+
+
+def delete_image_generation_history_rows_locked(
+    task_ids: Iterable[str],
+    selected_candidates: Mapping[str, Iterable[str]] | None = None,
+    tasks: Mapping[str, Mapping[str, Any]] | None = None,
+) -> int:
+    """Remove only explicitly-owned image-generation history rows.
+
+    Legacy online history rows without a source marker are intentionally left
+    alone.  They may belong to the independent online-image ledger and cannot
+    be safely assigned to a deleted Task-5 group after the fact.
+    """
+    task_id_set = {str(item) for item in task_ids if str(item)}
+    if not task_id_set:
+        return 0
+    selected = {
+        str(task_id): {str(candidate_id) for candidate_id in candidate_ids if str(candidate_id)}
+        for task_id, candidate_ids in (selected_candidates or {}).items()
+    }
+    with HISTORY_LOCK:
+        history = history_read_records_strict_locked()
+        if not history:
+            return 0
+        retained: list[Dict[str, Any]] = []
+        removed = 0
+        for record in history:
+            owned = (
+                isinstance(record, Mapping)
+                and any(
+                    image_generation_history_record_matches_task(
+                        record,
+                        (tasks or {}).get(task_id, {"id": task_id}),
+                        selected.get(task_id),
+                    )
+                    for task_id in task_id_set
+                )
+            )
+            if owned:
+                removed += 1
+                continue
+            retained.append(record)
+        if removed:
+            history_write_records_locked(retained)
+        return removed
+
+
+def history_read_records_locked() -> list[Dict[str, Any]]:
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def history_write_records_locked(records: list[Dict[str, Any]]) -> None:
+    history_dir = os.path.dirname(os.path.abspath(HISTORY_FILE))
+    os.makedirs(history_dir, exist_ok=True)
+    temporary = f"{HISTORY_FILE}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(records[:5000], handle, ensure_ascii=False, indent=4)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, HISTORY_FILE)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+
+
+def history_match_identity(record: Mapping[str, Any], reference: Mapping[str, Any]) -> bool:
+    """Match a just-saved result without relying on timestamps."""
+    record_images = {
+        str(value)
+        for value in (record.get("images") or [])
+        if isinstance(value, str) and value
+    }
+    reference_images = {
+        str(value)
+        for value in (reference.get("images") or [])
+        if isinstance(value, str) and value
+    }
+    if record_images and reference_images and record_images == reference_images:
+        return True
+    record_task_id = str(record.get("task_id") or "")
+    reference_task_id = str(reference.get("task_id") or "")
+    return bool(record_task_id and reference_task_id and record_task_id == reference_task_id)
+
+
+def annotate_history_record(reference: Mapping[str, Any], metadata: Mapping[str, Any]) -> bool:
+    """Annotate an already-saved result with its owning task metadata."""
+    if not isinstance(reference, Mapping) or not isinstance(metadata, Mapping):
+        return False
+    with HISTORY_LOCK:
+        history = history_read_records_locked()
+        for item in history:
+            if not isinstance(item, dict) or not history_match_identity(item, reference):
+                continue
+            history_record_source_metadata(item, metadata)
+            history_write_records_locked(history)
+            return True
+    return False
+
+
+def one_click_task_snapshot_by_type(task_id: str, task_type: str):
+    return (
+        detail_page_task_snapshot(task_id)
+        if str(task_type or "") == "detail-page"
+        else main_image_task_snapshot(task_id)
+    )
+
+
+def queue_one_click_late_result_cleanup(
+    task_id: str,
+    task_type: str,
+    reference: Mapping[str, Any],
+) -> None:
+    late_task = {
+        "id": str(task_id),
+        "type": str(task_type),
+        "settings": {},
+        "screens": [{"candidates": [{"result": dict(reference)}]}],
+    }
+    media_paths = one_click_task_output_media_paths(late_task)
+    if not media_paths:
+        return
+    one_click_cleanup_create_job(late_task, media_paths)
+    event = ONE_CLICK_CLEANUP_WAKE_EVENT
+    if event is not None:
+        event.set()
+
+
+def save_history_record_with_metadata(
+    record: Dict[str, Any],
+    metadata: Mapping[str, Any] | None,
+) -> None:
+    """Save generic history, guarding one-click ownership atomically."""
+    source_type = str((metadata or {}).get("source_type") or "") if isinstance(metadata, Mapping) else ""
+    task_id = str((metadata or {}).get("source_task_id") or "") if isinstance(metadata, Mapping) else ""
+    if source_type == "image-generation" and task_id:
+        # Task-5 owns its generated history rows.  The ownership check closes
+        # the race where a provider result finishes while the task is being
+        # deleted; an unowned late row is never written to the global ledger.
+        with IMAGE_GENERATION_TASK_LOCK:
+            latest = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+            candidate_id = str((metadata or {}).get("source_candidate_id") or "")
+            candidate = image_generation_get_candidate(latest, candidate_id) if latest and candidate_id else None
+            candidate_exists = bool(
+                latest
+                and (
+                    not candidate_id
+                    or candidate is not None
+                )
+            )
+            if (
+                not latest
+                or latest.get("deleting")
+                or not candidate_exists
+                or (candidate is not None and str(candidate.get("status") or "") == "cancelled")
+            ):
+                return
+            history_record_source_metadata(record, metadata)
+            save_to_history(record)
+        return
+    if source_type not in {"main-image", "detail-page"} or not task_id:
+        history_record_source_metadata(record, metadata)
+        save_to_history(record)
+        return
+    with ONE_CLICK_RECORD_MUTATION_LOCK:
+        latest = one_click_task_snapshot_by_type(task_id, source_type)
+        if not latest or latest.get("cancel_requested"):
+            queue_one_click_late_result_cleanup(task_id, source_type, record)
+            raise asyncio.CancelledError()
+        history_record_source_metadata(record, metadata)
+        save_to_history(record)
+
+
+def annotate_one_click_history_record(
+    task_id: str,
+    task_type: str,
+    reference: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> bool:
+    """Annotate only while the owning one-click group still exists.
+
+    If the group was deleted while an async provider call was in flight, the
+    common image builder may have saved a result row immediately before it
+    returned.  Remove that newly-created, explicitly-owned row while holding
+    the same mutation lock used by group deletion, then stop the late task.
+    """
+    expected_type = str(task_type or "")
+    if expected_type not in {"main-image", "detail-page"}:
+        raise ValueError("无效的一键任务类型")
+    with ONE_CLICK_RECORD_MUTATION_LOCK:
+        latest = one_click_task_snapshot_by_type(task_id, expected_type)
+        if not latest or latest.get("cancel_requested"):
+            # The one-click calls pass source metadata into the common image
+            # builder, so a late history row can be removed by task id without
+            # guessing from shared image URLs.
+            try:
+                with HISTORY_LOCK:
+                    history = history_read_records_strict_locked()
+                    retained = [
+                        item for item in history
+                        if not (
+                            isinstance(item, Mapping)
+                            and str(item.get("source_task_id") or "") == str(task_id)
+                            and (
+                                not item.get("source_type")
+                                or str(item.get("source_type")) == expected_type
+                            )
+                        )
+                    ]
+                    if len(retained) != len(history):
+                        history_write_records_locked(retained)
+            except ValueError:
+                # A damaged history file already fails closed elsewhere; do
+                # not turn a cancelled late task into a new write attempt.
+                pass
+            queue_one_click_late_result_cleanup(task_id, expected_type, reference)
+            raise asyncio.CancelledError()
+        return annotate_history_record(reference, metadata)
+
+
+def main_image_history_identity_sets(task: Mapping[str, Any]) -> tuple[set[str], set[str]]:
+    upstream_ids: set[str] = set()
+    output_images: set[str] = set()
+    if not isinstance(task, Mapping):
+        return upstream_ids, output_images
+    for screen in task.get("screens") or []:
+        if not isinstance(screen, Mapping):
+            continue
+        candidates = screen.get("candidates") if isinstance(screen.get("candidates"), list) else []
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            for value in (candidate.get("upstream_task_id"),):
+                if value:
+                    upstream_ids.add(str(value))
+            result = candidate.get("result") if isinstance(candidate.get("result"), Mapping) else {}
+            for value in (result.get("task_id"), result.get("request_id")):
+                if value:
+                    upstream_ids.add(str(value))
+            for value in [
+                candidate.get("image_url"),
+                *(result.get("images") or []),
+                result.get("image_url"),
+            ]:
+                if isinstance(value, str) and value:
+                    output_images.add(value)
+        result = screen.get("result") if isinstance(screen.get("result"), Mapping) else {}
+        for value in (result.get("task_id"), result.get("request_id")):
+            if value:
+                upstream_ids.add(str(value))
+        for value in (result.get("images") or []):
+            if isinstance(value, str) and value:
+                output_images.add(value)
+    return upstream_ids, output_images
+
+
+def unlink_main_image_history(task: Mapping[str, Any]) -> int:
+    """Unlink a deleted group from global history without hiding its results.
+
+    Generated result rows remain visible in the gallery.  Only the deleted
+    group's input-image references are removed from matching rows, allowing
+    storage cleanup to reclaim uploads once no other task, draft, favorite or
+    case still references them.
+    """
+    task_id = str(task.get("id") or "") if isinstance(task, Mapping) else ""
+    upstream_ids, output_images = main_image_history_identity_sets(task)
+    input_urls = main_image_task_input_urls(task)
+    if not task_id and not upstream_ids and not output_images:
+        return 0
+    changed_rows = 0
+    with HISTORY_LOCK:
+        history = history_read_records_locked()
+        if not history:
+            return 0
+        changed = False
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            source_type = str(item.get("source_type") or "")
+            source_task_id = str(item.get("source_task_id") or "")
+            item_images = {
+                str(value)
+                for value in (item.get("images") or [])
+                if isinstance(value, str) and value
+            }
+            owns_row = source_type == "main-image" and source_task_id == task_id
+            if not owns_row and item_images and output_images:
+                owns_row = bool(item_images & output_images)
+            if not owns_row:
+                item_task_id = str(item.get("task_id") or "")
+                owns_row = bool(
+                    item_task_id
+                    and item_task_id in upstream_ids
+                    and (not output_images or bool(item_images & output_images))
+                )
+            if owns_row:
+                params = item.get("params") if isinstance(item.get("params"), dict) else None
+                refs = params.get("reference_images") if params and isinstance(params.get("reference_images"), list) else None
+                if refs is not None:
+                    filtered = [
+                        ref for ref in refs
+                        if not (
+                            isinstance(ref, dict)
+                            and str(ref.get("url") or "") in input_urls
+                        )
+                    ]
+                    if len(filtered) != len(refs):
+                        params["reference_images"] = filtered
+                        item.pop("source_type", None)
+                        item.pop("source_task_id", None)
+                        item.pop("source_screen_no", None)
+                        changed = True
+                        changed_rows += 1
+        if changed:
+            history_write_records_locked(history)
+    return changed_rows
 
 def get_comfy_history(comfy_address, prompt_id):
     try:
@@ -4642,6 +6159,296 @@ def extract_canvas_assets(canvas):
             items.append(item)
     return items
 
+
+def _canvas_asset_local_path(url):
+    """Resolve a canvas-derived URL to an existing local file, if possible."""
+    candidates = set()
+    try:
+        candidates.update(storage_cleanup_paths_from_text(url))
+    except Exception:
+        candidates = set()
+    resolved = output_file_from_url(url)
+    if resolved:
+        candidates.add(Path(resolved))
+    for candidate in candidates:
+        try:
+            raw_path = Path(candidate)
+            if raw_path.is_symlink():
+                continue
+            path = raw_path.resolve()
+        except OSError:
+            continue
+        if path.is_file():
+            return path
+    return None
+
+
+def _canvas_asset_value_has_task_marker(value):
+    """Return whether a persisted record contains an explicit canvas task id."""
+    if isinstance(value, Mapping):
+        if str(value.get("canvas_task_id") or "").strip():
+            return True
+        return any(_canvas_asset_value_has_task_marker(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_canvas_asset_value_has_task_marker(item) for item in value)
+    return False
+
+
+def _canvas_asset_explicit_source(value):
+    """Whether a history record is explicit evidence of canvas provenance."""
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        str(value.get("source_type") or "").strip() == "canvas-online-image"
+        or _canvas_asset_value_has_task_marker(value)
+    )
+
+
+def _canvas_asset_collect_candidates(candidates, value, *, source, canvas=None, path=""):
+    """Collect file-backed assets from an explicit canvas audit source."""
+    record = canvas_record(canvas) if isinstance(canvas, Mapping) else {}
+    source_canvas_id = str(record.get("id") or "")
+    source_title = str(record.get("title") or "")
+    for field_path, raw, url in iter_canvas_asset_values(value, path):
+        local_path = _canvas_asset_local_path(url)
+        if local_path is None:
+            continue
+        path_key = storage_cleanup_path_key(local_path)
+        item = candidates.setdefault(
+            path_key,
+            {
+                "url": url,
+                "raw": raw,
+                "source": source,
+                "source_path": field_path,
+                "canvas_ids": set(),
+                "canvas_titles": set(),
+                "created_at": 0,
+            },
+        )
+        if source_canvas_id:
+            item["canvas_ids"].add(source_canvas_id)
+        if source_title:
+            item["canvas_titles"].add(source_title)
+        if isinstance(value, Mapping):
+            raw_time = value.get("created_at") or value.get("updated_at") or 0
+            try:
+                timestamp = int(raw_time)
+            except (TypeError, ValueError):
+                timestamp = 0
+            item["created_at"] = max(int(item.get("created_at") or 0), timestamp)
+
+
+def _canvas_asset_log_output_paths(canvas_payloads):
+    """Return path keys for outputs recorded by any persisted canvas log.
+
+    Older canvas logs predate the explicit ``source_type`` metadata written to
+    history rows.  Their generated outputs are still authoritative canvas
+    provenance, so an unmarked legacy history row for the same output must not
+    turn the canvas asset into a false shared reference.  References used as
+    inputs remain outside this set and continue to protect shared files.
+    """
+    output_paths = set()
+    for canvas in canvas_payloads or []:
+        if not isinstance(canvas, Mapping):
+            continue
+        logs = canvas.get("logs") if isinstance(canvas.get("logs"), list) else []
+        for log in logs:
+            if not isinstance(log, Mapping):
+                continue
+            outputs = log.get("outputs")
+            if outputs is None:
+                continue
+            for _field_path, _raw, url in iter_canvas_asset_values(outputs, "outputs"):
+                try:
+                    output_paths.update(
+                        storage_cleanup_path_key(path)
+                        for path in storage_cleanup_paths_from_text(url)
+                    )
+                except Exception:
+                    continue
+    return output_paths
+
+
+def _canvas_asset_history_output_paths(record):
+    """Return only output paths from one history record.
+
+    History records also contain ``params.reference_images``.  Those inputs
+    can be shared with another feature and must not be released merely because
+    an output with the same record appears in a canvas log.
+    """
+    if not isinstance(record, Mapping):
+        return set()
+    output_paths = set()
+    for key in ("images", "image_items", "outputs"):
+        value = record.get(key)
+        if value is None:
+            continue
+        for _field_path, _raw, url in iter_canvas_asset_values(value, key):
+            try:
+                output_paths.update(
+                    storage_cleanup_path_key(path)
+                    for path in storage_cleanup_paths_from_text(url)
+                )
+            except Exception:
+                continue
+    return output_paths
+
+
+def canvas_asset_external_reference_paths(canvas_log_output_paths=None):
+    """Collect non-canvas references that keep an explicit canvas asset in use."""
+    referenced = set()
+    canvas_log_output_paths = set(canvas_log_output_paths or ())
+    history_key = storage_cleanup_path_key(HISTORY_FILE)
+    canvas_root = Path(os.path.abspath(CANVAS_DIR))
+    for path in storage_cleanup_reference_files():
+        absolute = Path(os.path.abspath(path))
+        if storage_cleanup_path_key(path) == history_key:
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            records = raw if isinstance(raw, list) else []
+            for record in records:
+                if not _canvas_asset_explicit_source(record):
+                    record_references = set()
+                    storage_cleanup_collect_references(record, record_references)
+                    if canvas_log_output_paths:
+                        record_references.difference_update(
+                            canvas_log_output_paths.intersection(
+                                _canvas_asset_history_output_paths(record)
+                            )
+                        )
+                    referenced.update(record_references)
+            continue
+        if storage_cleanup_path_within(absolute, canvas_root):
+            # Current canvas nodes are represented by the regular canvas list;
+            # logs remain audit-only candidates and must not be treated as an
+            # unrelated module reference.
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        storage_cleanup_collect_references(raw, referenced)
+
+    with IMAGE_GENERATION_TASK_LOCK:
+        image_generation_tasks = copy.deepcopy(IMAGE_GENERATION_RUNTIME_TASKS)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        runninghub_operations = copy.deepcopy(ONLINE_RUNNINGHUB_OPERATIONS)
+    with QUEUE_LOCK:
+        queued_operations = copy.deepcopy(QUEUE)
+    storage_cleanup_collect_references(image_generation_tasks, referenced)
+    storage_cleanup_collect_references(runninghub_operations, referenced)
+    storage_cleanup_collect_references(queued_operations, referenced)
+    with CANVAS_TASK_LOCK:
+        canvas_tasks = copy.deepcopy(CANVAS_TASKS)
+    storage_cleanup_collect_canvas_task_references(canvas_tasks, referenced)
+    preset_path = Path(STATIC_DIR) / "data" / "image-generation-presets.v1.json"
+    if preset_path.is_file():
+        try:
+            preset = json.loads(preset_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            preset = None
+        if preset is not None:
+            storage_cleanup_collect_references(preset, referenced)
+    return referenced
+
+
+def canvas_orphan_assets_index(all_canvas_items=None, canvas_payloads=None):
+    """Build read-only orphan assets from explicit canvas provenance only."""
+    if all_canvas_items is None or canvas_payloads is None:
+        all_canvas_items = []
+        canvas_payloads = []
+        if os.path.isdir(CANVAS_DIR):
+            for filename in os.listdir(CANVAS_DIR):
+                if not filename.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(CANVAS_DIR, filename), "r", encoding="utf-8") as handle:
+                        canvas = json.load(handle)
+                except Exception:
+                    continue
+                canvas_payloads.append(canvas)
+                all_canvas_items.extend(extract_canvas_assets(canvas))
+    candidates = {}
+    for canvas in canvas_payloads:
+        logs = canvas.get("logs") if isinstance(canvas.get("logs"), list) else []
+        for index, log in enumerate(logs):
+            _canvas_asset_collect_candidates(
+                candidates,
+                log,
+                source="canvas-log",
+                canvas=canvas,
+                path=f"logs[{index}]",
+            )
+
+    history_path = Path(HISTORY_FILE)
+    if history_path.exists():
+        try:
+            history = json.loads(history_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            history = []
+        if isinstance(history, list):
+            for index, record in enumerate(history):
+                if not _canvas_asset_explicit_source(record):
+                    continue
+                _canvas_asset_collect_candidates(
+                    candidates,
+                    record,
+                    source="canvas-history",
+                    path=f"history[{index}]",
+                )
+
+    current_paths = set()
+    for item in all_canvas_items:
+        current_paths.update(
+            storage_cleanup_path_key(path)
+            for path in storage_cleanup_paths_from_text(str(item.get("url") or ""))
+        )
+    external_paths = canvas_asset_external_reference_paths(
+        _canvas_asset_log_output_paths(canvas_payloads)
+    )
+    orphan_items = []
+    for path_key, candidate in candidates.items():
+        if path_key in current_paths or path_key in external_paths:
+            continue
+        local_path = Path(path_key)
+        if not local_path.is_file():
+            continue
+        url = str(candidate.get("url") or "")
+        raw = candidate.get("raw")
+        kind = canvas_asset_kind(raw, url)
+        if kind not in {"image", "video", "audio", "text"}:
+            continue
+        fallback = f"孤立素材-{len(orphan_items) + 1}"
+        orphan_items.append(
+            {
+                "id": hashlib.sha1(f"canvas-orphan:{path_key}".encode("utf-8")).hexdigest()[:24],
+                "url": url,
+                "name": canvas_asset_name(raw, url, fallback),
+                "kind": kind,
+                "canvas_id": "",
+                "canvas_title": "未属于当前画布",
+                "canvas_kind": "orphan",
+                "canvas_icon": "archive",
+                "canvas_owner": "",
+                "canvas_color": "",
+                "canvas_created_at": 0,
+                "canvas_updated_at": 0,
+                "node_id": "",
+                "node_title": "未属于当前画布",
+                "node_type": "",
+                "source_path": candidate.get("source_path") or candidate.get("source") or "",
+                "source_type": candidate.get("source") or "canvas-history",
+                "source_canvas_ids": sorted(candidate.get("canvas_ids") or set()),
+                "source_canvas_titles": sorted(candidate.get("canvas_titles") or set()),
+                "created_at": int(candidate.get("created_at") or 0),
+            }
+        )
+    orphan_items.sort(key=lambda item: (int(item.get("created_at") or 0), str(item.get("name") or "")), reverse=True)
+    return orphan_items
+
 def normalize_canvas_cover_mode(value):
     return "custom" if str(value or "").strip().lower() == "custom" else "auto"
 
@@ -4726,6 +6533,7 @@ def remove_canvas_uploaded_cover(canvas):
 def canvas_assets_index():
     canvases = []
     items = []
+    canvas_payloads = []
     canvas_counts = {"all": 0, "smart": 0, "classic": 0}
     item_counts = {"all": 0, "smart": 0, "classic": 0}
     cleanup_expired_canvas_trash()
@@ -4739,6 +6547,7 @@ def canvas_assets_index():
             continue
         # 回收站中的画布仍然保留着原始引用；在彻底清理画布记录前，
         # 也要保护这些素材，避免用户恢复画布时出现断图。
+        canvas_payloads.append(canvas)
         record = canvas_record(canvas)
         canvas_items = extract_canvas_assets(canvas)
         record["asset_count"] = len(canvas_items)
@@ -4751,75 +6560,111 @@ def canvas_assets_index():
         item_counts[kind] = item_counts.get(kind, 0) + len(canvas_items)
     canvases.sort(key=lambda item: (0 if item.get("pinned") else 1, -int(item.get("updated_at") or item.get("created_at") or 0)))
     items.sort(key=lambda item: int(item.get("canvas_updated_at") or item.get("created_at") or 0), reverse=True)
+    orphan_items = canvas_orphan_assets_index(items, canvas_payloads)
     categories = [
         {"id": "all", "name": "全部画布", "count": item_counts.get("all", 0), "canvas_count": canvas_counts.get("all", 0)},
         {"id": "smart", "name": "智能画布", "count": item_counts.get("smart", 0), "canvas_count": canvas_counts.get("smart", 0)},
         {"id": "classic", "name": "普通画布", "count": item_counts.get("classic", 0), "canvas_count": canvas_counts.get("classic", 0)},
+        {"id": "orphan", "name": "孤立素材", "count": len(orphan_items), "canvas_count": 0},
     ]
-    return {"categories": categories, "canvases": canvases, "items": items}
+    return {
+        "categories": categories,
+        "canvases": canvases,
+        "items": items,
+        "orphan_items": orphan_items,
+    }
 
-def canvas_orphan_assets_index():
-    """列出本地媒体中未被任何画布（含回收站）引用的文件；只读，不自动删除。"""
-    referenced = set()
-    for filename in os.listdir(CANVAS_DIR):
-        if not filename.endswith(".json"):
-            continue
+
+_CANVAS_ASSET_INDEX_CACHE = {"signature": None, "value": None}
+_CANVAS_ASSET_INDEX_CACHE_LOCK = RLock()
+
+
+def invalidate_canvas_assets_index_cache():
+    with _CANVAS_ASSET_INDEX_CACHE_LOCK:
+        _CANVAS_ASSET_INDEX_CACHE["signature"] = None
+        _CANVAS_ASSET_INDEX_CACHE["value"] = None
+
+
+def _canvas_asset_runtime_map_active(value):
+    active_statuses = {
+        "queued",
+        "pending",
+        "submitting",
+        "generating",
+        "running",
+        "recovering",
+    }
+    records = value.values() if isinstance(value, Mapping) else value
+    for record in records or []:
+        if not isinstance(record, Mapping):
+            return True
+        status = str(record.get("status") or record.get("state") or "").strip().lower()
+        if status in active_statuses or (not status and record.get("task_id")):
+            return True
+    return False
+
+
+def _canvas_asset_dynamic_sources_active():
+    """Do not reuse an index while volatile runtime references are changing."""
+    try:
+        with CANVAS_TASK_LOCK:
+            if _canvas_asset_runtime_map_active(CANVAS_TASKS):
+                return True
+        with IMAGE_GENERATION_TASK_LOCK:
+            if _canvas_asset_runtime_map_active(IMAGE_GENERATION_RUNTIME_TASKS):
+                return True
+        with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+            if _canvas_asset_runtime_map_active(ONLINE_RUNNINGHUB_OPERATIONS):
+                return True
+        with QUEUE_LOCK:
+            return bool(QUEUE)
+    except (NameError, RuntimeError):
+        return True
+
+
+def _canvas_assets_index_signature():
+    """Return a cheap signature for every persisted input to the asset index."""
+    if _canvas_asset_dynamic_sources_active():
+        return None
+    try:
+        reference_files = storage_cleanup_reference_files()
+    except Exception:
+        # A scan error must not make a prior cache look current.
+        return None
+    paths = set(reference_files)
+    canvas_root = Path(CANVAS_DIR)
+    if canvas_root.exists():
+        paths.update(canvas_root.glob("*.json"))
+    entries = []
+    for path in sorted(paths, key=lambda item: storage_cleanup_path_key(item)):
         try:
-            with open(os.path.join(CANVAS_DIR, filename), "r", encoding="utf-8") as handle:
-                canvas = json.load(handle)
-        except Exception:
-            continue
-        # 回收站中的画布仍然保留着原始引用；在彻底清理画布记录前，
-        # 也要保护这些素材，避免用户恢复画布时出现断图。
-        for _field, _raw, url in iter_canvas_asset_values(canvas.get("nodes") or []):
-            if url:
-                path = output_file_from_url(url)
-                if path:
-                    referenced.add(os.path.abspath(path))
-    roots = [
-        ("generated", OUTPUT_OUTPUT_DIR),
-        ("output", OUTPUT_DIR),
-        ("input", OUTPUT_INPUT_DIR),
-    ]
-    items = []
-    seen = set()
-    for kind, root in roots:
-        if not os.path.isdir(root):
-            continue
-        for current, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for name in files:
-                if name.startswith("."):
-                    continue
-                path = os.path.abspath(os.path.join(current, name))
-                if path in referenced or path in seen:
-                    continue
-                media_kind = asset_library_media_kind(path)
-                if media_kind not in {"image", "video", "audio"}:
-                    continue
-                seen.add(path)
-                rel = os.path.relpath(path, root).replace("\\", "/")
-                if kind == "output":
-                    url = f"/output/{rel}"
-                elif kind == "generated":
-                    url = f"/assets/output/{rel}"
-                else:
-                    url = f"/assets/input/{rel}"
-                try:
-                    stat = os.stat(path)
-                except OSError:
-                    continue
-                items.append({
-                    "id": hashlib.sha1(path.encode("utf-8")).hexdigest()[:24],
-                    "url": url,
-                    "path": path,
-                    "name": name,
-                    "kind": media_kind,
-                    "size": stat.st_size,
-                    "created_at": int(stat.st_mtime * 1000),
-                })
-    items.sort(key=lambda item: int(item.get("created_at") or 0), reverse=True)
-    return items
+            stat_result = path.stat()
+            entries.append(
+                (
+                    storage_cleanup_path_key(path),
+                    int(stat_result.st_mtime_ns),
+                    int(stat_result.st_size),
+                )
+            )
+        except OSError:
+            entries.append((storage_cleanup_path_key(path), None, None))
+    return tuple(entries)
+
+
+def canvas_assets_index_cached():
+    """Reuse an unchanged index for the immediate delete-after-list flow."""
+    signature = _canvas_assets_index_signature()
+    if signature is not None:
+        with _CANVAS_ASSET_INDEX_CACHE_LOCK:
+            cached = _CANVAS_ASSET_INDEX_CACHE
+            if cached.get("signature") == signature and cached.get("value") is not None:
+                return copy.deepcopy(cached["value"])
+    value = canvas_assets_index()
+    if signature is not None:
+        with _CANVAS_ASSET_INDEX_CACHE_LOCK:
+            _CANVAS_ASSET_INDEX_CACHE["signature"] = signature
+            _CANVAS_ASSET_INDEX_CACHE["value"] = copy.deepcopy(value)
+    return value
 
 def display_title(text):
     title = re.sub(r"\s+", " ", text or "").strip()
@@ -5479,7 +7324,16 @@ RESPONSES_REJECT_STATUSES = {400, 404, 405, 415, 422}
 RESPONSES_POLL_INTERVAL = 5.0
 RESPONSES_POLL_MAX_SECONDS = 1500.0
 
-async def post_openai_responses(client, url, headers, body):
+async def post_openai_responses(
+    client,
+    url,
+    headers,
+    body,
+    *,
+    async_task_observer=None,
+    provider=None,
+    single_shot=False,
+):
     """RS / Responses 请求。图片编辑经常超过 120 秒，非流式请求会被中转前面的
     Cloudflare 读超时掐断（Error 524）。策略按可靠性排序：
     1) background:true 后台任务 + 轮询 GET /v1/responses/{id}（每个请求都秒回，彻底绕开超时）；
@@ -5491,9 +7345,13 @@ async def post_openai_responses(client, url, headers, body):
     try:
         resp = await client.post(url, headers=headers, json=bg_body)
     except httpx.HTTPError as e:
+        if single_shot:
+            raise
         print(f"RS background 请求传输失败，改走流式：{e}")
         return await post_openai_responses_stream(client, url, headers, body)
     if resp.status_code in RESPONSES_REJECT_STATUSES:
+        if single_shot:
+            return resp
         print(f"RS background 模式被拒（{resp.status_code}），改走流式：{resp.text[:200]}")
         return await post_openai_responses_stream(client, url, headers, body)
     if resp.status_code >= 400:
@@ -5512,35 +7370,35 @@ async def post_openai_responses(client, url, headers, body):
     rid = str((data or {}).get("id") or "").strip()
     if status not in {"queued", "in_progress", "processing", "pending", "running"} or not rid:
         return resp  # 中转忽略 background 直接同步返回了结果（或未知结构），交给下游解析
-    # 轮询后台任务
-    retrieve_url = f"{url.rstrip('/')}/{urllib.parse.quote(rid)}"
-    deadline = time.monotonic() + RESPONSES_POLL_MAX_SECONDS
-    transient_failures = 0
-    while time.monotonic() < deadline:
-        await asyncio.sleep(RESPONSES_POLL_INTERVAL)
-        try:
-            poll = await client.get(retrieve_url, headers=headers)
-        except httpx.HTTPError as e:
-            transient_failures += 1
-            if transient_failures > 5:
-                return _responses_wrap(url, 502, {"error": {"message": f"RS 后台任务轮询连续失败：{e}（任务 id={rid}）"}})
-            continue
-        if poll.status_code >= 400:
-            transient_failures += 1
-            if transient_failures > 5:
-                return _responses_wrap(url, 502, {"error": {"message": f"RS 后台任务轮询失败（{poll.status_code}）：{poll.text[:200]}（任务 id={rid}）"}})
-            continue
-        transient_failures = 0
-        try:
-            data = poll.json()
-        except ValueError:
-            continue
-        status = str((data or {}).get("status") or "").lower()
-        if status == "completed":
-            return _responses_wrap(url, 200, data)
-        if status in {"failed", "cancelled", "incomplete"}:
-            return _responses_wrap(url, 502, data)
-    return _responses_wrap(url, 502, {"error": {"message": f"RS 后台任务超过 {int(RESPONSES_POLL_MAX_SECONDS)}s 仍未完成（任务 id={rid}）"}})
+    # For Task 5 this awaited callback is the durability barrier: no GET may
+    # run until the upstream response ID and its saved query strategy are on
+    # disk. Legacy callers have no observer and retain their prior behaviour.
+    await notify_async_image_task_observer(async_task_observer, "submitted", {
+        "task_id": rid,
+        "provider": copy.deepcopy(provider or {}),
+        "submitted_at": time.time(),
+    })
+    query_provider = copy.deepcopy(provider) if isinstance(provider, dict) else {
+        "id": "",
+        "base_url": url.rsplit("/", 1)[0],
+    }
+    # Legacy Responses callers do not carry Task 5's durable strategy. Their
+    # retrieve endpoint is nevertheless always the submitted Responses URL +
+    # ID, not the generic /images/tasks route.
+    if str(query_provider.get("_task5_query_strategy") or "") != "openai-responses":
+        query_provider["image_task_endpoint"] = f"{url.rstrip('/')}/{{task_id}}"
+    try:
+        data = await wait_for_detail_page_image_task(
+            client,
+            rid,
+            query_provider,
+            async_task_observer,
+            timeout=RESPONSES_POLL_MAX_SECONDS,
+        )
+    except HTTPException as exc:
+        setattr(exc, "upstream_task_id", rid)
+        raise
+    return _responses_wrap(url, 200, data)
 
 async def post_openai_responses_stream(client, url, headers, body):
     """RS / Responses 的 SSE 流式请求：流式从一开始就持续有事件字节返回，
@@ -5675,7 +7533,7 @@ def normalize_model_protocols(value):
 IMAGE_PARAMETER_STRATEGY_OPTIONS = {"auto", "gpt-image", "banana", "legacy"}
 BANANA_ASPECT_RATIOS = (
     "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1",
-    "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9",
+    "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9", "9:21",
 )
 
 def normalize_model_image_strategies(value):
@@ -5971,7 +7829,10 @@ async def tudou_async_reference_images(reference_images):
             images.append(tudou_png_or_jpeg_data_url(data_url))
     return images
 
-async def generate_tudou_async_image(prompt, size, quality, model, reference_images, provider, aspect_ratio="", resolution=""):
+async def generate_tudou_async_image(
+    prompt, size, quality, model, reference_images, provider,
+    aspect_ratio="", resolution="", async_task_observer=None,
+):
     """Tudou's GPT-Image-2 async route, isolated from generic OpenAI image calls."""
     base_url = str((provider or {}).get("base_url") or "").strip().rstrip("/")
     if not base_url:
@@ -5997,8 +7858,17 @@ async def generate_tudou_async_image(prompt, size, quality, model, reference_ima
                 return extract_image(raw), raw
             except HTTPException as exc:
                 raise HTTPException(status_code=502, detail=f"土豆异步生图未返回 task_id：{str(raw)[:500]}") from exc
-        result = await wait_for_image_task(client, task_id, provider)
-        return extract_image(result), result
+        await notify_async_image_task_observer(async_task_observer, "submitted", {
+            "task_id": task_id,
+            "provider": image_generation_provider_snapshot(provider, model),
+            "submitted_at": time.time(),
+        })
+        try:
+            result = await wait_for_image_task(client, task_id, provider)
+            return extract_image(result), result
+        except Exception as exc:
+            setattr(exc, "upstream_task_id", task_id)
+            raise
 
 def is_tudou_grok_image_model(model):
     return str(model or "").strip().lower().startswith("grok-imagine-image")
@@ -6104,9 +7974,9 @@ async def run_codex_cli(prompt, model="", image_paths=None, timeout=None, output
         raise HTTPException(status_code=502, detail=f"OpenAI Codex CLI 调用失败：{message[:1200]}")
     return {"text": last_text or out_text, "_stdout": out_text, "_stderr": err_text}
 
-def codex_output_image_files(since_time=0):
+def codex_output_image_files(since_time=0, root=None):
     exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-    root = os.path.abspath(OUTPUT_OUTPUT_DIR)
+    root = os.path.abspath(root or OUTPUT_OUTPUT_DIR)
     files = []
     try:
         for name in os.listdir(root):
@@ -6425,8 +8295,11 @@ async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, mode
     if tool_provider == "codex" and fallback_api_key:
         attempts.append((["--provider", "openai", "--api-key", fallback_api_key], "openai"))
     last_message = ""
+    canonical_image_mode = IMAGE_GENERATION_PERSIST_MODE.get() == "image_generation_media"
     for attempt_index, (attempt_provider_args, attempt_provider) in enumerate(attempts):
-        out_path = os.path.join(OUTPUT_OUTPUT_DIR, f"gpt_image_2_{uuid.uuid4().hex}.png")
+        temporary_output_dir = tempfile.mkdtemp(prefix="image_generation_codex_") if canonical_image_mode else ""
+        output_root = temporary_output_dir or OUTPUT_OUTPUT_DIR
+        out_path = os.path.join(output_root, f"gpt_image_2_{uuid.uuid4().hex}.png")
         mode = "edit" if ref_paths else "generate"
         args = [
             exe,
@@ -6486,11 +8359,21 @@ async def generate_codex_provider_image_via_gpt_image_2_skill(prompt, size, mode
             candidate_paths.append(out_path)
         candidate_paths.extend([path for path in reported_paths if path and os.path.isfile(path)])
         urls = []
-        for path in candidate_paths:
-            processed_path = codex_postprocess_image_to_requested_size(path, size, attempt_provider)
-            url = codex_output_url_from_path(processed_path or path)
-            if url:
-                urls.append(url)
+        try:
+            for path in candidate_paths:
+                processed_path = codex_postprocess_image_to_requested_size(path, size, attempt_provider)
+                selected_path = processed_path or path
+                if canonical_image_mode:
+                    media = await save_ai_image_to_media({"type": "path", "value": selected_path})
+                    if media["url"] not in urls:
+                        urls.append(media["url"])
+                else:
+                    url = codex_output_url_from_path(selected_path)
+                    if url:
+                        urls.append(url)
+        finally:
+            if temporary_output_dir:
+                shutil.rmtree(temporary_output_dir, ignore_errors=True)
         if not urls:
             status_text = (out_text or err_text or "")[:1200]
             raise HTTPException(status_code=502, detail=f"GPT Image 2 Skill 已返回，但没有在输出目录发现图片：{status_text}")
@@ -6839,6 +8722,11 @@ def gemini_cli_image_size_instruction(size="", model=""):
 async def generate_gemini_cli_provider_image(prompt, size, model, reference_images=None, provider=None):
     ref_paths, temp_paths = await gemini_cli_reference_paths(reference_images)
     since = time.time()
+    canonical_image_mode = IMAGE_GENERATION_PERSIST_MODE.get() == "image_generation_media"
+    generated_output_dir = (
+        tempfile.mkdtemp(prefix="image_generation_gemini_")
+        if canonical_image_mode else OUTPUT_OUTPUT_DIR
+    )
     try:
         ref_text = ""
         if ref_paths:
@@ -6849,7 +8737,7 @@ async def generate_gemini_cli_provider_image(prompt, size, model, reference_imag
             f"任务：{prompt}\n\n"
             f"{gemini_cli_image_size_instruction(size, size_context)}\n"
             f"{ref_text}\n\n"
-            f"如果当前 Antigravity CLI/模型支持图片生成或图片编辑，请把最终图片保存到这个本地目录：{OUTPUT_OUTPUT_DIR}\n"
+            f"如果当前 Antigravity CLI/模型支持图片生成或图片编辑，请把最终图片保存到这个本地目录：{generated_output_dir}\n"
             "文件格式优先 png 或 jpg。只输出最终文件路径和一句简短说明；不要修改项目代码，不要创建额外文档。\n"
             "如果你无法真正创建图片文件，请在 60 秒内直接回复“无法生成图片文件”，不要只写计划，也不要持续尝试。"
         )
@@ -6859,11 +8747,20 @@ async def generate_gemini_cli_provider_image(prompt, size, model, reference_imag
             timeout=gemini_cli_image_timeout() if is_antigravity_cli(gemini_cli_executable()) else gemini_cli_timeout(),
             allow_tools=True,
         )
-        files = codex_output_image_files(since)
+        files = (
+            codex_output_image_files(since, generated_output_dir)
+            if canonical_image_mode
+            else codex_output_image_files(since)
+        )
         urls = []
         for path in files:
             processed_path = codex_postprocess_image_to_requested_size(path, size, "gemini-cli")
-            url = codex_output_url_from_path(processed_path or path)
+            selected_path = processed_path or path
+            if canonical_image_mode:
+                media = await save_ai_image_to_media({"type": "path", "value": selected_path})
+                url = media["url"]
+            else:
+                url = codex_output_url_from_path(selected_path)
             if url and url not in urls:
                 urls.append(url)
         if not urls:
@@ -6872,7 +8769,12 @@ async def generate_gemini_cli_provider_image(prompt, size, model, reference_imag
             for match in re.findall(pattern, text, flags=re.I):
                 match_path = match.strip()
                 processed_path = codex_postprocess_image_to_requested_size(match_path, size, "gemini-cli")
-                url = codex_output_url_from_path(processed_path or match_path)
+                selected_path = processed_path or match_path
+                if canonical_image_mode:
+                    media = await save_ai_image_to_media({"type": "path", "value": selected_path})
+                    url = media["url"]
+                else:
+                    url = codex_output_url_from_path(selected_path)
                 if url and url not in urls:
                     urls.append(url)
         if not urls:
@@ -6880,6 +8782,8 @@ async def generate_gemini_cli_provider_image(prompt, size, model, reference_imag
             raise HTTPException(status_code=502, detail=f"{gemini_cli_display_name()} 已返回，但没有在输出目录发现图片：{status_text}")
         return {"type": "url", "value": urls[0]}, {"images": urls, "text": raw.get("text"), "provider": "gemini-cli", "raw": raw.get("raw")}
     finally:
+        if canonical_image_mode:
+            shutil.rmtree(generated_output_dir, ignore_errors=True)
         for path in temp_paths:
             try:
                 os.remove(path)
@@ -7624,7 +9528,22 @@ async def jimeng_store_output_value(value, kind="image"):
     text = str(value or "").strip()
     if not text:
         return ""
+    canonical_image_mode = (
+        kind == "image" and IMAGE_GENERATION_PERSIST_MODE.get() == "image_generation_media"
+    )
     if text.startswith("/output/") or text.startswith("/assets/"):
+        if canonical_image_mode and not text.startswith("/assets/image-generation/media/"):
+            local_path = output_file_from_url(text)
+            if local_path and os.path.isfile(local_path):
+                content = await asyncio.to_thread(Path(local_path).read_bytes)
+                return (
+                    await asyncio.to_thread(
+                        IMAGE_GENERATION_MEDIA_STORE.adopt_bytes,
+                        content,
+                        Path(local_path).suffix,
+                        mimetypes.guess_type(local_path)[0] or "",
+                    )
+                )["url"]
         return text
     if text.startswith("file://"):
         text = urllib.parse.unquote(urllib.parse.urlparse(text).path)
@@ -7635,8 +9554,22 @@ async def jimeng_store_output_value(value, kind="image"):
     if text.startswith(("http://", "https://")):
         if kind == "video":
             return await save_remote_video_to_output(text, prefix="jimeng_video_")
+        if canonical_image_mode:
+            return (await save_ai_image_to_media({"type": "url", "value": text}))[
+                "url"
+            ]
         return await save_ai_image_to_output({"type": "url", "value": text}, prefix="jimeng_")
     if os.path.isfile(text):
+        if canonical_image_mode:
+            content = await asyncio.to_thread(Path(text).read_bytes)
+            return (
+                await asyncio.to_thread(
+                    IMAGE_GENERATION_MEDIA_STORE.adopt_bytes,
+                    content,
+                    Path(text).suffix,
+                    mimetypes.guess_type(text)[0] or "",
+                )
+            )["url"]
         return jimeng_local_output_url(text, kind)
     return ""
 
@@ -7928,11 +9861,27 @@ class DetailPageAsyncTaskFailed(HTTPException):
         self.upstream_task_id = str(task_id or "")
         self.async_candidate_status = "failed"
 
+def detail_page_async_safe_snapshot_url(value, *, strip_trailing_slash=False):
+    """Keep routing data while refusing credentials and transient URL parts."""
+    parsed = urllib.parse.urlsplit(str(value or "").strip())
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{hostname}:{port}" if hostname and port is not None else hostname
+    path = parsed.path.rstrip("/") if strip_trailing_slash else parsed.path
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
+
+
 def detail_page_async_provider_snapshot(provider, model=""):
     provider = provider or {}
-    raw_base_url = str(provider.get("base_url") or "").strip()
-    parsed_base_url = urllib.parse.urlsplit(raw_base_url)
-    safe_base_url = urllib.parse.urlunsplit((parsed_base_url.scheme, parsed_base_url.netloc, parsed_base_url.path.rstrip("/"), "", ""))
+    safe_base_url = detail_page_async_safe_snapshot_url(provider.get("base_url"), strip_trailing_slash=True)
+    safe_task_endpoint = detail_page_async_safe_snapshot_url(
+        provider.get("image_task_endpoint") or "/v1/images/tasks/{task_id}"
+    )
     return {
         "id": str(provider.get("id") or ""),
         "name": str(provider.get("name") or provider.get("id") or ""),
@@ -7940,9 +9889,59 @@ def detail_page_async_provider_snapshot(provider, model=""):
         "protocol": str(provider.get("protocol") or "openai").strip().lower(),
         "image_request_mode": normalize_image_request_mode(provider.get("image_request_mode")),
         "image_async_enabled": bool(detail_page_async_image_enabled(provider)),
-        "image_task_endpoint": str(provider.get("image_task_endpoint") or "/v1/images/tasks/{task_id}").strip(),
+        "image_task_endpoint": safe_task_endpoint,
         "model": str(model or ""),
     }
+
+
+def image_generation_provider_snapshot(provider, model=""):
+    """Durable, credential-free execution contract for one Task 5 candidate."""
+    provider = provider or {}
+    snapshot = detail_page_async_provider_snapshot(provider, model)
+    raw_task_endpoint = str(provider.get("image_task_endpoint") or "").strip()
+    if raw_task_endpoint:
+        snapshot["image_task_endpoint"] = detail_page_async_safe_snapshot_url(raw_task_endpoint)
+    elif not detail_page_async_image_enabled(provider):
+        # Preserve provider-family defaults for Tudou/APIMart/video-proxy; a
+        # fabricated OpenAI endpoint would route recovery to the wrong API.
+        snapshot["image_task_endpoint"] = ""
+    snapshot["id"] = str(provider.get("id") or "").strip().lower()
+    for key in ("image_generation_endpoint", "image_edit_endpoint"):
+        snapshot[key] = detail_page_async_safe_snapshot_url(provider.get(key))
+    for key in (
+        "image_models", "model_names", "model_protocols", "model_image_strategies",
+        "image_model_resolution_maps", "ms_loras", "ms_defaults_version",
+        "rh_apps", "rh_workflows", "volcengine_project_name", "volcengine_region",
+    ):
+        if key in provider:
+            snapshot[key] = copy.deepcopy(provider[key])
+    if is_runninghub_provider(provider):
+        frozen_entry = runninghub_entry_config_from_model(provider, model)
+        if frozen_entry:
+            snapshot["_task5_runninghub_entry"] = copy.deepcopy(frozen_entry)
+            snapshot["_task5_query_strategy"] = "runninghub-entry"
+            submit_path = "/task/openapi/create" if str(frozen_entry.get("kind") or "") == "workflow" else "/task/openapi/ai-app/run"
+            snapshot["runninghub_submit_endpoint"] = detail_page_async_safe_snapshot_url(
+                runninghub_endpoint_url(provider, submit_path)
+            )
+            snapshot["runninghub_upload_endpoint"] = detail_page_async_safe_snapshot_url(
+                runninghub_endpoint_url(provider, "/task/openapi/upload")
+            )
+            snapshot["runninghub_query_endpoint"] = detail_page_async_safe_snapshot_url(
+                runninghub_endpoint_url(provider, "/task/openapi/outputs")
+            )
+            snapshot["image_task_endpoint"] = snapshot["runninghub_query_endpoint"]
+    elif normalize_image_request_mode(snapshot.get("image_request_mode")) == "openai-responses":
+        snapshot["_task5_query_strategy"] = "openai-responses"
+        responses_submit_url = provider_endpoint_url(provider, "image_generation_endpoint", "/v1/responses")
+        snapshot["image_task_endpoint"] = detail_page_async_safe_snapshot_url(
+            f"{responses_submit_url.rstrip('/')}/{{task_id}}"
+        )
+    else:
+        snapshot["_task5_query_strategy"] = "image-task"
+    snapshot["_task5_execution"] = True
+    snapshot["_task5_single_shot_submit"] = True
+    return image_generation_redact_sensitive_value(snapshot, drop_sensitive_keys=True)
 
 def add_url_query_parameter(url, key, value):
     parsed = urllib.parse.urlsplit(str(url or ""))
@@ -8177,6 +10176,18 @@ def output_file_from_url(url):
         rest = clean[len("/api/storage-files/"):].lstrip("/")
         kind, _, rel = rest.partition("/")
         return storage_file_path(kind, rel) if kind and rel else None
+    if clean.startswith("/static/image-generation-examples/"):
+        rel = clean[len("/static/image-generation-examples/"):].lstrip("/")
+        if not rel or rel == "." or rel == ".." or rel.startswith("../") or os.path.isabs(rel):
+            return None
+        root = os.path.abspath(os.path.join(STATIC_DIR, "image-generation-examples"))
+        path = os.path.abspath(os.path.join(root, rel))
+        try:
+            if os.path.commonpath([root, path]) == root and os.path.isfile(path):
+                return path
+        except ValueError:
+            return None
+        return None
     if not (clean.startswith("/output/") or clean.startswith("/assets/")):
         return None
     if clean.startswith("/assets/"):
@@ -8203,6 +10214,1481 @@ def image_has_alpha(img: Image.Image) -> bool:
     return False
 
 STORAGE_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif"}
+
+
+def storage_cleanup_manifest_root() -> Path:
+    return Path(DATA_DIR) / "storage_cleanup_transactions"
+
+
+def storage_cleanup_target_roots(kind: str) -> tuple[Path, ...]:
+    if kind == "generated":
+        raw = (Path(OUTPUT_OUTPUT_DIR), Path(OUTPUT_DIR))
+    elif kind == "temporary-upload":
+        raw = (Path(OUTPUT_INPUT_DIR),)
+    elif kind == "all":
+        raw = (
+            *storage_cleanup_target_roots("generated"),
+            *storage_cleanup_target_roots("temporary-upload"),
+        )
+    else:
+        raise ValueError("不支持的存储清理类型")
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for item in raw:
+        root = Path(os.path.abspath(item))
+        key = os.path.normcase(str(root))
+        if key not in seen:
+            roots.append(root)
+            seen.add(key)
+    return tuple(roots)
+
+
+def storage_cleanup_all_roots() -> tuple[Path, ...]:
+    roots = (*storage_cleanup_target_roots("generated"), *storage_cleanup_target_roots("temporary-upload"))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = os.path.normcase(str(root))
+        if key not in seen:
+            unique.append(root)
+            seen.add(key)
+    return tuple(unique)
+
+
+def storage_cleanup_reference_roots() -> tuple[Path, ...]:
+    """Return local media roots that may appear in durable references.
+
+    The ordinary cleanup target list intentionally excludes the canonical
+    image-generation store.  Reference discovery must still understand that
+    store so main-image/detail-page/canvas records containing a raw canonical
+    URL can protect a shared CAS object.
+    """
+    roots = (*storage_cleanup_all_roots(), Path(IMAGE_GENERATION_MEDIA_STORE.media_root))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for raw in roots:
+        root = Path(os.path.abspath(raw))
+        key = os.path.normcase(str(root))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return tuple(unique)
+
+
+def storage_cleanup_recovery_roots() -> tuple[Path, ...]:
+    """Allow startup recovery for ordinary and image-generation transactions."""
+    roots = (
+        *storage_cleanup_all_roots(),
+        Path(IMAGE_GENERATION_MEDIA_STORE.media_root),
+        Path(IMAGE_GENERATION_MEDIA_STORE.metadata_root),
+        Path(IMAGE_GENERATION_MEDIA_STORE.trash_root),
+        Path(STATIC_DIR) / "image-generation-examples",
+    )
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        absolute = Path(os.path.abspath(root))
+        key = os.path.normcase(str(absolute))
+        if key not in seen:
+            unique.append(absolute)
+            seen.add(key)
+    return tuple(unique)
+
+
+def storage_cleanup_paths_overlap(first: Path | str, second: Path | str) -> bool:
+    left = Path(os.path.abspath(first))
+    right = Path(os.path.abspath(second))
+    return storage_cleanup_path_within(left, right) or storage_cleanup_path_within(right, left)
+
+
+def storage_cleanup_validate_scope(kind: str) -> None:
+    if kind == "all":
+        storage_cleanup_validate_scope("generated")
+        storage_cleanup_validate_scope("temporary-upload")
+        return
+    targets = storage_cleanup_target_roots(kind)
+    protected = (
+        Path(DATA_DIR),
+        Path(ASSET_LIBRARY_DIR),
+        Path(LOCAL_UPLOAD_DIR),
+        Path(CANVAS_COVER_DIR),
+        Path(PROMPT_THUMBNAIL_DIR),
+        Path(STATIC_DIR) / "image-generation-examples",
+        Path(IMAGE_GENERATION_MEDIA_STORE.assets_root),
+    )
+    other_scope = (
+        storage_cleanup_target_roots("temporary-upload")
+        if kind == "generated"
+        else storage_cleanup_target_roots("generated")
+    )
+    if any(storage_cleanup_paths_overlap(target, guard) for target in targets for guard in protected):
+        raise ValueError("清理目录与受保护素材目录重叠")
+    if any(storage_cleanup_paths_overlap(target, other) for target in targets for other in other_scope):
+        raise ValueError("生成目录与临时上传目录不能重叠清理")
+
+
+def storage_cleanup_path_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def storage_cleanup_path_within(path: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+    except ValueError:
+        return False
+
+
+def storage_cleanup_join(root: Path | str, relative: str) -> Path | None:
+    text = str(relative or "").replace("\\", "/").lstrip("/")
+    normalized = os.path.normpath(text).replace("\\", "/")
+    if not normalized or normalized in {".", ".."} or normalized.startswith("../") or os.path.isabs(normalized):
+        return None
+    root_path = Path(os.path.abspath(root))
+    candidate = Path(os.path.abspath(root_path / normalized))
+    return candidate if storage_cleanup_path_within(candidate, root_path) else None
+
+
+def storage_cleanup_paths_from_text(value: str) -> set[Path]:
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    roots = storage_cleanup_reference_roots()
+    result: set[Path] = set()
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        clean = urllib.parse.unquote(
+            parsed.path if parsed.scheme in {"http", "https"}
+            else text.split("?", 1)[0].split("#", 1)[0]
+        )
+    except ValueError:
+        clean = text.split("?", 1)[0].split("#", 1)[0]
+    clean = clean.replace("\\", "/")
+    mappings: list[tuple[str, tuple[Path, ...]]] = [
+        ("/assets/image-generation/media/", (Path(IMAGE_GENERATION_MEDIA_STORE.media_root),)),
+        ("/api/storage-files/generated/", (Path(OUTPUT_OUTPUT_DIR),)),
+        ("/api/storage-files/upload/", (Path(OUTPUT_INPUT_DIR),)),
+        ("/assets/output/", (Path(ASSETS_DIR) / "output",)),
+        ("/assets/input/", (Path(ASSETS_DIR) / "input",)),
+        ("/output/", (Path(OUTPUT_OUTPUT_DIR), Path(OUTPUT_DIR))),
+    ]
+    for prefix, mapped_roots in mappings:
+        if not clean.startswith(prefix):
+            continue
+        relative = clean[len(prefix):]
+        for root in mapped_roots:
+            candidate = storage_cleanup_join(root, relative)
+            if candidate is not None and any(
+                storage_cleanup_path_within(candidate, target) for target in roots
+            ):
+                result.add(candidate)
+        return result
+    if os.path.isabs(text):
+        absolute = Path(os.path.abspath(text))
+        if any(storage_cleanup_path_within(absolute, root) for root in roots):
+            result.add(absolute)
+    return result
+
+
+def storage_cleanup_collect_references(value: Any, referenced: set[str]) -> None:
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple, set)):
+            stack.extend(current)
+        elif isinstance(current, str):
+            referenced.update(
+                storage_cleanup_path_key(path)
+                for path in storage_cleanup_paths_from_text(current)
+            )
+
+
+def storage_cleanup_collect_canvas_references(
+    value: Any,
+    referenced: set[str],
+    audit_only: set[str] | None = None,
+) -> None:
+    """Collect active canvas references while excluding persisted log history.
+
+    ``canvas.logs`` is an audit trail, not current ownership.  Keep its paths
+    in a separate set so the storage-cleanup UI can explain why a candidate is
+    still visible in the canvas log without allowing the log to block cleanup.
+    Every other canvas field (especially ``nodes`` and settings) remains a
+    strong reference.
+    """
+    if not isinstance(value, Mapping):
+        storage_cleanup_collect_references(value, referenced)
+        return
+    for key, item in value.items():
+        if str(key) == "logs":
+            if audit_only is not None:
+                storage_cleanup_collect_references(item, audit_only)
+            continue
+        storage_cleanup_collect_references(item, referenced)
+
+
+def storage_cleanup_collect_canvas_task_references(
+    value: Any,
+    referenced: set[str],
+) -> None:
+    """Keep active canvas jobs strong; completed jobs are represented by nodes/logs."""
+    if not isinstance(value, Mapping):
+        storage_cleanup_collect_references(value, referenced)
+        return
+    terminal = {
+        "succeeded", "partial", "failed", "cancelled", "interrupted", "unknown",
+    }
+    for task in value.values():
+        if not isinstance(task, Mapping):
+            storage_cleanup_collect_references(task, referenced)
+            continue
+        status = str(task.get("status") or "").strip().lower()
+        if status in terminal:
+            continue
+        storage_cleanup_collect_references(task, referenced)
+
+
+def storage_cleanup_history_looks_like_main_image(record: Mapping[str, Any]) -> bool:
+    if not isinstance(record, Mapping):
+        return False
+    if str(record.get("source_type") or "") == "main-image":
+        return True
+    prompt = str(record.get("prompt") or "").lower()
+    prompt_matches = any(marker in prompt for marker in (
+        "电商连续主图", "电商创意主图",
+        "e-commerce continuous main image", "e-commerce creative main image",
+        "continuous main image", "creative main image",
+    ))
+    if not prompt_matches:
+        return False
+    params = record.get("params") if isinstance(record.get("params"), Mapping) else {}
+    refs = params.get("reference_images") if isinstance(params.get("reference_images"), list) else []
+    if not refs:
+        return False
+    roles = {
+        str(item.get("role") or "").lower()
+        for item in refs
+        if isinstance(item, Mapping)
+    }
+    urls = [
+        str(item.get("url") or "")
+        for item in refs
+        if isinstance(item, Mapping)
+    ]
+    return bool(
+        "product" in roles
+        and roles <= {"product", "reference"}
+        and urls
+        and all("/assets/input/" in url.replace("\\", "/") for url in urls)
+    )
+
+
+def storage_cleanup_history_is_orphaned_main_image(
+    record: Mapping[str, Any],
+    task_ids: set[str],
+    input_sets: list[set[str]],
+) -> bool:
+    """Recognize legacy main-image history left by a deleted group.
+
+    Older builds did not persist a source marker.  Their prompts and reference
+    roles are distinctive enough to safely identify rows whose complete input
+    set no longer belongs to any persisted main-image group.  We only use this
+    migration rule to release *input* references; output history remains
+    protected and visible to the user.
+    """
+    if not storage_cleanup_history_looks_like_main_image(record):
+        return False
+    source_type = str(record.get("source_type") or "")
+    source_task_id = str(record.get("source_task_id") or "")
+    if source_type == "main-image" and source_task_id:
+        return source_task_id not in task_ids
+    params = record.get("params") if isinstance(record.get("params"), Mapping) else {}
+    refs = {
+        str(item.get("url") or "")
+        for item in (params.get("reference_images") or [])
+        if isinstance(item, Mapping) and str(item.get("url") or "")
+    }
+    if refs:
+        return not any(refs <= active_refs for active_refs in input_sets)
+    # A marker without an input list can only be treated as orphaned when the
+    # new explicit source marker points at a group that no longer exists.
+    return source_type == "main-image" and not source_task_id
+
+
+def storage_cleanup_history_is_canvas_audit_record(record: Mapping[str, Any]) -> bool:
+    return str(record.get("source_type") or "").strip() == "canvas-online-image"
+
+
+def storage_cleanup_collect_history_references(
+    value: Any,
+    referenced: set[str],
+    audit_only: set[str] | None = None,
+) -> None:
+    if not isinstance(value, list):
+        storage_cleanup_collect_references(value, referenced)
+        return
+    try:
+        task_ids, input_sets = main_image_persisted_inventory()
+    except Exception:
+        # A failed inventory must not weaken the safety scan.
+        storage_cleanup_collect_references(value, referenced)
+        return
+    for record in value:
+        if isinstance(record, Mapping) and storage_cleanup_history_is_canvas_audit_record(record):
+            if audit_only is not None:
+                storage_cleanup_collect_references(record, audit_only)
+            continue
+        if not isinstance(record, Mapping) or not storage_cleanup_history_is_orphaned_main_image(record, task_ids, input_sets):
+            storage_cleanup_collect_references(record, referenced)
+            continue
+        # Keep output URLs and every non-input reference protected.  Only the
+        # deleted main-image group's old upload references are unlinked.
+        clone = copy.deepcopy(record)
+        params = clone.get("params") if isinstance(clone.get("params"), dict) else None
+        if params is not None:
+            params["reference_images"] = []
+        storage_cleanup_collect_references(clone, referenced)
+
+
+def storage_cleanup_reference_files() -> list[Path]:
+    paths: list[Path] = []
+    data_root = Path(DATA_DIR)
+    manifest_root = storage_cleanup_manifest_root()
+    one_click_job_root = Path(ONE_CLICK_CLEANUP_JOB_DIR)
+    update_backups_root = Path(update_backup_root())
+    media_metadata_root = Path(IMAGE_GENERATION_MEDIA_STORE.metadata_root)
+    if data_root.exists():
+        if data_root.is_symlink():
+            raise ValueError("数据目录不能是链接")
+        for path in data_root.rglob("*.json"):
+            if (
+                storage_cleanup_path_within(path, manifest_root)
+                or storage_cleanup_path_within(path, one_click_job_root)
+                or storage_cleanup_path_within(path, update_backups_root)
+                or storage_cleanup_path_within(path, media_metadata_root)
+            ):
+                continue
+            if path.is_symlink():
+                raise ValueError("引用记录不能是链接")
+            paths.append(path)
+    # Custom storage settings and tests may place task ledgers outside the
+    # general data root.  They are still first-class strong references and
+    # must be scanned explicitly instead of relying on directory nesting.
+    for raw_root in (MAIN_IMAGE_TASK_DIR, DETAIL_PAGE_TASK_DIR):
+        task_root = Path(raw_root)
+        if not task_root.exists():
+            continue
+        if task_root.is_symlink():
+            raise ValueError("任务记录目录不能是链接")
+        for path in task_root.rglob("*.json"):
+            if path.is_symlink():
+                raise ValueError("引用记录不能是链接")
+            paths.append(path)
+    for raw in (HISTORY_FILE, GLOBAL_CONFIG_FILE):
+        path = Path(raw)
+        if path.exists():
+            if path.is_symlink():
+                raise ValueError("引用记录不能是链接")
+            paths.append(path)
+    unique: dict[str, Path] = {}
+    for path in paths:
+        unique[storage_cleanup_path_key(path)] = path
+    return sorted(unique.values(), key=lambda item: storage_cleanup_path_key(item))
+
+
+def storage_cleanup_referenced_paths() -> set[str]:
+    referenced: set[str] = set()
+    for path in storage_cleanup_reference_files():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"引用记录无法读取：{path.name}") from exc
+        if storage_cleanup_path_key(path) == storage_cleanup_path_key(HISTORY_FILE):
+            storage_cleanup_collect_history_references(raw, referenced)
+        elif storage_cleanup_path_within(Path(os.path.abspath(path)), Path(os.path.abspath(CANVAS_DIR))):
+            storage_cleanup_collect_canvas_references(raw, referenced)
+        else:
+            storage_cleanup_collect_references(raw, referenced)
+    with CANVAS_TASK_LOCK:
+        canvas_tasks = copy.deepcopy(CANVAS_TASKS)
+    with IMAGE_GENERATION_TASK_LOCK:
+        image_generation_tasks = copy.deepcopy(IMAGE_GENERATION_RUNTIME_TASKS)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        runninghub_operations = copy.deepcopy(ONLINE_RUNNINGHUB_OPERATIONS)
+    with QUEUE_LOCK:
+        queued_operations = copy.deepcopy(QUEUE)
+    storage_cleanup_collect_canvas_task_references(canvas_tasks, referenced)
+    storage_cleanup_collect_references(image_generation_tasks, referenced)
+    storage_cleanup_collect_references(runninghub_operations, referenced)
+    storage_cleanup_collect_references(queued_operations, referenced)
+    return referenced
+
+
+def storage_cleanup_reference_signature() -> str:
+    """Return a cheap mutation signature for every durable/runtime reference.
+
+    This deliberately hashes record identities and stat metadata, not file
+    contents.  It is used only to decide whether a previously completed full
+    reference scan can be reused; any detected change triggers another full
+    fail-closed scan.
+    """
+    digest = hashlib.sha256()
+    for path in storage_cleanup_reference_files():
+        try:
+            details = path.lstat()
+        except OSError as exc:
+            raise ValueError(f"引用记录无法检查：{path.name}") from exc
+        attributes = int(getattr(details, "st_file_attributes", 0) or 0)
+        if stat.S_ISLNK(details.st_mode) or bool(attributes & 0x0400):
+            raise ValueError("引用记录不能是链接或重解析点")
+        digest.update(storage_cleanup_path_key(path).encode("utf-8", errors="surrogatepass"))
+        digest.update(str(int(details.st_size)).encode("ascii"))
+        digest.update(str(int(details.st_mtime_ns)).encode("ascii"))
+    with CANVAS_TASK_LOCK:
+        canvas_tasks = copy.deepcopy(CANVAS_TASKS)
+    with IMAGE_GENERATION_TASK_LOCK:
+        image_generation_tasks = copy.deepcopy(IMAGE_GENERATION_RUNTIME_TASKS)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        runninghub_operations = copy.deepcopy(ONLINE_RUNNINGHUB_OPERATIONS)
+    with QUEUE_LOCK:
+        queued_operations = copy.deepcopy(QUEUE)
+    runtime_payload = {
+        "canvas_tasks": canvas_tasks,
+        "image_generation_tasks": image_generation_tasks,
+        "runninghub_operations": runninghub_operations,
+        "queue": queued_operations,
+    }
+    digest.update(
+        json.dumps(
+            runtime_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
+def storage_cleanup_stable_reference_snapshot(
+    *, max_attempts: int = 3,
+) -> tuple[set[str], str]:
+    """Complete one reference scan whose inputs stayed stable throughout."""
+    for _attempt in range(max(1, int(max_attempts))):
+        before = storage_cleanup_reference_signature()
+        referenced = storage_cleanup_referenced_paths()
+        after = storage_cleanup_reference_signature()
+        if before == after:
+            return referenced, after
+    raise ValueError("引用记录持续变化，稍后自动重试")
+
+
+def storage_cleanup_reference_source_labels_for_keys(
+    target_keys: Iterable[str],
+) -> dict[str, list[str]]:
+    """Explain multiple protected files in one pass over reference records."""
+    requested = {str(item) for item in target_keys if str(item)}
+    labels: dict[str, set[str]] = {key: set() for key in requested}
+    if not requested:
+        return {}
+    for path in storage_cleanup_reference_files():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"引用记录无法读取：{path.name}") from exc
+        found: set[str] = set()
+        path_key = storage_cleanup_path_key(path)
+        if path_key == storage_cleanup_path_key(HISTORY_FILE):
+            storage_cleanup_collect_history_references(raw, found)
+            label = "全局历史"
+        elif storage_cleanup_path_within(
+            Path(os.path.abspath(path)), Path(os.path.abspath(CANVAS_DIR))
+        ):
+            storage_cleanup_collect_canvas_references(raw, found)
+            label = "当前画布"
+        elif storage_cleanup_path_within(
+            Path(os.path.abspath(path)), Path(os.path.abspath(MAIN_IMAGE_TASK_DIR))
+        ):
+            storage_cleanup_collect_references(raw, found)
+            label = "一键主图"
+        elif storage_cleanup_path_within(
+            Path(os.path.abspath(path)), Path(os.path.abspath(DETAIL_PAGE_TASK_DIR))
+        ):
+            storage_cleanup_collect_references(raw, found)
+            label = "一键详情页"
+        else:
+            storage_cleanup_collect_references(raw, found)
+            label = "案例、收藏、草稿或其他业务记录"
+        for target_key in requested & found:
+            labels[target_key].add(label)
+    runtime_groups: tuple[tuple[str, Any], ...]
+    with CANVAS_TASK_LOCK:
+        canvas_tasks = copy.deepcopy(CANVAS_TASKS)
+    with IMAGE_GENERATION_TASK_LOCK:
+        image_generation_tasks = copy.deepcopy(IMAGE_GENERATION_RUNTIME_TASKS)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        runninghub_operations = copy.deepcopy(ONLINE_RUNNINGHUB_OPERATIONS)
+    with QUEUE_LOCK:
+        queued_operations = copy.deepcopy(QUEUE)
+    runtime_groups = (
+        ("运行中的画布任务", canvas_tasks),
+        ("运行中的图片生成任务", image_generation_tasks),
+        ("RunningHub 运行操作", runninghub_operations),
+        ("等待队列", queued_operations),
+    )
+    for label, value in runtime_groups:
+        found: set[str] = set()
+        if label == "运行中的画布任务":
+            storage_cleanup_collect_canvas_task_references(value, found)
+        else:
+            storage_cleanup_collect_references(value, found)
+        for target_key in requested & found:
+            labels[target_key].add(label)
+    return {key: sorted(values) for key, values in labels.items()}
+
+
+def storage_cleanup_reference_source_labels(target_key: str) -> list[str]:
+    """Explain which current-reference domains protect one local file."""
+    return storage_cleanup_reference_source_labels_for_keys([target_key]).get(
+        str(target_key), []
+    )
+
+
+FIXED_EXAMPLE_URL_PREFIX = "/static/image-generation-examples/"
+
+
+def storage_cleanup_fixed_example_root() -> Path:
+    return Path(os.path.abspath(Path(STATIC_DIR) / "image-generation-examples"))
+
+
+def storage_cleanup_fixed_example_path_from_url(value: str) -> Path | None:
+    """Map one controlled fixed-example URL to its local static file."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except ValueError as exc:
+        if text.replace("\\", "/").startswith(FIXED_EXAMPLE_URL_PREFIX):
+            raise ValueError("固定案例媒体地址无效") from exc
+        return None
+    clean = urllib.parse.unquote(parsed.path).replace("\\", "/")
+    if not clean.startswith(FIXED_EXAMPLE_URL_PREFIX):
+        return None
+    if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError("固定案例媒体必须使用本机静态地址")
+    relative = clean[len(FIXED_EXAMPLE_URL_PREFIX):]
+    candidate = storage_cleanup_join(storage_cleanup_fixed_example_root(), relative)
+    if candidate is None or candidate.suffix.lower() not in STORAGE_IMAGE_EXTS:
+        raise ValueError("固定案例媒体路径无效")
+    return Path(os.path.abspath(candidate))
+
+
+def storage_cleanup_collect_fixed_example_references(value: Any, referenced: set[str]) -> None:
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple, set)):
+            stack.extend(current)
+        elif isinstance(current, str):
+            path = storage_cleanup_fixed_example_path_from_url(current)
+            if path is not None:
+                referenced.add(storage_cleanup_path_key(path))
+
+
+def storage_cleanup_fixed_example_referenced_paths() -> set[str]:
+    """Collect all durable/runtime references to packaged fixed examples."""
+    root = storage_cleanup_fixed_example_root()
+    if root.exists() and storage_cleanup_is_link_or_reparse(root):
+        raise ValueError("固定案例目录不能是链接或重解析点")
+    sources = storage_cleanup_reference_files()
+    preset = Path(STATIC_DIR) / "data" / "image-generation-presets.v1.json"
+    if root.exists() and not preset.is_file():
+        raise ValueError("固定案例发布预设不存在")
+    if preset.exists():
+        if storage_cleanup_is_link_or_reparse(preset):
+            raise ValueError("固定案例发布预设不能是链接或重解析点")
+        sources.append(preset)
+    unique_sources = {
+        storage_cleanup_path_key(path): path
+        for path in sources
+    }
+    referenced: set[str] = set()
+    for path in sorted(unique_sources.values(), key=storage_cleanup_path_key):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"固定案例引用记录无法读取：{path.name}") from exc
+        if storage_cleanup_path_within(Path(os.path.abspath(path)), Path(os.path.abspath(CANVAS_DIR))):
+            active: Dict[str, Any] = {}
+            if isinstance(raw, Mapping):
+                active = {key: item for key, item in raw.items() if str(key) != "logs"}
+            storage_cleanup_collect_fixed_example_references(active, referenced)
+        else:
+            storage_cleanup_collect_fixed_example_references(raw, referenced)
+    with CANVAS_TASK_LOCK:
+        canvas_tasks = copy.deepcopy(CANVAS_TASKS)
+    with IMAGE_GENERATION_TASK_LOCK:
+        image_generation_tasks = copy.deepcopy(IMAGE_GENERATION_RUNTIME_TASKS)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        runninghub_operations = copy.deepcopy(ONLINE_RUNNINGHUB_OPERATIONS)
+    with QUEUE_LOCK:
+        queued_operations = copy.deepcopy(QUEUE)
+    storage_cleanup_collect_fixed_example_references(canvas_tasks, referenced)
+    storage_cleanup_collect_fixed_example_references(image_generation_tasks, referenced)
+    storage_cleanup_collect_fixed_example_references(runninghub_operations, referenced)
+    storage_cleanup_collect_fixed_example_references(queued_operations, referenced)
+    return referenced
+
+
+def storage_cleanup_validate_fixed_example_file(path: Path) -> None:
+    root = storage_cleanup_fixed_example_root()
+    candidate = Path(os.path.abspath(path))
+    if not storage_cleanup_path_within(candidate, root):
+        raise ValueError("固定案例文件路径越界")
+    if storage_cleanup_is_link_or_reparse(candidate):
+        raise ValueError("固定案例文件不能是链接或重解析点")
+    match = re.fullmatch(r"([0-9a-fA-F]{64})(\.[A-Za-z0-9]+)", candidate.name)
+    if not match or candidate.suffix.lower() not in STORAGE_IMAGE_EXTS:
+        raise ValueError("固定案例文件名不是合法内容哈希")
+    digest = hashlib.sha256()
+    try:
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValueError("固定案例文件无法校验") from exc
+    if digest.hexdigest() != match.group(1).lower():
+        raise ValueError("固定案例文件哈希不匹配")
+
+
+def storage_cleanup_fixed_example_snapshot() -> Dict[str, Any]:
+    root = storage_cleanup_fixed_example_root()
+    breakdown = {
+        "total_files": 0,
+        "total_bytes": 0,
+        "candidate_files": 0,
+        "candidate_bytes": 0,
+        "protected_files": 0,
+        "protected_bytes": 0,
+        "legacy_history_candidate_files": 0,
+        "legacy_history_candidate_bytes": 0,
+    }
+    if not root.exists():
+        return {"candidates": [], "breakdown": breakdown}
+    if storage_cleanup_is_link_or_reparse(root):
+        raise ValueError("固定案例目录不能是链接或重解析点")
+    referenced = storage_cleanup_fixed_example_referenced_paths()
+    candidates: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for current, dirs, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        if storage_cleanup_is_link_or_reparse(current_path):
+            raise ValueError("固定案例路径不能包含链接或重解析点")
+        safe_dirs: list[str] = []
+        for name in dirs:
+            child = current_path / name
+            if name.startswith("."):
+                continue
+            if storage_cleanup_is_link_or_reparse(child):
+                raise ValueError("固定案例路径不能包含链接或重解析点")
+            safe_dirs.append(name)
+        dirs[:] = safe_dirs
+        for name in files:
+            path = current_path / name
+            if name.startswith(".") or path.suffix.lower() not in STORAGE_IMAGE_EXTS:
+                continue
+            storage_cleanup_validate_fixed_example_file(path)
+            key = storage_cleanup_path_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                details = path.stat()
+            except OSError as exc:
+                raise ValueError("无法核对固定案例文件") from exc
+            size = int(details.st_size)
+            breakdown["total_files"] += 1
+            breakdown["total_bytes"] += size
+            if key in referenced:
+                breakdown["protected_files"] += 1
+                breakdown["protected_bytes"] += size
+                continue
+            candidates.append({
+                "path": str(path),
+                "key": key,
+                "kind": "fixed-example",
+                "size": size,
+                "mtime_ns": int(details.st_mtime_ns),
+                "candidate_source": "fixed_example_orphan",
+                "weak_history_fingerprints": [],
+            })
+            breakdown["candidate_files"] += 1
+            breakdown["candidate_bytes"] += size
+    candidates.sort(key=lambda item: str(item["key"]))
+    return {"candidates": candidates, "breakdown": breakdown}
+
+
+def storage_cleanup_prune_empty_fixed_example_directories() -> None:
+    root = storage_cleanup_fixed_example_root()
+    if not root.exists() or storage_cleanup_is_link_or_reparse(root):
+        return
+    for current, dirs, _files in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current)
+        if current_path == root or storage_cleanup_is_link_or_reparse(current_path):
+            continue
+        try:
+            if not any(current_path.iterdir()):
+                current_path.rmdir()
+        except OSError:
+            continue
+
+
+def storage_cleanup_history_record_fingerprint(record: Mapping[str, Any]) -> str:
+    """Return a stable identity used to fail closed between preview/confirm."""
+    payload = json.dumps(
+        dict(record), ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def storage_cleanup_history_is_legacy_unmarked(record: Mapping[str, Any]) -> bool:
+    """Identify old shared ``type=online`` rows that have no producer marker.
+
+    Older builds wrote online-image, one-click and image-generation results to
+    the same ledger without ``source_type``.  Such a row is useful migration
+    evidence, but it must not permanently protect a file after every current
+    task/canvas/example/favorite reference has disappeared.
+    """
+    return bool(
+        isinstance(record, Mapping)
+        and str(record.get("type") or "") == "online"
+        and not str(record.get("source_type") or "").strip()
+        and not str(record.get("source_task_id") or "").strip()
+    )
+
+
+def storage_cleanup_history_reference_analysis(
+    records: list[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    if records is None:
+        history_path = Path(HISTORY_FILE)
+        if not history_path.exists():
+            records = []
+        else:
+            try:
+                raw = json.loads(history_path.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("图片历史记录无法安全读取") from exc
+            if not isinstance(raw, list):
+                raise ValueError("图片历史记录格式无效")
+            records = raw
+    strong_records: list[Dict[str, Any]] = []
+    weak_by_path: Dict[str, set[str]] = {}
+    weak_record_paths: Dict[str, set[str]] = {}
+    audit_paths: set[str] = set()
+    weak_records = 0
+    for record in records:
+        if not isinstance(record, Mapping):
+            strong_records.append(record)
+            continue
+        if storage_cleanup_history_is_canvas_audit_record(record):
+            storage_cleanup_collect_references(record, audit_paths)
+            continue
+        if not storage_cleanup_history_is_legacy_unmarked(record):
+            strong_records.append(record)
+            continue
+        weak_records += 1
+        fingerprint = storage_cleanup_history_record_fingerprint(record)
+        record_paths: set[str] = set()
+        storage_cleanup_collect_references(record, record_paths)
+        weak_record_paths[fingerprint] = set(record_paths)
+        for key in record_paths:
+            weak_by_path.setdefault(key, set()).add(fingerprint)
+    strong_paths: set[str] = set()
+    storage_cleanup_collect_history_references(strong_records, strong_paths)
+    return {
+        "strong_paths": strong_paths,
+        "weak_by_path": weak_by_path,
+        "weak_record_paths": weak_record_paths,
+        "weak_records": weak_records,
+        "audit_paths": audit_paths,
+    }
+
+
+def storage_cleanup_strong_reference_snapshot() -> Dict[str, Any]:
+    """Collect the same deletion-blocking references used by cleanup jobs.
+
+    Canvas logs and ``canvas-online-image`` history rows are returned through
+    ``audit_only`` for explanation in the preview, but do not count as current
+    ownership.  Keeping preview and background scans on the same rule avoids a
+    candidate appearing in preview only to be protected again at confirmation.
+    """
+    history_analysis = storage_cleanup_history_reference_analysis()
+    referenced = set(history_analysis["strong_paths"])
+    audit_only = set(history_analysis.get("audit_paths") or set())
+    history_key = storage_cleanup_path_key(HISTORY_FILE)
+    for path in storage_cleanup_reference_files():
+        if storage_cleanup_path_key(path) == history_key:
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"引用记录无法读取：{path.name}") from exc
+        if storage_cleanup_path_within(Path(os.path.abspath(path)), Path(os.path.abspath(CANVAS_DIR))):
+            storage_cleanup_collect_canvas_references(raw, referenced, audit_only)
+        else:
+            storage_cleanup_collect_references(raw, referenced)
+    with CANVAS_TASK_LOCK:
+        canvas_tasks = copy.deepcopy(CANVAS_TASKS)
+    with IMAGE_GENERATION_TASK_LOCK:
+        image_generation_tasks = copy.deepcopy(IMAGE_GENERATION_RUNTIME_TASKS)
+    with ONLINE_RUNNINGHUB_OPERATION_LOCK:
+        runninghub_operations = copy.deepcopy(ONLINE_RUNNINGHUB_OPERATIONS)
+    with QUEUE_LOCK:
+        queued_operations = copy.deepcopy(QUEUE)
+    storage_cleanup_collect_canvas_task_references(canvas_tasks, referenced)
+    storage_cleanup_collect_references(image_generation_tasks, referenced)
+    storage_cleanup_collect_references(runninghub_operations, referenced)
+    storage_cleanup_collect_references(queued_operations, referenced)
+    return {
+        "referenced": referenced,
+        "history": history_analysis,
+        "audit_only": audit_only,
+    }
+
+
+def storage_cleanup_value_reference_keys(value: Any) -> set[str]:
+    referenced: set[str] = set()
+    storage_cleanup_collect_references(value, referenced)
+    return referenced
+
+
+def storage_cleanup_strip_target_paths(value: Any, target_keys: set[str]) -> tuple[Any, int]:
+    """Remove selected local-path references while preserving unrelated data."""
+    drop = object()
+
+    def transform(current: Any) -> tuple[Any, int]:
+        if isinstance(current, str):
+            keys = {
+                storage_cleanup_path_key(path)
+                for path in storage_cleanup_paths_from_text(current)
+            }
+            return (drop, 1) if keys & target_keys else (current, 0)
+        if isinstance(current, list):
+            result = []
+            removed = 0
+            for item in current:
+                item_keys = storage_cleanup_value_reference_keys(item)
+                if isinstance(item, Mapping) and item_keys and item_keys <= target_keys:
+                    removed += 1
+                    continue
+                updated, count = transform(item)
+                removed += count
+                if updated is not drop:
+                    result.append(updated)
+            return result, removed
+        if isinstance(current, tuple):
+            updated, removed = transform(list(current))
+            return tuple(updated), removed
+        if isinstance(current, Mapping):
+            result: Dict[str, Any] = {}
+            removed = 0
+            for key, item in current.items():
+                updated, count = transform(item)
+                removed += count
+                if updated is not drop:
+                    result[str(key)] = updated
+            return result, removed
+        return current, 0
+
+    updated, removed = transform(value)
+    return (None if updated is drop else updated), removed
+
+
+def storage_cleanup_rewrite_legacy_history_locked(
+    expected_by_path: Mapping[str, Iterable[str]],
+) -> Dict[str, Any]:
+    """Trim only previewed weak references; changed rows are skipped safely."""
+    history = history_read_records_strict_locked()
+    analysis = storage_cleanup_history_reference_analysis(history)
+    current_by_path = analysis["weak_by_path"]
+    accepted_keys = {
+        str(key)
+        for key, fingerprints in expected_by_path.items()
+        if set(current_by_path.get(str(key), set())) == {str(item) for item in fingerprints}
+    }
+    if not accepted_keys:
+        return {
+            "records": history,
+            "accepted_keys": set(),
+            "history_deleted": 0,
+            "history_updated": 0,
+        }
+    retained: list[Dict[str, Any]] = []
+    deleted = 0
+    updated_count = 0
+    for record in history:
+        if not isinstance(record, Mapping) or not storage_cleanup_history_is_legacy_unmarked(record):
+            retained.append(record)
+            continue
+        record_keys = storage_cleanup_value_reference_keys(record)
+        targets = record_keys & accepted_keys
+        if not targets:
+            retained.append(record)
+            continue
+        updated, removed = storage_cleanup_strip_target_paths(copy.deepcopy(record), targets)
+        if not removed or not isinstance(updated, dict):
+            retained.append(record)
+            continue
+        original_images = record.get("images")
+        if isinstance(original_images, list) and not list(updated.get("images") or []):
+            deleted += 1
+            continue
+        retained.append(updated)
+        updated_count += 1
+    return {
+        "records": retained,
+        "accepted_keys": accepted_keys,
+        "history_deleted": deleted,
+        "history_updated": updated_count,
+    }
+
+
+def storage_cleanup_is_link_or_reparse(path: Path) -> bool:
+    details = path.lstat()
+    attributes = int(getattr(details, "st_file_attributes", 0) or 0)
+    return stat.S_ISLNK(details.st_mode) or bool(attributes & 0x0400)
+
+
+def storage_cleanup_scan_snapshot(kind: str, cutoff: float) -> Dict[str, Any]:
+    storage_cleanup_validate_scope(kind)
+    reference_snapshot = storage_cleanup_strong_reference_snapshot()
+    referenced = reference_snapshot["referenced"]
+    audit_only = reference_snapshot.get("audit_only") or set()
+    history_analysis = reference_snapshot["history"]
+    strong_history_referenced = history_analysis["strong_paths"]
+    weak_history_by_path = history_analysis["weak_by_path"]
+    candidates: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    requested_kinds = (
+        ("generated", "temporary-upload")
+        if kind == "all"
+        else (kind,)
+    )
+    summary: Dict[str, Any] = {
+        "total_files": 0,
+        "total_bytes": 0,
+        "candidate_files": 0,
+        "candidate_bytes": 0,
+        "protected_files": 0,
+        "protected_bytes": 0,
+        "protected_by": {
+            "online_history": 0,
+            "other_records": 0,
+            "recent_files": 0,
+            "fixed_example_reference": 0,
+        },
+        "candidate_by": {
+            "unreferenced": 0,
+            "legacy_unmarked_history": 0,
+            "canvas_log_only": 0,
+            "fixed_example_orphan": 0,
+        },
+        "legacy_unmarked_history_records": 0,
+        "breakdown": {},
+    }
+    candidate_weak_fingerprints: set[str] = set()
+    for scope_kind in requested_kinds:
+        breakdown = {
+            "total_files": 0,
+            "total_bytes": 0,
+            "candidate_files": 0,
+            "candidate_bytes": 0,
+            "protected_files": 0,
+            "protected_bytes": 0,
+            "legacy_history_candidate_files": 0,
+            "legacy_history_candidate_bytes": 0,
+        }
+        summary["breakdown"][scope_kind] = breakdown
+        for root in storage_cleanup_target_roots(scope_kind):
+            root.mkdir(parents=True, exist_ok=True)
+            if storage_cleanup_is_link_or_reparse(root):
+                raise ValueError("清理目录不能是链接或重解析点")
+            for current, dirs, files in os.walk(root, followlinks=False):
+                current_path = Path(current)
+                if storage_cleanup_is_link_or_reparse(current_path):
+                    raise ValueError("清理路径不能包含链接或重解析点")
+                safe_dirs = []
+                for name in dirs:
+                    if name.startswith("."):
+                        continue
+                    child = current_path / name
+                    if storage_cleanup_is_link_or_reparse(child):
+                        raise ValueError("清理路径不能包含链接或重解析点")
+                    safe_dirs.append(name)
+                dirs[:] = safe_dirs
+                for name in files:
+                    if name.startswith(".") or Path(name).suffix.lower() not in STORAGE_IMAGE_EXTS:
+                        continue
+                    path = current_path / name
+                    if storage_cleanup_is_link_or_reparse(path):
+                        raise ValueError("清理文件不能是链接或重解析点")
+                    key = storage_cleanup_path_key(path)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        details = path.stat()
+                    except OSError as exc:
+                        raise ValueError("无法核对待清理文件") from exc
+                    size = int(details.st_size)
+                    summary["total_files"] += 1
+                    summary["total_bytes"] += size
+                    breakdown["total_files"] += 1
+                    breakdown["total_bytes"] += size
+                    is_recent = (
+                        STORAGE_CLEANUP_PROTECTION_SECONDS > 0
+                        and float(details.st_mtime) >= cutoff
+                    )
+                    if key in referenced or is_recent:
+                        summary["protected_files"] += 1
+                        summary["protected_bytes"] += size
+                        breakdown["protected_files"] += 1
+                        breakdown["protected_bytes"] += size
+                        protected_source = "other_records"
+                        if key in strong_history_referenced:
+                            protected_source = "online_history"
+                        elif is_recent and key not in referenced:
+                            protected_source = "recent_files"
+                        summary["protected_by"][protected_source] += 1
+                        continue
+                    weak_fingerprints = sorted(weak_history_by_path.get(key, set()))
+                    candidate_source = (
+                        "legacy_unmarked_history"
+                        if weak_fingerprints
+                        else "canvas_log_only"
+                        if key in audit_only
+                        else "unreferenced"
+                    )
+                    candidate = {
+                        "path": str(path),
+                        "key": key,
+                        "kind": scope_kind,
+                        "size": size,
+                        "mtime_ns": int(details.st_mtime_ns),
+                        "candidate_source": candidate_source,
+                        "weak_history_fingerprints": weak_fingerprints,
+                    }
+                    candidates.append(candidate)
+                    summary["candidate_files"] += 1
+                    summary["candidate_bytes"] += size
+                    breakdown["candidate_files"] += 1
+                    breakdown["candidate_bytes"] += size
+                    summary["candidate_by"][candidate_source] += 1
+                    if weak_fingerprints:
+                        candidate_weak_fingerprints.update(weak_fingerprints)
+                        breakdown["legacy_history_candidate_files"] += 1
+                        breakdown["legacy_history_candidate_bytes"] += size
+    if kind == "all":
+        fixed_snapshot = storage_cleanup_fixed_example_snapshot()
+        fixed_breakdown = fixed_snapshot["breakdown"]
+        fixed_candidates = fixed_snapshot["candidates"]
+        summary["breakdown"]["fixed-example"] = fixed_breakdown
+        candidates.extend(fixed_candidates)
+        summary["total_files"] += int(fixed_breakdown["total_files"])
+        summary["total_bytes"] += int(fixed_breakdown["total_bytes"])
+        summary["candidate_files"] += int(fixed_breakdown["candidate_files"])
+        summary["candidate_bytes"] += int(fixed_breakdown["candidate_bytes"])
+        summary["protected_files"] += int(fixed_breakdown["protected_files"])
+        summary["protected_bytes"] += int(fixed_breakdown["protected_bytes"])
+        summary["protected_by"]["fixed_example_reference"] += int(
+            fixed_breakdown["protected_files"]
+        )
+        summary["candidate_by"]["fixed_example_orphan"] += len(fixed_candidates)
+    candidates.sort(key=lambda item: item["key"])
+    summary["legacy_unmarked_history_records"] = len(candidate_weak_fingerprints)
+    sample_kinds = (
+        (*requested_kinds, "fixed-example")
+        if kind == "all"
+        else requested_kinds
+    )
+    per_kind = max(1, 12 // max(1, len(sample_kinds)))
+    sample_candidates: list[Dict[str, Any]] = [
+        item
+        for scope_kind in sample_kinds
+        for item in [
+            candidate for candidate in candidates
+            if candidate["kind"] == scope_kind
+        ][:per_kind]
+    ]
+    selected_sample_keys = {str(item["key"]) for item in sample_candidates}
+    if len(sample_candidates) < 12:
+        sample_candidates.extend(
+            item for item in candidates
+            if str(item["key"]) not in selected_sample_keys
+        )
+    samples = [
+        {
+            "name": Path(str(item["path"])).name,
+            "kind": str(item["kind"]),
+            "size": int(item["size"]),
+            "candidate_source": str(item["candidate_source"]),
+        }
+        for item in sample_candidates[:12]
+    ]
+    return {"candidates": candidates, "summary": summary, "samples": samples}
+
+
+def storage_cleanup_candidate_snapshot(kind: str, cutoff: float) -> list[Dict[str, Any]]:
+    """Compatibility helper for callers that only need the candidate list."""
+    return list(storage_cleanup_scan_snapshot(kind, cutoff)["candidates"])
+
+
+def storage_cleanup_prune_confirmations(now: float) -> None:
+    expired = [
+        token for token, item in STORAGE_CLEANUP_CONFIRMATIONS.items()
+        if float(item.get("expires_at") or 0) <= now
+    ]
+    for token in expired:
+        STORAGE_CLEANUP_CONFIRMATIONS.pop(token, None)
+
+
+def storage_cleanup_consume_confirmation(confirmation_id: str) -> Dict[str, Any]:
+    now = time.time()
+    with STORAGE_CLEANUP_CONFIRMATION_LOCK:
+        storage_cleanup_prune_confirmations(now)
+        confirmation = STORAGE_CLEANUP_CONFIRMATIONS.pop(confirmation_id, None)
+    if not confirmation:
+        raise HTTPException(status_code=409, detail="清理确认已失效，请重新扫描")
+    return confirmation
+
+
+@app.post("/api/storage-cleanup/preview")
+async def preview_storage_cleanup(payload: StorageCleanupPreviewRequest):
+    now = time.time()
+    cutoff = now - STORAGE_CLEANUP_PROTECTION_SECONDS
+    try:
+        snapshot = await asyncio.to_thread(
+            storage_cleanup_scan_snapshot,
+            payload.kind,
+            cutoff,
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="本机引用记录无法安全核对，未执行清理",
+        ) from exc
+    confirmation_id = secrets.token_urlsafe(32)
+    expires_at = now + STORAGE_CLEANUP_CONFIRMATION_TTL_SECONDS
+    with STORAGE_CLEANUP_CONFIRMATION_LOCK:
+        storage_cleanup_prune_confirmations(now)
+        STORAGE_CLEANUP_CONFIRMATIONS[confirmation_id] = {
+            "kind": payload.kind,
+            "cutoff": cutoff,
+            "expires_at": expires_at,
+            "candidates": snapshot["candidates"],
+        }
+    return {
+        "confirmation_id": confirmation_id,
+        "kind": payload.kind,
+        "cutoff_at": datetime.datetime.fromtimestamp(
+            cutoff, datetime.timezone.utc
+        ).isoformat(),
+        "expires_at": datetime.datetime.fromtimestamp(
+            expires_at, datetime.timezone.utc
+        ).isoformat(),
+        "has_targets": bool(snapshot["candidates"]),
+        "summary": snapshot["summary"],
+        "samples": snapshot["samples"],
+    }
+
+
+@app.post("/api/storage-cleanup/confirm", status_code=202)
+async def confirm_storage_cleanup(payload: StorageCleanupConfirmRequest):
+    confirmation = storage_cleanup_consume_confirmation(payload.confirmation_id)
+    if not STORAGE_CLEANUP_EXECUTION_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="正在执行存储清理，请稍后重试")
+    job: Dict[str, Any] | None = None
+    try:
+        kind = str(confirmation.get("kind") or "")
+        cutoff = float(confirmation.get("cutoff") or 0)
+        current_snapshot = await asyncio.to_thread(storage_cleanup_scan_snapshot, kind, cutoff)
+        current = current_snapshot["candidates"]
+        current_by_key = {str(item.get("key") or ""): item for item in current}
+        targets = []
+        removed_bytes = 0
+        for original in confirmation.get("candidates") or []:
+            item = current_by_key.get(str(original.get("key") or ""))
+            if not item:
+                continue
+            if int(item.get("size") or -1) != int(original.get("size") or -2):
+                continue
+            if int(item.get("mtime_ns") or -1) != int(original.get("mtime_ns") or -2):
+                continue
+            if str(item.get("candidate_source") or "") != str(original.get("candidate_source") or ""):
+                continue
+            if list(item.get("weak_history_fingerprints") or []) != list(original.get("weak_history_fingerprints") or []):
+                continue
+            targets.append(Path(str(item["path"])))
+            removed_bytes += int(item.get("size") or 0)
+        if not targets:
+            return {
+                "kind": kind,
+                "removed": 0,
+                "removed_bytes": 0,
+                "queued": 0,
+                "queued_bytes": 0,
+                "cleanup_job_id": "",
+                "cleanup_status": "skipped",
+                "destination": "windows-recycle-bin",
+                "moved_to_recycle_bin": False,
+            }
+        target_by_key = {storage_cleanup_path_key(path): path for path in targets}
+        target_kind_by_key = {
+            str(item.get("key") or ""): str(item.get("kind") or "")
+            for item in current
+            if str(item.get("key") or "") in target_by_key
+        }
+        fixed_target_keys = {
+            key for key, item_kind in target_kind_by_key.items()
+            if item_kind == "fixed-example"
+        }
+        ordinary_target_keys = set(target_by_key) - fixed_target_keys
+        expected_by_path = {
+            str(item.get("key") or ""): list(item.get("weak_history_fingerprints") or [])
+            for item in current
+            if str(item.get("key") or "") in ordinary_target_keys
+        }
+        history_deleted = 0
+        history_updated = 0
+        accepted_ordinary_targets: set[Path] = set()
+        accepted_fixed_targets: set[Path] = {
+            target_by_key[key]
+            for key in fixed_target_keys
+            if target_by_key[key].is_file()
+        }
+        with HISTORY_LOCK:
+            existing_expected_by_path = {
+                key: fingerprints
+                for key, fingerprints in expected_by_path.items()
+                if key in target_by_key and target_by_key[key].is_file()
+            }
+            rewrite = storage_cleanup_rewrite_legacy_history_locked(existing_expected_by_path)
+            accepted_keys = set(rewrite["accepted_keys"])
+            accepted_ordinary_targets = {
+                target_by_key[key]
+                for key in accepted_keys
+                if key in target_by_key and target_by_key[key].is_file()
+            }
+            accepted_targets = accepted_ordinary_targets | accepted_fixed_targets
+            if not accepted_targets:
+                return {
+                    "kind": kind,
+                    "removed": 0,
+                    "removed_bytes": 0,
+                    "queued": 0,
+                    "queued_bytes": 0,
+                    "cleanup_job_id": "",
+                    "cleanup_status": "skipped",
+                    "destination": "windows-recycle-bin",
+                    "moved_to_recycle_bin": False,
+                }
+            job = storage_cleanup_create_job(
+                accepted_ordinary_targets,
+                accepted_fixed_targets,
+            )
+            history_deleted = int(rewrite["history_deleted"])
+            history_updated = int(rewrite["history_updated"])
+            if history_deleted or history_updated:
+                try:
+                    history_write_records_locked(rewrite["records"])
+                except Exception:
+                    one_click_cleanup_remove_job(str(job["job_id"]))
+                    job = None
+                    raise
+        accepted_targets = accepted_ordinary_targets | accepted_fixed_targets
+        queued_bytes = sum(
+            int(item.get("size") or 0)
+            for item in current
+            if str(item.get("key") or "") in {
+                storage_cleanup_path_key(path) for path in accepted_targets
+            }
+        )
+        event = ONE_CLICK_CLEANUP_WAKE_EVENT
+        if event is not None:
+            event.set()
+        return {
+            "kind": kind,
+            "removed": 0,
+            "removed_bytes": 0,
+            "queued": len(accepted_targets),
+            "queued_bytes": queued_bytes or removed_bytes,
+            "history_deleted": history_deleted,
+            "history_updated": history_updated,
+            "cleanup_job_id": str((job or {}).get("job_id") or ""),
+            "cleanup_status": "queued",
+            "destination": "windows-recycle-bin",
+            "moved_to_recycle_bin": False,
+        }
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        if job is not None:
+            one_click_cleanup_remove_job(str(job.get("job_id") or ""))
+        raise HTTPException(
+            status_code=409,
+            detail="本机引用记录无法安全核对，未执行清理",
+        ) from exc
+    finally:
+        STORAGE_CLEANUP_EXECUTION_LOCK.release()
+
+
+@app.get("/api/storage-cleanup/jobs/{job_id}")
+async def get_one_click_cleanup_job(job_id: str):
+    job = one_click_cleanup_job_snapshot(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="图片清理任务不存在")
+    return one_click_cleanup_public_job(job)
+
+
+class OneClickCleanupReviewConfirmRequest(BaseModel):
+    confirmation_id: str = ""
+
+
+def one_click_cleanup_prune_review_confirmations(now: float) -> None:
+    expired = [
+        key for key, value in ONE_CLICK_CLEANUP_REVIEW_CONFIRMATIONS.items()
+        if float(value.get("expires_at") or 0) <= now
+    ]
+    for key in expired:
+        ONE_CLICK_CLEANUP_REVIEW_CONFIRMATIONS.pop(key, None)
+
+
+def one_click_cleanup_review_preview(job: Mapping[str, Any]) -> Dict[str, Any]:
+    if str(job.get("status") or "") != "review_required":
+        raise ValueError("当前清理任务不需要重新确认")
+    media_ids, media_paths = one_click_cleanup_normalize_candidates(
+        job.get("media_paths") or [],
+        job.get("media_ids") or [],
+    )
+    referenced, signature = storage_cleanup_stable_reference_snapshot()
+    source_labels = storage_cleanup_reference_source_labels_for_keys(referenced)
+    candidates: list[Dict[str, Any]] = []
+    for media_id in media_ids:
+        record = IMAGE_GENERATION_MEDIA_STORE.media_record(media_id)
+        metadata = IMAGE_GENERATION_MEDIA_STORE._read_media_metadata(media_id)
+        image_path: Path | None = None
+        if record is not None:
+            filename = Path(urllib.parse.urlsplit(str(record.get("url") or "")).path).name
+            image_path = Path(IMAGE_GENERATION_MEDIA_STORE.media_root) / media_id[:2] / filename
+        target_key = storage_cleanup_path_key(image_path) if image_path else ""
+        details: Dict[str, Any] = {
+            "media_id": media_id,
+            "path": str(image_path) if image_path else "",
+            "name": image_path.name if image_path else media_id,
+            "exists": bool(image_path and image_path.is_file()),
+            "metadata_valid": bool(metadata),
+            "referenced": bool(target_key and target_key in referenced),
+            "reference_sources": (
+                source_labels.get(target_key, [])
+                if target_key and target_key in referenced
+                else []
+            ),
+        }
+        if image_path and image_path.is_file():
+            details.update(one_click_cleanup_file_snapshot(image_path))
+        candidates.append(details)
+    for raw in media_paths:
+        path = Path(raw)
+        target_key = storage_cleanup_path_key(path)
+        details = {
+            "media_id": "",
+            "path": str(path),
+            "name": path.name,
+            "exists": path.is_file(),
+            "metadata_valid": None,
+            "referenced": target_key in referenced,
+            "reference_sources": (
+                source_labels.get(target_key, [])
+                if target_key in referenced
+                else []
+            ),
+        }
+        if path.is_file():
+            details.update(one_click_cleanup_file_snapshot(path))
+        candidates.append(details)
+    now = time.time()
+    confirmation_id = secrets.token_urlsafe(32)
+    expires_at = now + ONE_CLICK_CLEANUP_REVIEW_CONFIRMATION_TTL_SECONDS
+    with ONE_CLICK_CLEANUP_REVIEW_CONFIRMATION_LOCK:
+        one_click_cleanup_prune_review_confirmations(now)
+        ONE_CLICK_CLEANUP_REVIEW_CONFIRMATIONS[confirmation_id] = {
+            "job_id": str(job.get("job_id") or ""),
+            "reference_signature": signature,
+            "expires_at": expires_at,
+        }
+    return {
+        "job_id": str(job.get("job_id") or ""),
+        "confirmation_id": confirmation_id,
+        "expires_at": datetime.datetime.fromtimestamp(
+            expires_at, datetime.timezone.utc
+        ).isoformat(),
+        "candidates": candidates,
+    }
+
+
+@app.post("/api/storage-cleanup/jobs/{job_id}/review")
+async def review_one_click_cleanup_job(job_id: str):
+    job = one_click_cleanup_job_snapshot(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="图片清理任务不存在")
+    try:
+        return await asyncio.to_thread(one_click_cleanup_review_preview, job)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc) or "清理任务无法安全审计") from exc
+
+
+@app.post("/api/storage-cleanup/jobs/{job_id}/confirm-review", status_code=202)
+async def confirm_one_click_cleanup_review(
+    job_id: str,
+    payload: OneClickCleanupReviewConfirmRequest,
+):
+    now = time.time()
+    with ONE_CLICK_CLEANUP_REVIEW_CONFIRMATION_LOCK:
+        one_click_cleanup_prune_review_confirmations(now)
+        confirmation = ONE_CLICK_CLEANUP_REVIEW_CONFIRMATIONS.pop(
+            str(payload.confirmation_id or ""), None
+        )
+    if not confirmation or str(confirmation.get("job_id") or "") != str(job_id):
+        raise HTTPException(status_code=409, detail="清理审计确认已失效，请重新预览")
+    job = one_click_cleanup_job_snapshot(job_id)
+    if not job or str(job.get("status") or "") != "review_required":
+        raise HTTPException(status_code=409, detail="清理任务状态已变化，请重新检查")
+    try:
+        if storage_cleanup_reference_signature() != str(confirmation.get("reference_signature") or ""):
+            raise ValueError("引用记录已变化，请重新预览")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    updated = one_click_cleanup_update_job(
+        job_id,
+        status="queued",
+        authorized=True,
+        review_required=False,
+        reviewed_at=now,
+        attempts=0,
+        error="",
+        next_attempt_at=0,
+    )
+    event = ONE_CLICK_CLEANUP_WAKE_EVENT
+    if event is not None:
+        event.set()
+    return one_click_cleanup_public_job(updated or job)
 
 def storage_file_item(kind, root, path):
     rel = os.path.relpath(path, root).replace("\\", "/")
@@ -8367,6 +11853,21 @@ def generate_video_preview_image(path: str, width: int) -> Image.Image:
         except OSError:
             pass
 
+
+def normalize_media_preview_image_mode(image: Image.Image) -> Image.Image:
+    mode = str(image.mode or "")
+    if mode.startswith("I;16"):
+        # Pillow cannot LANCZOS-resize 16-bit integer images. Down-map the
+        # full 16-bit range for the cached preview while leaving the source intact.
+        return image.convert("I").point(lambda value: value / 257).convert("L")
+    if mode in {"I", "F"}:
+        low, high = image.getextrema()
+        if high > low:
+            scale = 255.0 / (high - low)
+            return image.point(lambda value: (value - low) * scale).convert("L")
+        return Image.new("L", image.size, max(0, min(255, round(low))))
+    return image
+
 @app.get("/api/media-preview")
 async def media_preview(url: str, w: int = 512):
     path = output_file_from_url(url)
@@ -8396,7 +11897,7 @@ async def media_preview(url: str, w: int = 512):
                     img = generate_video_preview_image(path, width)
                 else:
                     with Image.open(path) as source:
-                        img = ImageOps.exif_transpose(source)
+                        img = normalize_media_preview_image_mode(ImageOps.exif_transpose(source))
                         img.thumbnail((width, width), Image.LANCZOS)
                         img = img.convert("RGBA" if image_has_alpha(img) else "RGB")
                 try:
@@ -10891,6 +14392,82 @@ async def save_ai_image_to_output(image_data, prefix="online_", category="output
         print(f"保存上游图片失败: {e}; url={value}")
         return value
 
+
+async def save_ai_image_to_media(image_data) -> dict[str, Any]:
+    """Persist one generated image in the canonical image-generation store."""
+    if not isinstance(image_data, dict):
+        raise ValueError("上游图片格式无效")
+    image_type = str(image_data.get("type") or "url").strip().lower()
+    value = image_data.get("value")
+    if not value:
+        raise ValueError("上游图片内容为空")
+    if image_type == "b64":
+        try:
+            content = base64.b64decode(str(value), validate=False)
+        except Exception as exc:
+            raise ValueError("上游图片编码无效") from exc
+        if not content:
+            raise ValueError("上游图片内容为空")
+        return await asyncio.to_thread(
+            IMAGE_GENERATION_MEDIA_STORE.adopt_bytes,
+            content,
+            str(image_data.get("mime_type") or image_data.get("mimeType") or "image/png"),
+            str(image_data.get("mime_type") or image_data.get("mimeType") or "image/png"),
+        )
+
+    if image_type in {"path", "file"}:
+        local_path = Path(str(value)).expanduser()
+        if not local_path.is_file() or local_path.is_symlink():
+            raise ValueError("上游图片文件不存在或不安全")
+        content = await asyncio.to_thread(local_path.read_bytes)
+        return await asyncio.to_thread(
+            IMAGE_GENERATION_MEDIA_STORE.adopt_bytes,
+            content,
+            local_path.suffix,
+            mimetypes.guess_type(local_path.name)[0] or "",
+        )
+
+    value = rewrite_runninghub_file_url(str(value).strip())
+    if value.startswith("/assets/image-generation/media/"):
+        return await asyncio.to_thread(IMAGE_GENERATION_MEDIA_STORE.adopt_local_url, value)
+    local_path = output_file_from_url(value)
+    if local_path and os.path.isfile(local_path):
+        content = await asyncio.to_thread(Path(local_path).read_bytes)
+        return await asyncio.to_thread(
+            IMAGE_GENERATION_MEDIA_STORE.adopt_bytes,
+            content,
+            Path(local_path).suffix,
+            mimetypes.guess_type(local_path)[0] or "",
+        )
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("上游图片地址无法安全保存")
+    timeout = httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        response = await client.get(value)
+        response.raise_for_status()
+    content_type = response.headers.get("Content-Type", "")
+    return await asyncio.to_thread(
+        IMAGE_GENERATION_MEDIA_STORE.adopt_bytes,
+        response.content,
+        Path(parsed.path).suffix,
+        content_type,
+    )
+
+
+def image_generation_media_output_meta(record: Mapping[str, Any], source_item=None) -> dict[str, Any]:
+    """Build result metadata without probing a legacy output path."""
+    meta = image_output_meta(str(record.get("url") or ""), source_item)
+    for key in ("width", "height"):
+        try:
+            value = int(record.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            meta[key] = value
+            meta[f"natural_{key}"] = value
+    return meta
+
 def image_output_meta(url, source_item=None):
     meta = {"url": url, "kind": "image"}
     if not url:
@@ -11525,7 +15102,7 @@ def runninghub_extract_outputs(data):
                 outputs.append(rewrite_runninghub_file_url(url))
     return outputs
 
-async def runninghub_store_remote_output(client, remote):
+async def runninghub_store_remote_output(client, remote, persist_mode=None):
     remote = rewrite_runninghub_file_url(remote)
     if not str(remote or "").startswith(("http://", "https://")):
         return remote
@@ -11533,6 +15110,16 @@ async def runninghub_store_remote_output(client, remote):
     if not response.is_success:
         return remote
     ext = runninghub_output_ext(remote, response.headers.get("content-type", ""))
+    if persist_mode is None:
+        persist_mode = IMAGE_GENERATION_PERSIST_MODE.get()
+    if persist_mode == "image_generation_media":
+        record = await asyncio.to_thread(
+            IMAGE_GENERATION_MEDIA_STORE.adopt_bytes,
+            response.content,
+            f".{ext}",
+            response.headers.get("content-type", ""),
+        )
+        return record["url"]
     filename = f"rh_{uuid.uuid4().hex[:12]}.{ext}"
     path = output_path_for(filename, "output")
     with open(path, "wb") as f:
@@ -12437,7 +16024,7 @@ async def runninghub_upload_local_to_filename(client, provider, url, use_wallet=
     if not content:
         return ""
     api_key = runninghub_api_key(provider, use_wallet=use_wallet)
-    upload_url = runninghub_endpoint_url(provider, "/task/openapi/upload")
+    upload_url = runninghub_execution_endpoint(provider, "runninghub_upload_endpoint", "/task/openapi/upload")
     files = {"file": (filename, content, content_type)}
     data = {"apiKey": api_key, "fileType": "input"}
     response = await client.post(upload_url, headers=runninghub_app_headers(False, use_wallet), data=data, files=files)
@@ -12520,20 +16107,24 @@ def runninghub_queue_maxed_payload(value, seen=None):
         return any(runninghub_queue_maxed_payload(item, seen) for item in value)
     return runninghub_queue_maxed_payload(str(value), seen)
 
-async def submit_prepared_runninghub_entry(prepared):
-    provider = get_api_provider_exact(prepared.get("provider_id") or "runninghub")
+async def submit_prepared_runninghub_entry(prepared, provider_override=None):
+    provider = (
+        copy.deepcopy(provider_override)
+        if isinstance(provider_override, dict)
+        else get_api_provider_exact(prepared.get("provider_id") or "runninghub")
+    )
     use_wallet = bool(prepared.get("use_wallet"))
     api_key = runninghub_api_key(provider, use_wallet=use_wallet)
     kind = str(prepared.get("kind") or "")
     entry_id = str(prepared.get("entry_id") or "").strip()
     node_info_list = sanitize_runninghub_node_info_list(prepared.get("node_info_list") or [])
     if kind == "workflow":
-        submit_url = runninghub_endpoint_url(provider, "/task/openapi/create")
+        submit_url = runninghub_execution_endpoint(provider, "runninghub_submit_endpoint", "/task/openapi/create")
         body = {"apiKey": api_key, "workflowId": entry_id, "addMetadata": True}
         if node_info_list:
             body["nodeInfoList"] = node_info_list
     else:
-        submit_url = runninghub_endpoint_url(provider, "/task/openapi/ai-app/run")
+        submit_url = runninghub_execution_endpoint(provider, "runninghub_submit_endpoint", "/task/openapi/ai-app/run")
         body = {"apiKey": api_key, "webappId": entry_id, "nodeInfoList": node_info_list}
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=180.0, write=120.0, pool=20.0)) as client:
         try:
@@ -12551,13 +16142,17 @@ async def submit_prepared_runninghub_entry(prepared):
         raise HTTPException(status_code=502, detail=runninghub_error_detail("RunningHub 未返回 taskId", raw, endpoint=submit_url))
     return str(task_id)
 
-async def query_runninghub_task_remote(task_id, use_wallet=False):
+async def query_runninghub_task_remote(task_id, use_wallet=False, provider_override=None, persist_mode=None):
     task_id = str(task_id or "").strip()
     if not task_id:
         raise HTTPException(status_code=400, detail="taskId 必填")
-    provider = runninghub_provider()
+    provider = (
+        copy.deepcopy(provider_override)
+        if isinstance(provider_override, dict)
+        else runninghub_provider()
+    )
     api_key = runninghub_api_key(provider, use_wallet=use_wallet)
-    url = runninghub_endpoint_url(provider, "/task/openapi/outputs")
+    url = runninghub_execution_endpoint(provider, "runninghub_query_endpoint", "/task/openapi/outputs")
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=240.0, write=30.0, pool=20.0)) as client:
         try:
             response = await client.post(url, headers=runninghub_app_headers(True, use_wallet, provider), json={"apiKey": api_key, "taskId": task_id})
@@ -12582,7 +16177,9 @@ async def query_runninghub_task_remote(task_id, use_wallet=False):
                 status = "SUCCESS"
                 for remote in remotes:
                     try:
-                        local_url = await runninghub_store_remote_output(client, remote)
+                        local_url = await runninghub_store_remote_output(
+                            client, remote, persist_mode=persist_mode
+                        )
                     except Exception:
                         local_url = remote
                     urls.append(local_url)
@@ -12599,29 +16196,111 @@ async def query_runninghub_task_remote(task_id, use_wallet=False):
             log_runninghub_error("query-unknown", raw, endpoint=url, taskId=task_id, code=code)
         return {"status": status, "urls": urls, "image_items": image_items, "failReason": runninghub_fail_reason(raw), "code": code}
 
-async def generate_runninghub_entry_image(prompt, size, model, reference_images, provider, entry, entry_params=None):
-    """运行 RunningHub 工作流 / AI 应用（与智能画布一致的运行方式），返回首张图片结果。"""
-    prepared = await prepare_runninghub_entry_submission(prompt, reference_images, provider, entry, entry_params)
-    task_id = await submit_prepared_runninghub_entry(prepared)
-    deadline = time.monotonic() + 1800
+async def wait_for_runninghub_entry_task(
+    task_id,
+    provider,
+    use_wallet=False,
+    observer=None,
+    timeout=1800,
+    persist_mode=None,
+):
+    """Query one saved RunningHub task; this function never submits work."""
+    deadline = time.monotonic() + max(0.01, float(timeout or 1800))
     last_payload = None
+    attempt = 0
     while time.monotonic() < deadline:
         await asyncio.sleep(2.5)
-        data = await query_runninghub_task_remote(task_id, bool(prepared.get("use_wallet")))
+        attempt += 1
+        try:
+            query_kwargs = {"provider_override": provider}
+            if persist_mode is not None:
+                query_kwargs["persist_mode"] = persist_mode
+            data = await query_runninghub_task_remote(
+                task_id, bool(use_wallet), **query_kwargs
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await notify_async_image_task_observer(observer, "recovering", {
+                "task_id": task_id,
+                "attempt": attempt,
+                "last_query_at": time.time(),
+                "error": str(getattr(exc, "detail", None) or exc)[:800],
+            })
+            setattr(exc, "upstream_task_id", str(task_id or ""))
+            raise
         last_payload = data
+        await notify_async_image_task_observer(observer, "querying", {
+            "task_id": task_id,
+            "attempt": attempt,
+            "last_query_at": time.time(),
+            "status": str(data.get("status") or ""),
+        })
         if data.get("status") == "SUCCESS":
             outputs = data.get("urls") or []
             if outputs:
-                return {"type": "url", "value": str(outputs[0])}, data
-            raise HTTPException(status_code=502, detail="RunningHub 任务无图片输出")
+                return data
+            raise DetailPageAsyncTaskFailed("RunningHub 任务无图片输出", task_id)
         if data.get("status") == "FAILED":
-            raise HTTPException(status_code=502, detail=f"RunningHub 任务失败：{data.get('failReason') or '未知错误'}")
-    raise HTTPException(status_code=504, detail=f"RunningHub 任务超时：{last_payload}")
+            raise DetailPageAsyncTaskFailed(
+                f"RunningHub 任务失败：{data.get('failReason') or '未知错误'}",
+                task_id,
+            )
+    raise DetailPageAsyncTaskUnknown(f"RunningHub 任务超时：{last_payload}", task_id)
 
-async def generate_runninghub_provider_image(prompt, size, model, reference_images=None, provider=None, entry_params=None):
-    entry = runninghub_entry_config_from_model(provider, model)
+async def generate_runninghub_entry_image(
+    prompt,
+    size,
+    model,
+    reference_images,
+    provider,
+    entry,
+    entry_params=None,
+    async_task_observer=None,
+):
+    """运行 RunningHub 工作流 / AI 应用（与智能画布一致的运行方式），返回首张图片结果。"""
+    prepared = await prepare_runninghub_entry_submission(prompt, reference_images, provider, entry, entry_params)
+    task_id = await submit_prepared_runninghub_entry(
+        prepared,
+        provider_override=provider if (provider or {}).get("_task5_execution") else None,
+    )
+    await notify_async_image_task_observer(async_task_observer, "submitted", {
+        "task_id": task_id,
+        "provider": copy.deepcopy(provider or {}),
+        "submitted_at": time.time(),
+    })
+    data = await wait_for_runninghub_entry_task(
+        task_id,
+        provider,
+        bool(prepared.get("use_wallet")),
+        async_task_observer,
+    )
+    outputs = data.get("urls") or []
+    return {"type": "url", "value": str(outputs[0])}, data
+
+async def generate_runninghub_provider_image(
+    prompt,
+    size,
+    model,
+    reference_images=None,
+    provider=None,
+    entry_params=None,
+    async_task_observer=None,
+):
+    entry = (provider or {}).get("_task5_runninghub_entry")
+    if not isinstance(entry, dict):
+        entry = runninghub_entry_config_from_model(provider, model)
     if entry:
-        return await generate_runninghub_entry_image(prompt, size, model, reference_images, provider, entry, entry_params)
+        return await generate_runninghub_entry_image(
+            prompt,
+            size,
+            model,
+            reference_images,
+            provider,
+            entry,
+            entry_params,
+            async_task_observer=async_task_observer,
+        )
     model_def = await runninghub_model_definition(provider, model)
     endpoint = runninghub_task_endpoint(provider, model_def.get("endpoint") or model)
     params = model_def.get("params") if isinstance(model_def.get("params"), list) else []
@@ -12782,8 +16461,9 @@ async def generate_ai_image(
     resolution="",
     runninghub_params=None,
     async_task_observer=None,
+    provider_override=None,
 ):
-    provider = get_api_provider(provider_id)
+    provider = copy.deepcopy(provider_override) if isinstance(provider_override, dict) else get_api_provider(provider_id)
     requested_model = str(model or "").strip()
     model = resolve_image_model_for_resolution(provider, requested_model, resolution)
     if is_tudou_provider(provider):
@@ -12797,13 +16477,19 @@ async def generate_ai_image(
     if is_jimeng_provider(provider):
         return await generate_jimeng_provider_image(prompt, size, model, reference_images, provider)
     if is_runninghub_provider(provider):
-        return await generate_runninghub_provider_image(prompt, size, model, reference_images, provider, runninghub_params)
+        args = (prompt, size, model, reference_images, provider, runninghub_params)
+        if async_task_observer is None:
+            return await generate_runninghub_provider_image(*args)
+        return await generate_runninghub_provider_image(*args, async_task_observer=async_task_observer)
     if effective_protocol(provider, requested_model) == "gemini":
         return await generate_gemini_provider_image(prompt, size, model, reference_images, provider)
     if is_volcengine_provider(provider):
         return await generate_volcengine_provider_image(prompt, size, model, reference_images, provider)
     if is_tudou_async_image_mode(provider, model):
-        return await generate_tudou_async_image(prompt, size, quality, model, reference_images, provider, aspect_ratio, resolution)
+        return await generate_tudou_async_image(
+            prompt, size, quality, model, reference_images, provider,
+            aspect_ratio, resolution, async_task_observer=async_task_observer,
+        )
     if is_tudou_provider(provider) and is_tudou_grok_image_model(model):
         return await generate_tudou_grok_image(prompt, size, model, reference_images, provider, aspect_ratio)
     is_apimart = is_apimart_provider(provider)
@@ -12822,6 +16508,8 @@ async def generate_ai_image(
     image_refs = [ref for ref in refs if ref not in mask_refs]
     image_request_mode = effective_image_request_mode(provider, model)
     detail_page_async = bool(async_task_observer) and detail_page_async_image_enabled(provider)
+    task5_single_shot = bool(provider.get("_task5_single_shot_submit"))
+    task5_track_task_id = bool(async_task_observer) and bool(provider.get("_task5_execution"))
     if detail_page_async:
         gen_url = add_url_query_parameter(gen_url, "async", "true")
         edit_url = add_url_query_parameter(edit_url, "async", "true")
@@ -12899,7 +16587,7 @@ async def generate_ai_image(
                     client,
                     "POST",
                     video_url,
-                    attempts=2,
+                    attempts=1 if task5_single_shot else 2,
                     headers=api_headers(provider=provider, model=model),
                     json=body,
                 )
@@ -12925,7 +16613,15 @@ async def generate_ai_image(
                 "tool_choice": {"type": "image_generation"},
             }
             responses_url = provider_endpoint_url(provider, "image_generation_endpoint", "/v1/responses")
-            response = await post_openai_responses(client, responses_url, api_headers(provider=provider, model=model), body)
+            response = await post_openai_responses(
+                client,
+                responses_url,
+                api_headers(provider=provider, model=model),
+                body,
+                async_task_observer=async_task_observer,
+                provider=provider,
+                single_shot=task5_single_shot,
+            )
         elif image_request_mode == "openai-json":
             # Agnes 等“OpenAI JSON 图片接口”统一走 /images/generations：
             # 不使用 /images/edits，不传顶层 response_format/n/quality；
@@ -12955,7 +16651,7 @@ async def generate_ai_image(
             if quality:
                 body["quality"] = quality
             response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
-            if response.status_code >= 400 and images_api_unsupported(response) and not detail_page_async:
+            if response.status_code >= 400 and images_api_unsupported(response) and not detail_page_async and not task5_single_shot:
                 response = await post_openai_edits()
         elif image_refs:
             # 1) OpenAI 协议的图生图/编辑用 multipart 提交到 /images/edits；
@@ -13000,7 +16696,7 @@ async def generate_ai_image(
                     fh.close()
             # 2) edits 失败 → 非 GPT-Image-2 可回退到 /images/generations + JSON image:[urls/base64]（grsai 风格）
             if response is None:
-                if is_gpt2 or detail_page_async:
+                if is_gpt2 or detail_page_async or task5_single_shot:
                     raise HTTPException(
                         status_code=502,
                         detail=f"图片编辑接口 /images/edits 调用失败：{edit_failed_text[:300] or edit_failed_status}。已停止自动重试，避免上游可能已扣费后再次请求。"
@@ -13029,12 +16725,12 @@ async def generate_ai_image(
                 headers=api_headers(provider=provider, model=model),
                 json=body,
             )
-            if response.status_code >= 400 and images_api_unsupported(response) and not detail_page_async:
+            if response.status_code >= 400 and images_api_unsupported(response) and not detail_page_async and not task5_single_shot:
                 response = await post_openai_edits()
         response.raise_for_status()
         raw = response.json()
         task_id = extract_task_id(raw) if isinstance(raw, dict) else None
-        if detail_page_async and task_id:
+        if (detail_page_async or task5_track_task_id) and task_id:
             await notify_async_image_task_observer(async_task_observer, "submitted", {
                 "task_id": task_id,
                 "provider": detail_page_async_provider_snapshot(provider, model),
@@ -15670,12 +19366,22 @@ async def fetch_upstream_models(provider_id: str):
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider_id} 未配置 API Key")
     return await fetch_models_from_upstream(provider.get("base_url") or "", api_key, provider_protocol(provider), provider.get("image_request_mode") or "openai")
 
-async def build_online_image_result(payload: OnlineImageRequest, async_task_observer=None):
-    provider = get_api_provider(payload.provider_id)
+async def build_online_image_result(
+    payload: OnlineImageRequest,
+    async_task_observer=None,
+    provider_override=None,
+    history_metadata: Mapping[str, Any] | None = None,
+    persist_mode: str = "legacy_output",
+):
+    provider = copy.deepcopy(provider_override) if isinstance(provider_override, dict) else get_api_provider(payload.provider_id)
     default_model = (provider.get("image_models") or [IMAGE_MODEL])[0]
     model = selected_model(payload.model, default_model)
     operation = str(payload.operation or "").strip().lower()
-    runninghub_entry = runninghub_entry_config_from_model(provider, model) if is_runninghub_provider(provider) else None
+    runninghub_entry = None
+    if is_runninghub_provider(provider):
+        runninghub_entry = provider.get("_task5_runninghub_entry")
+        if not isinstance(runninghub_entry, dict):
+            runninghub_entry = runninghub_entry_config_from_model(provider, model)
     runninghub_params = sanitize_runninghub_entry_params(runninghub_entry, payload.runninghub_params) if runninghub_entry else {}
     if operation != "upscale" and not str(payload.prompt or "").strip() and online_image_prompt_required(provider, model):
         raise HTTPException(status_code=400, detail="请输入提示词")
@@ -15701,6 +19407,7 @@ async def build_online_image_result(payload: OnlineImageRequest, async_task_obse
                 payload.prompt, request_size, payload.quality, model, image_refs, provider["id"],
                 payload.aspect_ratio, payload.resolution, runninghub_params,
                 async_task_observer=async_task_observer,
+                provider_override=provider,
             )
         try:
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
@@ -15709,22 +19416,31 @@ async def build_online_image_result(payload: OnlineImageRequest, async_task_obse
         local_urls = []
         local_items = []
         for item in image_items:
-            local_url = await save_ai_image_to_output(item, prefix="online_")
-            if local_url:
-                local_urls.append(local_url)
-                local_items.append(image_output_meta(local_url, item))
+            if persist_mode == "image_generation_media":
+                media = await save_ai_image_to_media(item)
+                local_urls.append(media["url"])
+                local_items.append(image_generation_media_output_meta(media, item))
+            else:
+                local_url = await save_ai_image_to_output(item, prefix="online_")
+                if local_url:
+                    local_urls.append(local_url)
+                    local_items.append(image_output_meta(local_url, item))
         return local_urls, local_items, raw_item
+    persist_token = IMAGE_GENERATION_PERSIST_MODE.set(str(persist_mode or "legacy_output"))
     try:
-        generated = await asyncio.gather(*(generate_one() for _ in range(count)))
-    except httpx.HTTPStatusError as exc:
-        log_net_error(f"生图 HTTP状态错误 provider={provider.get('id')} model={model} size={request_size}", exc)
-        text = exc.response.text or ''
-        friendly = friendly_image_error_detail(text, request_size, model)
-        detail = friendly or f"上游生图接口错误：{text[:300]}"
-        raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
-    except httpx.HTTPError as exc:
-        log_net_error(f"生图 网络/TLS错误 provider={provider.get('id')} model={model}", exc)
-        raise HTTPException(status_code=502, detail=f"请求上游生图接口失败：{exc}") from exc
+        try:
+            generated = await asyncio.gather(*(generate_one() for _ in range(count)))
+        except httpx.HTTPStatusError as exc:
+            log_net_error(f"生图 HTTP状态错误 provider={provider.get('id')} model={model} size={request_size}", exc)
+            text = exc.response.text or ''
+            friendly = friendly_image_error_detail(text, request_size, model)
+            detail = friendly or f"上游生图接口错误：{text[:300]}"
+            raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+        except httpx.HTTPError as exc:
+            log_net_error(f"生图 网络/TLS错误 provider={provider.get('id')} model={model}", exc)
+            raise HTTPException(status_code=502, detail=f"请求上游生图接口失败：{exc}") from exc
+    finally:
+        IMAGE_GENERATION_PERSIST_MODE.reset(persist_token)
 
     local_urls = [url for urls, _items, _raw in generated for url in (urls or []) if url]
     local_items = [item for _urls, items, _raw in generated for item in (items or []) if item.get("url")]
@@ -15749,7 +19465,7 @@ async def build_online_image_result(payload: OnlineImageRequest, async_task_obse
         "params": {"provider_id": provider["id"], "model": model, "logical_model": model, "model_display_name": model_display_name, "effective_model": effective_model, "resolution": payload.resolution, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "runninghub_params": runninghub_params},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
-    save_to_history(result)
+    save_history_record_with_metadata(result, history_metadata)
     if GLOBAL_LOOP:
         asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
     return result
@@ -16035,7 +19751,10 @@ async def online_runninghub_operation_query(operation_id: str = ""):
         record["updated_at"] = time.time()
         response = online_runninghub_operation_response(record)
     if save_result:
-        save_to_history(save_result)
+        save_history_record_with_metadata(
+            save_result,
+            {"source_type": "online-image"},
+        )
         if GLOBAL_LOOP:
             asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(save_result), GLOBAL_LOOP)
     return response
@@ -16063,7 +19782,10 @@ async def online_runninghub_operation_cancel(payload: OnlineRunningHubOperationC
 
 @app.post("/api/online-image")
 async def online_image(payload: OnlineImageRequest):
-    return await build_online_image_result(payload)
+    return await build_online_image_result(
+        payload,
+        history_metadata={"source_type": "online-image"},
+    )
 
 # Midjourney is intentionally kept outside the generic image-generation flow.
 # APIMart exposes it as a task API with its own action endpoints, which does not
@@ -16388,7 +20110,10 @@ async def query_image_task(payload: ImageTaskQueryRequest):
                         "params": {"provider_id": provider["id"]},
                         "raw": raw,
                     }
-                    save_to_history(result)
+                    save_history_record_with_metadata(
+                        result,
+                        {"source_type": "online-image"},
+                    )
                     if GLOBAL_LOOP:
                         asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
                     return result
@@ -16455,7 +20180,10 @@ async def query_image_task(payload: ImageTaskQueryRequest):
             "params": {"provider_id": provider["id"]},
             "raw": raw,
         }
-        save_to_history(result)
+        save_history_record_with_metadata(
+            result,
+            {"source_type": "online-image"},
+        )
         if GLOBAL_LOOP:
             asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
         return result
@@ -16483,14 +20211,26 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
             CANVAS_TASKS[task_id]["status"] = "running"
             CANVAS_TASKS[task_id]["updated_at"] = time.time()
     try:
-        result = await build_online_image_result(payload)
+        result = await build_online_image_result(
+            payload,
+            history_metadata={
+                "source_type": "canvas-online-image",
+                "source_task_id": task_id,
+            },
+        )
+        result["canvas_task_id"] = task_id
+        for item in result.get("image_items") or []:
+            if isinstance(item, dict):
+                item["canvas_task_id"] = task_id
         with CANVAS_TASK_LOCK:
-            CANVAS_TASKS[task_id].update({
+            task = CANVAS_TASKS.get(task_id)
+            if task is not None:
+                task.update({
                 "status": "succeeded",
                 "result": result,
                 "error": "",
                 "updated_at": time.time(),
-            })
+                })
     except JimengPendingError as exc:
         # 即梦云端还在排队：标记为 jimeng_pending，前端据 submit_id 持久续查（任务未丢失）
         info = jimeng_pending_payload(exc)
@@ -19750,11 +23490,31 @@ async def run_detail_page_screen(task_id: str, payload: DetailPageTaskRequest, s
                     last_error="",
                     error="",
                 )
+        history_metadata = {
+            "source_type": "detail-page",
+            "source_task_id": task_id,
+            "source_screen_no": screen_no,
+        }
         try:
             result = await (
-                build_online_image_result(request, async_task_observer=async_task_observer)
+                build_online_image_result(
+                    request,
+                    async_task_observer=async_task_observer,
+                    history_metadata=history_metadata,
+                    persist_mode="image_generation_media",
+                )
                 if provider_snapshot
-                else build_online_image_result(request)
+                else build_online_image_result(
+                    request,
+                    history_metadata=history_metadata,
+                    persist_mode="image_generation_media",
+                )
+            )
+            annotate_one_click_history_record(
+                task_id,
+                "detail-page",
+                result,
+                history_metadata,
             )
             candidate = detail_page_update_candidate(
                 task_id,
@@ -19841,7 +23601,12 @@ def detail_page_refresh_screen_candidate_status(task_id: str, screen_no: int):
         error = "；".join(str(candidate.get("error") or "") for candidate in candidates if candidate.get("error"))[:1200]
     return detail_page_update_screen(task_id, screen_no, status=status, error=error[:1200])
 
-async def detail_page_result_from_async_payload(candidate, task_payload):
+async def detail_page_result_from_async_payload(
+    candidate,
+    task_payload,
+    history_metadata=None,
+    persist_mode="legacy_output",
+):
     try:
         image_items = extract_images(task_payload)
     except HTTPException:
@@ -19849,10 +23614,15 @@ async def detail_page_result_from_async_payload(candidate, task_payload):
     local_urls = []
     local_items = []
     for item in image_items:
-        local_url = await save_ai_image_to_output(item, prefix="detail_recovered_")
-        if local_url:
-            local_urls.append(local_url)
-            local_items.append(image_output_meta(local_url, item))
+        if persist_mode == "image_generation_media":
+            media = await save_ai_image_to_media(item)
+            local_urls.append(media["url"])
+            local_items.append(image_generation_media_output_meta(media, item))
+        else:
+            local_url = await save_ai_image_to_output(item, prefix="detail_recovered_")
+            if local_url:
+                local_urls.append(local_url)
+                local_items.append(image_output_meta(local_url, item))
     if not local_urls:
         raise DetailPageAsyncTaskFailed("上游任务显示成功，但查询结果中没有图片", candidate.get("upstream_task_id"))
     snapshot = candidate.get("provider_snapshot") if isinstance(candidate.get("provider_snapshot"), dict) else {}
@@ -19872,7 +23642,7 @@ async def detail_page_result_from_async_payload(candidate, task_payload):
         "params": generation_params,
         "raw_usage": image_task_data(task_payload).get("usage") if isinstance(image_task_data(task_payload), dict) else None,
     }
-    save_to_history(result)
+    save_history_record_with_metadata(result, history_metadata)
     if GLOBAL_LOOP:
         asyncio.run_coroutine_threadsafe(manager.broadcast_new_image(result), GLOBAL_LOOP)
     return result
@@ -19932,7 +23702,23 @@ async def run_detail_page_candidate_recovery(task_id: str, screen_no: int, candi
         async with httpx.AsyncClient(timeout=timeout) as client:
             raw = await wait_for_detail_page_image_task(client, upstream_task_id, provider, observer)
         current = detail_page_get_candidate(task_id, screen_no, candidate_id) or candidate
-        result = await detail_page_result_from_async_payload(current, raw)
+        history_metadata = {
+            "source_type": "detail-page",
+            "source_task_id": task_id,
+            "source_screen_no": screen_no,
+        }
+        result = await detail_page_result_from_async_payload(
+            current,
+            raw,
+            history_metadata,
+            persist_mode="image_generation_media",
+        )
+        annotate_one_click_history_record(
+            task_id,
+            "detail-page",
+            result,
+            history_metadata,
+        )
         detail_page_update_candidate(
             task_id,
             screen_no,
@@ -20750,23 +24536,20 @@ async def optimize_detail_page_prompt(task_id: str, screen_no: int, payload: Det
     return {"screen_no": screen_no, "prompt_candidates": prompt_candidates}
 
 
-@app.delete("/api/detail-page-tasks/{task_id}/screens/{screen_no}")
+@app.delete("/api/detail-page-tasks/{task_id}/screens/{screen_no}", status_code=202)
 async def delete_detail_page_screen(task_id: str, screen_no: int):
     task = detail_page_task_snapshot(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="详情页任务不存在")
     if task.get("status") in DETAIL_PAGE_ACTIVE_STATUSES:
         raise HTTPException(status_code=409, detail="生成期间不能删除分屏")
-    with CANVAS_TASK_LOCK:
-        current = CANVAS_TASKS.get(task_id)
-        before = len(current.get("screens") or [])
-        current["screens"] = [item for item in current.get("screens") or [] if int(item.get("screen_no") or 0) != screen_no]
-        if len(current["screens"]) == before:
-            raise HTTPException(status_code=404, detail="详情页分屏不存在")
-        current["updated_at"] = time.time()
-        snapshot = copy.deepcopy(current)
-    detail_page_persist_task(snapshot)
-    return snapshot
+    try:
+        result = delete_one_click_task_screen_record(task, screen_no)
+        return JSONResponse(status_code=202, content=result)
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=f"删除分屏失败，未执行清理：{exc}") from exc
 
 
 @app.post("/api/detail-page-tasks/{task_id}/screens/reorder")
@@ -20821,31 +24604,3154 @@ async def download_detail_page_task(task_id: str):
     )
 
 
-@app.delete("/api/detail-page-tasks/{task_id}")
+@app.delete("/api/detail-page-tasks/{task_id}", status_code=202)
 async def delete_detail_page_task(task_id: str):
     task = detail_page_task_snapshot(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="详情页任务不存在")
-    for screen_task in list((DETAIL_PAGE_SCREEN_TASKS.get(task_id) or {}).values()):
-        if not screen_task.done():
-            screen_task.cancel()
-    background_task = DETAIL_PAGE_BACKGROUND_TASKS.get(task_id)
-    if background_task and not background_task.done():
-        background_task.cancel()
-    DETAIL_PAGE_SCREEN_TASKS.pop(task_id, None)
-    DETAIL_PAGE_BACKGROUND_TASKS.pop(task_id, None)
-    for key, recovery_task in list(DETAIL_PAGE_CANDIDATE_RECOVERY_TASKS.items()):
-        if key.startswith(f"{task_id}:"):
-            if not recovery_task.done():
-                recovery_task.cancel()
-            DETAIL_PAGE_CANDIDATE_RECOVERY_TASKS.pop(key, None)
-    with CANVAS_TASK_LOCK:
-        CANVAS_TASKS.pop(task_id, None)
+    if str(task.get("status") or "") in DETAIL_PAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="生成期间不能删除详情页分组")
     try:
-        detail_page_delete_persisted_task(task_id)
+        for screen_task in list((DETAIL_PAGE_SCREEN_TASKS.get(task_id) or {}).values()):
+            if not screen_task.done():
+                screen_task.cancel()
+        background_task = DETAIL_PAGE_BACKGROUND_TASKS.get(task_id)
+        if background_task and not background_task.done():
+            background_task.cancel()
+        DETAIL_PAGE_SCREEN_TASKS.pop(task_id, None)
+        DETAIL_PAGE_BACKGROUND_TASKS.pop(task_id, None)
+        for key, recovery_task in list(DETAIL_PAGE_CANDIDATE_RECOVERY_TASKS.items()):
+            if key.startswith(f"{task_id}:"):
+                if not recovery_task.done():
+                    recovery_task.cancel()
+                DETAIL_PAGE_CANDIDATE_RECOVERY_TASKS.pop(key, None)
+        result = delete_one_click_task_record(task)
+        return JSONResponse(status_code=202, content=result)
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=f"删除详情页分组失败，未执行清理：{exc}") from exc
+
+# --- 独立一键主图 ---
+
+MAIN_IMAGE_ACTIVE_STATUSES = {"planning", "repairing", "generating"}
+MAIN_IMAGE_TERMINAL_STATUSES = {"succeeded", "partial", "failed", "cancelled", "interrupted", "unknown"}
+
+
+def main_image_generation_settings(payload: MainImageTaskRequest):
+    settings = copy.deepcopy(detail_page_model_dump(payload) or {})
+    settings.pop("submission_id", None)
+    settings.pop("force_new", None)
+    return settings
+
+
+def main_image_config_fingerprint(payload: MainImageTaskRequest):
+    settings = main_image_generation_settings(payload)
+    settings.pop("product_image_meta", None)
+    settings.pop("reference_image_meta", None)
+    canonical = json.dumps(settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def validate_main_image_task_request(payload: MainImageTaskRequest):
+    if not payload.product_images:
+        raise HTTPException(status_code=400, detail="请至少上传一张产品图")
+    images = [*payload.product_images, *payload.reference_images]
+    if len(images) > 6:
+        raise HTTPException(status_code=400, detail="产品图和参考图合计最多 6 张")
+    if any(not is_image_reference_value(value) for value in images):
+        raise HTTPException(status_code=400, detail="主图任务包含无效图片地址")
+    if payload.copywriting not in {"required", "blank", "poster"}:
+        raise HTTPException(status_code=400, detail="不支持的文案设置")
+    if payload.richness not in {"concise", "medium", "rich"}:
+        raise HTTPException(status_code=400, detail="不支持的画面丰富度")
+    if payload.model_setting not in {"none", "use"}:
+        raise HTTPException(status_code=400, detail="不支持的模特设置")
+    if payload.model_pose not in {"normal", "specific"}:
+        raise HTTPException(status_code=400, detail="不支持的模特姿态")
+    if payload.model_setting == "use" and payload.model_usage > payload.image_count:
+        raise HTTPException(status_code=400, detail="模特使用数量不能超过主图数量")
+    return payload
+
+
+def main_image_task_file(task_id: str):
+    safe_id = str(task_id or "")
+    if not re.fullmatch(r"main_image_[A-Za-z0-9_-]{8,160}", safe_id):
+        return ""
+    return os.path.join(MAIN_IMAGE_TASK_DIR, f"{safe_id}.json")
+
+
+def main_image_group_meta_file():
+    return os.path.join(MAIN_IMAGE_TASK_DIR, "_meta.json")
+
+
+def main_image_read_next_group_no():
+    try:
+        with open(main_image_group_meta_file(), "r", encoding="utf-8") as handle:
+            value = int((json.load(handle) or {}).get("next_group_no") or 0)
+            if value > 0:
+                return value
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    maximum = 0
+    for path in glob.glob(os.path.join(MAIN_IMAGE_TASK_DIR, "main_image_*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                maximum = max(maximum, int((json.load(handle) or {}).get("group_no") or 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return maximum + 1
+
+
+def main_image_write_next_group_no(next_group_no):
+    os.makedirs(MAIN_IMAGE_TASK_DIR, exist_ok=True)
+    path = main_image_group_meta_file()
+    temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump({"next_group_no": max(1, int(next_group_no or 1))}, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def main_image_allocate_group_no_locked():
+    group_no = max(1, int(main_image_read_next_group_no() or 1))
+    main_image_write_next_group_no(group_no + 1)
+    return group_no
+
+
+def main_image_persist_task(task):
+    if not isinstance(task, dict) or task.get("type") != "main-image":
+        return
+    path = main_image_task_file(task.get("id"))
+    if not path:
+        return
+    os.makedirs(MAIN_IMAGE_TASK_DIR, exist_ok=True)
+    value = copy.deepcopy(task)
+    value.pop("raw_llm_response", None)
+    value.pop("system_prompt", None)
+    temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def main_image_delete_persisted_task(task_id: str):
+    path = main_image_task_file(task_id)
+    if path and os.path.isfile(path):
+        os.remove(path)
+
+
+def main_image_task_input_urls(task: Mapping[str, Any]) -> set[str]:
+    """Return the uploaded image URLs owned by a main-image group."""
+    if not isinstance(task, Mapping):
+        return set()
+    settings = task.get("settings") if isinstance(task.get("settings"), Mapping) else {}
+    values = [*(settings.get("product_images") or []), *(settings.get("reference_images") or [])]
+    return {str(value) for value in values if isinstance(value, str) and value}
+
+
+def one_click_task_input_urls(task: Mapping[str, Any]) -> set[str]:
+    """Return local/remote input URLs recorded by either one-click workflow."""
+    if not isinstance(task, Mapping):
+        return set()
+    settings = task.get("settings") if isinstance(task.get("settings"), Mapping) else {}
+    values = [*(settings.get("product_images") or []), *(settings.get("reference_images") or [])]
+    return {str(value) for value in values if isinstance(value, str) and str(value).strip()}
+
+
+def one_click_task_history_identity_sets(task: Mapping[str, Any]) -> tuple[set[str], set[str]]:
+    """Collect upstream IDs and output URLs belonging to one one-click group."""
+    upstream_ids: set[str] = set()
+    output_images: set[str] = set()
+    if not isinstance(task, Mapping):
+        return upstream_ids, output_images
+    for screen in task.get("screens") or []:
+        if not isinstance(screen, Mapping):
+            continue
+        candidates = screen.get("candidates") if isinstance(screen.get("candidates"), list) else []
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            if candidate.get("upstream_task_id"):
+                upstream_ids.add(str(candidate.get("upstream_task_id")))
+            result = candidate.get("result") if isinstance(candidate.get("result"), Mapping) else {}
+            for value in (result.get("task_id"), result.get("request_id")):
+                if value:
+                    upstream_ids.add(str(value))
+            values = [candidate.get("image_url"), result.get("image_url"), *(result.get("images") or [])]
+            for value in values:
+                if isinstance(value, str) and value:
+                    output_images.add(value)
+            for item in result.get("image_items") or []:
+                if isinstance(item, Mapping) and item.get("url"):
+                    output_images.add(str(item.get("url")))
+        result = screen.get("result") if isinstance(screen.get("result"), Mapping) else {}
+        for value in (result.get("task_id"), result.get("request_id")):
+            if value:
+                upstream_ids.add(str(value))
+        for value in (result.get("images") or []):
+            if isinstance(value, str) and value:
+                output_images.add(value)
+        for item in result.get("image_items") or []:
+            if isinstance(item, Mapping) and item.get("url"):
+                output_images.add(str(item.get("url")))
+    return upstream_ids, output_images
+
+
+def one_click_task_media_paths(task: Mapping[str, Any]) -> set[Path]:
+    """Resolve existing local input/output media for a one-click group."""
+    return one_click_task_input_media_paths(task) | one_click_task_output_media_paths(task)
+
+
+def one_click_media_paths_from_urls(urls: Iterable[str]) -> set[Path]:
+    """Resolve only the supplied one-click media URLs to existing local files."""
+    paths: set[Path] = set()
+    for url in urls:
+        try:
+            resolved = output_file_from_url(url)
+        except Exception:
+            resolved = None
+        if resolved:
+            candidate = Path(os.path.abspath(resolved))
+            if candidate.is_file():
+                paths.add(candidate)
+        try:
+            for candidate in storage_cleanup_paths_from_text(url):
+                if candidate.is_file():
+                    paths.add(Path(os.path.abspath(candidate)))
+        except Exception:
+            # An external URL or an unavailable storage mapping is not a local
+            # file owned by this task and must never make deletion fail open.
+            continue
+    return paths
+
+
+def one_click_task_input_media_paths(task: Mapping[str, Any]) -> set[Path]:
+    """Resolve uploaded inputs recorded by one main-image/detail-page group."""
+    return one_click_media_paths_from_urls(one_click_task_input_urls(task))
+
+
+def one_click_task_output_media_paths(task: Mapping[str, Any]) -> set[Path]:
+    """Resolve generated outputs recorded by one main-image/detail-page group."""
+    _upstream_ids, output_images = one_click_task_history_identity_sets(task)
+    return one_click_media_paths_from_urls(output_images)
+
+
+def one_click_value_media_paths(value: Any) -> set[Path]:
+    """Resolve existing local media mentioned anywhere in an owned record."""
+    paths: set[Path] = set()
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple, set)):
+            stack.extend(current)
+        elif isinstance(current, str):
+            try:
+                for candidate in storage_cleanup_paths_from_text(current):
+                    if candidate.is_file():
+                        paths.add(Path(os.path.abspath(candidate)))
+            except Exception:
+                continue
+    return paths
+
+
+def one_click_history_output_urls(record: Mapping[str, Any]) -> set[str]:
+    """Return only generated output URLs from one global history row."""
+    if not isinstance(record, Mapping):
+        return set()
+    values: set[str] = {
+        str(value)
+        for value in (record.get("images") or [])
+        if isinstance(value, str) and value
+    }
+    image_url = record.get("image_url")
+    if isinstance(image_url, str) and image_url:
+        values.add(image_url)
+    for item in record.get("image_items") or []:
+        if isinstance(item, Mapping) and isinstance(item.get("url"), str) and item.get("url"):
+            values.add(str(item.get("url")))
+    return values
+
+
+def one_click_urls_media_paths(values: Iterable[str]) -> set[Path]:
+    """Resolve an explicit output URL allowlist without walking other fields."""
+    paths: set[Path] = set()
+    for value in values:
+        try:
+            candidates = storage_cleanup_paths_from_text(str(value or ""))
+        except Exception:
+            candidates = set()
+        for candidate in candidates:
+            absolute = Path(os.path.abspath(candidate))
+            if absolute.is_file():
+                paths.add(absolute)
+    return paths
+
+
+def one_click_history_record_upstream_ids(record: Mapping[str, Any]) -> set[str]:
+    if not isinstance(record, Mapping):
+        return set()
+    return {
+        str(record.get(key))
+        for key in ("task_id", "request_id")
+        if str(record.get(key) or "")
+    }
+
+
+def one_click_prune_history_output_urls(
+    record: Mapping[str, Any],
+    removed_urls: set[str],
+    removed_upstream_ids: set[str],
+) -> Dict[str, Any] | None:
+    """Remove selected outputs from a mixed legacy row, preserving the rest."""
+    clone = copy.deepcopy(dict(record))
+    if isinstance(clone.get("images"), list):
+        clone["images"] = [
+            value for value in clone["images"]
+            if not (isinstance(value, str) and value in removed_urls)
+        ]
+    if isinstance(clone.get("image_items"), list):
+        clone["image_items"] = [
+            item for item in clone["image_items"]
+            if not (
+                isinstance(item, Mapping)
+                and str(item.get("url") or "") in removed_urls
+            )
+        ]
+    if str(clone.get("image_url") or "") in removed_urls:
+        clone.pop("image_url", None)
+    for key in ("task_id", "request_id"):
+        if str(clone.get(key) or "") in removed_upstream_ids:
+            clone.pop(key, None)
+    if not one_click_history_output_urls(clone):
+        return None
+    clone.pop("source_screen_no", None)
+    return clone
+
+
+def prepare_one_click_screen_history_mutation(
+    history: list[Dict[str, Any]],
+    task: Mapping[str, Any],
+    screen: Mapping[str, Any],
+) -> tuple[list[Dict[str, Any]], int, int, set[Path]]:
+    """Plan a fail-closed history mutation for exactly one removed screen."""
+    task_id = str(task.get("id") or "")
+    expected_type = str(task.get("type") or "")
+    screen_no = int(screen.get("screen_no") or 0)
+    if not task_id or expected_type not in {"main-image", "detail-page"} or screen_no <= 0:
+        raise ValueError("无效的一键单屏记录")
+    screen_task = {
+        "id": task_id,
+        "type": expected_type,
+        "settings": {},
+        "screens": [copy.deepcopy(dict(screen))],
+    }
+    target_upstream_ids, target_urls = one_click_task_history_identity_sets(screen_task)
+    retained: list[Dict[str, Any]] = []
+    deleted = 0
+    updated = 0
+    removed_urls: set[str] = set()
+    for raw in history:
+        if not isinstance(raw, dict):
+            raise ValueError("图片历史记录包含无效条目")
+        source_type = str(raw.get("source_type") or "")
+        source_task_id = str(raw.get("source_task_id") or "")
+        raw_screen_no = raw.get("source_screen_no")
+        try:
+            source_screen_no = int(raw_screen_no) if raw_screen_no not in (None, "") else 0
+        except (TypeError, ValueError) as exc:
+            raise ValueError("图片历史记录屏幕编号无效") from exc
+        if source_type and source_type != expected_type:
+            retained.append(raw)
+            continue
+        if source_task_id and source_task_id != task_id:
+            retained.append(raw)
+            continue
+        if source_task_id == task_id and source_screen_no and source_screen_no != screen_no:
+            retained.append(raw)
+            continue
+
+        record_urls = one_click_history_output_urls(raw)
+        record_upstream_ids = one_click_history_record_upstream_ids(raw)
+        exact_owner = source_task_id == task_id and source_screen_no == screen_no
+        matching_urls = record_urls & target_urls
+        upstream_match = bool(record_upstream_ids & target_upstream_ids)
+        if not exact_owner and not matching_urls and not upstream_match:
+            retained.append(raw)
+            continue
+
+        if exact_owner and record_urls and target_urls and not matching_urls:
+            raise ValueError("单屏历史记录与任务图片不一致")
+        if upstream_match and record_urls and target_urls and not matching_urls:
+            raise ValueError("单屏旧历史记录归属不明确")
+
+        removable = set(matching_urls)
+        if exact_owner and not target_urls:
+            removable.update(record_urls)
+        if upstream_match and not target_urls:
+            removable.update(record_urls)
+        remaining_urls = record_urls - removable
+        if exact_owner and not remaining_urls:
+            removed_urls.update(record_urls)
+            deleted += 1
+            continue
+        if not exact_owner and record_urls and not remaining_urls and (matching_urls or upstream_match):
+            removed_urls.update(record_urls)
+            deleted += 1
+            continue
+        if removable:
+            pruned = one_click_prune_history_output_urls(raw, removable, target_upstream_ids)
+            removed_urls.update(removable)
+            if pruned is None:
+                deleted += 1
+            else:
+                retained.append(pruned)
+                updated += 1
+            continue
+        if exact_owner or (upstream_match and not record_urls):
+            deleted += 1
+            continue
+        retained.append(raw)
+    return retained, deleted, updated, one_click_urls_media_paths(removed_urls)
+
+
+def one_click_history_record_owned_by_task(
+    record: Mapping[str, Any],
+    task: Mapping[str, Any],
+) -> bool:
+    """Match explicit and legacy history rows without crossing task ownership."""
+    if not isinstance(record, Mapping) or not isinstance(task, Mapping):
+        return False
+    task_id = str(task.get("id") or "")
+    if not task_id:
+        return False
+    expected_type = "main-image" if task.get("type") == "main-image" else "detail-page"
+    source_task_id = str(record.get("source_task_id") or "")
+    source_type = str(record.get("source_type") or "")
+    if source_task_id:
+        return source_task_id == task_id and (not source_type or source_type == expected_type)
+    if source_type and source_type != expected_type:
+        return False
+    _upstream_ids, output_images = one_click_task_history_identity_sets(task)
+    item_images = {
+        str(value)
+        for value in (record.get("images") or [])
+        if isinstance(value, str) and value
+    }
+    if item_images and output_images and item_images & output_images:
+        return True
+    item_task_id = str(record.get("task_id") or "")
+    return bool(item_task_id and item_task_id in _upstream_ids)
+
+
+def delete_one_click_history_rows_locked(task: Mapping[str, Any]) -> int:
+    """Remove all durable history rows owned by a deleted one-click group."""
+    history = history_read_records_strict_locked()
+    if not history:
+        return 0
+    retained = [item for item in history if not one_click_history_record_owned_by_task(item, task)]
+    removed = len(history) - len(retained)
+    if removed:
+        history_write_records_locked(retained)
+    return removed
+
+
+def history_read_records_strict_locked() -> list[Dict[str, Any]]:
+    """Read history for destructive work and fail closed on damaged records."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8-sig") as handle:
+            value = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("图片历史记录无法安全读取") from exc
+    if not isinstance(value, list):
+        raise ValueError("图片历史记录格式无效")
+    return value
+
+
+def restore_deleted_record_file(path: str, content: bytes) -> None:
+    """Restore a task JSON after a failed media/history deletion transaction."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.restore.tmp")
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+class OneClickCleanupBusyError(RuntimeError):
+    """Raised when another storage operation currently owns the cleanup lock."""
+
+
+def one_click_cleanup_job_path(job_id: str) -> Path:
+    value = str(job_id or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise ValueError("一键清理任务编号无效")
+    return Path(ONE_CLICK_CLEANUP_JOB_DIR) / f"{value}.json"
+
+
+def one_click_cleanup_write_job_locked(job: Mapping[str, Any]) -> None:
+    job_id = str(job.get("job_id") or "")
+    target = one_click_cleanup_job_path(job_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(dict(job), handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def one_click_cleanup_public_job(job: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return job state without exposing the internal candidate paths."""
+    return {
+        key: copy.deepcopy(job.get(key))
+        for key in (
+            "job_id",
+            "task_id",
+            "task_ids",
+            "task_type",
+            "status",
+            "attempts",
+            "created_at",
+            "updated_at",
+            "next_attempt_at",
+            "media_candidates",
+            "media_deleted",
+            "media_preserved",
+            "media_restored",
+            "quarantine_invalid",
+            "destination",
+            "moved_to_recycle_bin",
+            "review_required",
+            "reviewed_at",
+            "error",
+        )
+        if key in job
+    }
+
+
+def one_click_cleanup_media_id_from_path(path: Path | str) -> str | None:
+    """Parse one canonical CAS path without reading or hashing the file."""
+    candidate = Path(os.path.abspath(str(path)))
+    root = Path(os.path.abspath(IMAGE_GENERATION_MEDIA_STORE.media_root))
+    if not storage_cleanup_path_within(candidate, root):
+        return None
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("一键清理正式素材路径越界") from exc
+    if len(relative.parts) != 2:
+        raise ValueError("一键清理正式素材路径无效")
+    shard, filename = relative.parts
+    file_path = Path(filename)
+    media_id = file_path.stem.lower()
+    if (
+        not IMAGE_GENERATION_MEDIA_STORE._is_media_id(media_id)
+        or shard.lower() != media_id[:2]
+        or file_path.suffix.lower() not in STORAGE_IMAGE_EXTS
+    ):
+        raise ValueError("一键清理正式素材路径无效")
+    return media_id
+
+
+def one_click_cleanup_normalize_candidates(
+    media_paths: Iterable[Path | str],
+    media_ids: Iterable[str] = (),
+) -> tuple[list[str], list[str]]:
+    """Split a one-click allowlist into canonical IDs and legacy paths."""
+    normalized_ids: set[str] = set()
+    for raw in media_ids or ():
+        value = str(raw or "").strip().lower()
+        if not IMAGE_GENERATION_MEDIA_STORE._is_media_id(value):
+            raise ValueError("一键清理媒体编号无效")
+        normalized_ids.add(value)
+    normalized_paths: set[str] = set()
+    ordinary_roots = storage_cleanup_all_roots()
+    for raw in media_paths or ():
+        candidate = Path(os.path.abspath(str(raw)))
+        media_id = one_click_cleanup_media_id_from_path(candidate)
+        if media_id is not None:
+            normalized_ids.add(media_id)
+            continue
+        if not any(storage_cleanup_path_within(candidate, root) for root in ordinary_roots):
+            raise ValueError("一键清理文件路径越界")
+        normalized_paths.add(str(candidate))
+    return (
+        sorted(normalized_ids),
+        sorted(normalized_paths, key=storage_cleanup_path_key),
+    )
+
+
+def one_click_cleanup_create_job(
+    task: Mapping[str, Any],
+    media_paths: set[Path],
+    *,
+    input_media_paths: Iterable[Path | str] = (),
+    status: str = "queued",
+) -> Dict[str, Any]:
+    if status not in {"preparing", "queued"}:
+        raise ValueError("一键清理任务初始状态无效")
+    task_type = str(task.get("type") or "")
+    direct_media_ids, direct_legacy_paths = one_click_cleanup_normalize_candidates(media_paths)
+    input_media_ids, input_legacy_paths = one_click_cleanup_normalize_candidates(input_media_paths)
+    direct_id_set = set(direct_media_ids)
+    direct_path_set = set(direct_legacy_paths)
+    input_media_ids = sorted(set(input_media_ids) - direct_id_set)
+    input_legacy_paths = sorted(
+        set(input_legacy_paths) - direct_path_set,
+        key=storage_cleanup_path_key,
+    )
+    media_ids = sorted(direct_id_set | set(input_media_ids))
+    legacy_paths = sorted(
+        direct_path_set | set(input_legacy_paths),
+        key=storage_cleanup_path_key,
+    )
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    job = {
+        "version": ONE_CLICK_CLEANUP_JOB_VERSION,
+        "job_id": job_id,
+        "task_id": str(task.get("id") or ""),
+        "task_type": task_type,
+        "media_ids": media_ids,
+        "media_paths": legacy_paths,
+        "cleanup_policy": (
+            "same-module-inputs-v1"
+            if task_type in {"main-image", "detail-page"}
+            else "legacy-reference-scan"
+        ),
+        "direct_media_ids": direct_media_ids,
+        "direct_media_paths": direct_legacy_paths,
+        "input_media_ids": input_media_ids,
+        "input_media_paths": input_legacy_paths,
+        "candidate_snapshots": [],
+        "review_required": False,
+        "authorized": True,
+        "media_candidates": len(media_ids) + len(legacy_paths),
+        "media_deleted": 0,
+        "media_preserved": 0,
+        "status": status,
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+        "next_attempt_at": 0,
+        "error": "",
+    }
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        one_click_cleanup_write_job_locked(job)
+        ONE_CLICK_CLEANUP_JOBS[job_id] = copy.deepcopy(job)
+    return job
+
+
+def storage_cleanup_normalize_fixed_example_paths(values: Iterable[Path | str]) -> list[str]:
+    root = storage_cleanup_fixed_example_root()
+    normalized: set[str] = set()
+    for raw in values or ():
+        path = Path(os.path.abspath(str(raw)))
+        if not storage_cleanup_path_within(path, root):
+            raise ValueError("固定案例清理路径越界")
+        if path.suffix.lower() not in STORAGE_IMAGE_EXTS:
+            raise ValueError("固定案例清理文件类型无效")
+        normalized.add(str(path))
+    return sorted(normalized, key=lambda item: storage_cleanup_path_key(item))
+
+
+def storage_cleanup_create_job(
+    media_paths: Iterable[Path | str],
+    fixed_example_paths: Iterable[Path | str],
+) -> Dict[str, Any]:
+    """Persist one mixed ordinary/fixed-example cleanup hand-off."""
+    normalized_media_paths = sorted({
+        str(Path(os.path.abspath(str(path))))
+        for path in media_paths or ()
+        if any(
+            storage_cleanup_path_within(Path(os.path.abspath(str(path))), root)
+            for root in storage_cleanup_all_roots()
+        )
+    }, key=storage_cleanup_path_key)
+    if len(normalized_media_paths) != len({str(path) for path in media_paths or ()}):
+        raise ValueError("存储清理文件路径越界或重复")
+    normalized_fixed_paths = storage_cleanup_normalize_fixed_example_paths(fixed_example_paths)
+    if len(normalized_fixed_paths) != len({str(path) for path in fixed_example_paths or ()}):
+        raise ValueError("固定案例清理路径重复")
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    job = {
+        "version": ONE_CLICK_CLEANUP_JOB_VERSION,
+        "job_id": job_id,
+        "task_id": f"storage-cleanup-{uuid.uuid4().hex}",
+        "task_type": "storage-cleanup",
+        "media_paths": normalized_media_paths,
+        "fixed_example_paths": normalized_fixed_paths,
+        "media_candidates": len(normalized_media_paths) + len(normalized_fixed_paths),
+        "media_deleted": 0,
+        "media_preserved": 0,
+        "status": "queued",
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+        "next_attempt_at": 0,
+        "error": "",
+    }
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        one_click_cleanup_write_job_locked(job)
+        ONE_CLICK_CLEANUP_JOBS[job_id] = copy.deepcopy(job)
+    return job
+
+
+def image_generation_cleanup_create_job(
+    *,
+    task_ids: Iterable[str],
+    media_ids: Iterable[str],
+    protected_media_ids: Iterable[str] = (),
+    media_paths: Iterable[Path | str] = (),
+    protected_media_paths: Iterable[Path | str] = (),
+    quarantine_media_ids: Iterable[str] = (),
+    quarantine_paths: Iterable[Path | str] = (),
+    media_cutoff: float | None = None,
+) -> Dict[str, Any]:
+    """Persist one image-generation cleanup hand-off before returning 202."""
+    normalized_task_ids = sorted({str(item) for item in task_ids if str(item)})
+    normalized_media_ids = sorted({
+        str(item) for item in media_ids
+        if IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(item))
+    })
+    normalized_protected_ids = sorted({
+        str(item) for item in protected_media_ids
+        if IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(item))
+    })
+    normalized_quarantine_ids = sorted({
+        str(item) for item in quarantine_media_ids
+        if IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(item))
+    })
+    normalized_media_paths = image_generation_cleanup_normalize_paths(media_paths)
+    normalized_protected_paths = image_generation_cleanup_normalize_paths(
+        protected_media_paths, field_name="图片生成保护路径"
+    )
+    normalized_quarantine_paths = image_generation_cleanup_normalize_paths(
+        quarantine_paths, field_name="图片生成隔离区路径"
+    )
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    job = {
+        "version": ONE_CLICK_CLEANUP_JOB_VERSION,
+        "job_id": job_id,
+        "task_id": normalized_task_ids[0] if len(normalized_task_ids) == 1 else "",
+        "task_ids": normalized_task_ids,
+        "task_type": "image-generation",
+        "media_ids": normalized_media_ids,
+        "protected_media_ids": normalized_protected_ids,
+        "media_paths": normalized_media_paths,
+        "protected_media_paths": normalized_protected_paths,
+        "quarantine_media_ids": normalized_quarantine_ids,
+        "quarantine_paths": normalized_quarantine_paths,
+        "media_cutoff": media_cutoff,
+        "media_candidates": len(
+            set(normalized_media_ids)
+            | set(normalized_media_paths)
+            | set(normalized_quarantine_ids)
+            | set(normalized_quarantine_paths)
+        ),
+        "media_deleted": 0,
+        "media_preserved": 0,
+        "status": "queued",
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+        "next_attempt_at": 0,
+        "error": "",
+    }
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        one_click_cleanup_write_job_locked(job)
+        ONE_CLICK_CLEANUP_JOBS[job_id] = copy.deepcopy(job)
+    return job
+
+
+def one_click_cleanup_prune_completed_receipts_locked(now: float | None = None) -> None:
+    current = time.time() if now is None else float(now)
+    expired = [
+        job_id for job_id, receipt in ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS.items()
+        if float(receipt.get("_receipt_expires_at") or 0) <= current
+    ]
+    for job_id in expired:
+        ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS.pop(job_id, None)
+    overflow = len(ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS) - ONE_CLICK_CLEANUP_COMPLETED_RECEIPT_LIMIT
+    if overflow > 0:
+        oldest = sorted(
+            ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS.items(),
+            key=lambda item: (
+                float(item[1].get("_receipt_expires_at") or 0),
+                str(item[0]),
+            ),
+        )
+        for job_id, _receipt in oldest[:overflow]:
+            ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS.pop(job_id, None)
+
+
+def one_click_cleanup_remove_job(
+    job_id: str,
+    *,
+    completed_job: Mapping[str, Any] | None = None,
+) -> None:
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        normalized_id = str(job_id)
+        ONE_CLICK_CLEANUP_JOBS.pop(normalized_id, None)
+        ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS.pop(normalized_id, None)
+        try:
+            one_click_cleanup_job_path(job_id).unlink()
+        except FileNotFoundError:
+            pass
+        if (
+            isinstance(completed_job, Mapping)
+            and str(completed_job.get("status") or "") == "succeeded"
+            and str(completed_job.get("task_type") or "") in {"main-image", "detail-page"}
+        ):
+            receipt = copy.deepcopy(dict(completed_job))
+            receipt["_receipt_expires_at"] = (
+                time.time() + ONE_CLICK_CLEANUP_COMPLETED_RECEIPT_TTL_SECONDS
+            )
+            ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS[normalized_id] = receipt
+            one_click_cleanup_prune_completed_receipts_locked()
+
+
+def load_one_click_cleanup_jobs() -> None:
+    """Load durable queued/failed cleanup jobs and recover interrupted work."""
+    root = Path(ONE_CLICK_CLEANUP_JOB_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    loaded: Dict[str, Dict[str, Any]] = {}
+    for path in sorted(root.glob("*.json")):
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(f"忽略损坏的一键清理任务 {path.name}: {exc}")
+            continue
+        if not isinstance(job, dict):
+            continue
+        job_id = str(job.get("job_id") or "")
+        try:
+            one_click_cleanup_job_path(job_id)
+        except ValueError:
+            continue
+        try:
+            job_version = int(job.get("version") or 0)
+        except (TypeError, ValueError):
+            continue
+        if job_version not in {1, 2, 3, ONE_CLICK_CLEANUP_JOB_VERSION}:
+            continue
+        task_type = str(job.get("task_type") or "")
+        if task_type not in {
+            "main-image", "detail-page", "image-generation", "legacy-history",
+            "canvas-reconcile", "storage-cleanup",
+        }:
+            continue
+        if task_type == "canvas-reconcile":
+            # This task type belonged to the old, incorrect "delete canvas
+            # node => delete history" behavior.  Keep the manifest auditable
+            # but make it terminal so a restart can never recycle files from
+            # an obsolete job.
+            job["status"] = "cancelled"
+            job["error"] = "画布节点删除不会自动清理，旧任务已停用"
+            job["next_attempt_at"] = 0
+            job["updated_at"] = time.time()
+            job["version"] = ONE_CLICK_CLEANUP_JOB_VERSION
+            loaded[job_id] = job
+            with ONE_CLICK_CLEANUP_JOB_LOCK:
+                one_click_cleanup_write_job_locked(job)
+            continue
+        if task_type == "image-generation":
+            raw_media_ids = job.get("media_ids")
+            raw_protected_media_ids = job.get("protected_media_ids")
+            raw_media_paths = job.get("media_paths", [])
+            raw_protected_media_paths = job.get("protected_media_paths", [])
+            raw_quarantine_media_ids = job.get("quarantine_media_ids", [])
+            raw_quarantine_paths = job.get("quarantine_paths", [])
+            if (
+                not isinstance(raw_media_ids, list)
+                or not isinstance(raw_protected_media_ids, list)
+                or not isinstance(raw_media_paths, list)
+                or not isinstance(raw_protected_media_paths, list)
+                or not isinstance(raw_quarantine_media_ids, list)
+                or not isinstance(raw_quarantine_paths, list)
+            ):
+                continue
+            if any(
+                not isinstance(item, str) or not IMAGE_GENERATION_MEDIA_STORE._is_media_id(item)
+                for item in (*raw_media_ids, *raw_protected_media_ids, *raw_quarantine_media_ids)
+            ):
+                continue
+            if (
+                len(raw_media_ids) != len(set(raw_media_ids))
+                or len(raw_protected_media_ids) != len(set(raw_protected_media_ids))
+                or len(raw_quarantine_media_ids) != len(set(raw_quarantine_media_ids))
+            ):
+                continue
+            try:
+                normalized_paths = image_generation_cleanup_normalize_paths(raw_media_paths)
+                normalized_protected_paths = image_generation_cleanup_normalize_paths(
+                    raw_protected_media_paths, field_name="图片生成保护路径"
+                )
+                normalized_quarantine_paths = image_generation_cleanup_normalize_paths(
+                    raw_quarantine_paths, field_name="图片生成隔离区路径"
+                )
+            except ValueError:
+                continue
+            if (
+                len(raw_media_paths) != len(normalized_paths)
+                or len(raw_protected_media_paths) != len(normalized_protected_paths)
+                or len(raw_quarantine_paths) != len(normalized_quarantine_paths)
+            ):
+                continue
+            job["media_paths"] = normalized_paths
+            job["protected_media_paths"] = normalized_protected_paths
+            job["quarantine_media_ids"] = sorted(raw_quarantine_media_ids)
+            job["quarantine_paths"] = normalized_quarantine_paths
+            media_cutoff = job.get("media_cutoff")
+            if media_cutoff is not None and (
+                isinstance(media_cutoff, bool) or not isinstance(media_cutoff, (int, float))
+            ):
+                continue
+        elif task_type == "storage-cleanup":
+            raw_media_paths = job.get("media_paths", [])
+            raw_fixed_paths = job.get("fixed_example_paths", [])
+            if not isinstance(raw_media_paths, list) or not isinstance(raw_fixed_paths, list):
+                continue
+            try:
+                normalized_media_paths = sorted({
+                    str(Path(os.path.abspath(str(path))))
+                    for path in raw_media_paths
+                    if any(
+                        storage_cleanup_path_within(Path(os.path.abspath(str(path))), root)
+                        for root in storage_cleanup_all_roots()
+                    )
+                }, key=storage_cleanup_path_key)
+                normalized_fixed_paths = storage_cleanup_normalize_fixed_example_paths(raw_fixed_paths)
+            except ValueError:
+                continue
+            if (
+                len(raw_media_paths) != len(normalized_media_paths)
+                or len(raw_fixed_paths) != len(normalized_fixed_paths)
+            ):
+                continue
+            job["media_paths"] = normalized_media_paths
+            job["fixed_example_paths"] = normalized_fixed_paths
+        else:
+            raw_media_paths = job.get("media_paths", [])
+            raw_media_ids = job.get("media_ids", [])
+            if not isinstance(raw_media_paths, list) or not isinstance(raw_media_ids, list):
+                continue
+            try:
+                normalized_media_ids, normalized_media_paths = one_click_cleanup_normalize_candidates(
+                    raw_media_paths,
+                    raw_media_ids,
+                )
+            except ValueError:
+                continue
+            job["media_ids"] = normalized_media_ids
+            job["media_paths"] = normalized_media_paths
+            cleanup_policy = str(job.get("cleanup_policy") or "")
+            if (
+                task_type in {"main-image", "detail-page"}
+                and job_version >= 4
+                and cleanup_policy == "same-module-inputs-v1"
+            ):
+                role_fields = (
+                    "direct_media_ids", "direct_media_paths",
+                    "input_media_ids", "input_media_paths",
+                )
+                if any(not isinstance(job.get(field), list) for field in role_fields):
+                    continue
+                try:
+                    direct_ids, direct_paths = one_click_cleanup_normalize_candidates(
+                        job.get("direct_media_paths") or [],
+                        job.get("direct_media_ids") or [],
+                    )
+                    input_ids, input_paths = one_click_cleanup_normalize_candidates(
+                        job.get("input_media_paths") or [],
+                        job.get("input_media_ids") or [],
+                    )
+                except ValueError:
+                    continue
+                direct_id_set = set(direct_ids)
+                direct_path_set = set(direct_paths)
+                input_ids = sorted(set(input_ids) - direct_id_set)
+                input_paths = sorted(
+                    set(input_paths) - direct_path_set,
+                    key=storage_cleanup_path_key,
+                )
+                if (
+                    set(normalized_media_ids) != direct_id_set | set(input_ids)
+                    or set(normalized_media_paths) != direct_path_set | set(input_paths)
+                ):
+                    continue
+                job["direct_media_ids"] = direct_ids
+                job["direct_media_paths"] = direct_paths
+                job["input_media_ids"] = input_ids
+                job["input_media_paths"] = input_paths
+            else:
+                job["cleanup_policy"] = "legacy-reference-scan"
+                job["direct_media_ids"] = []
+                job["direct_media_paths"] = []
+                job["input_media_ids"] = []
+                job["input_media_paths"] = []
+            job["candidate_snapshots"] = (
+                job.get("candidate_snapshots")
+                if isinstance(job.get("candidate_snapshots"), list)
+                else []
+            )
+            job["media_candidates"] = len(normalized_media_ids) + len(normalized_media_paths)
+            if job_version < 3 and normalized_media_ids:
+                # Version 1/2 one-click jobs were created before canonical CAS
+                # media was supported by this worker.  Never let a service
+                # restart turn a previously failed job into an automatic real
+                # deletion; require a fresh preview and explicit confirmation.
+                job["status"] = "review_required"
+                job["review_required"] = True
+                job["authorized"] = False
+                job["next_attempt_at"] = 0
+                job["error"] = "旧清理任务包含正式素材，需重新审计并确认"
+            else:
+                job["review_required"] = bool(job.get("review_required", False))
+                job["authorized"] = bool(job.get("authorized", True))
+        status = str(job.get("status") or "queued")
+        if status == "preparing":
+            # A process may stop after the durable job is written but before
+            # the record transaction activates it.  Re-running the full
+            # reference scan is safe in either case: surviving records protect
+            # their files, while completed deletions release them.
+            job["status"] = "queued"
+            job["next_attempt_at"] = 0
+            job["error"] = "服务重启后已恢复待提交清理任务"
+        elif status == "running":
+            job["status"] = "queued"
+            job["next_attempt_at"] = 0
+            job["error"] = "服务重启后已恢复排队"
+        elif status not in {"queued", "failed", "review_required"}:
+            continue
+        job["updated_at"] = time.time()
+        # Persist the current schema after loading a v1 job so the new
+        # quarantine fields survive a restart without breaking old jobs.
+        job["version"] = ONE_CLICK_CLEANUP_JOB_VERSION
+        loaded[job_id] = job
+        with ONE_CLICK_CLEANUP_JOB_LOCK:
+            one_click_cleanup_write_job_locked(job)
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        ONE_CLICK_CLEANUP_JOBS.clear()
+        ONE_CLICK_CLEANUP_JOBS.update(loaded)
+        ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS.clear()
+
+
+def one_click_cleanup_job_snapshot(job_id: str) -> Dict[str, Any] | None:
+    value = str(job_id or "")
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        one_click_cleanup_prune_completed_receipts_locked()
+        job = ONE_CLICK_CLEANUP_JOBS.get(value)
+        if job is not None:
+            return copy.deepcopy(job)
+        receipt = ONE_CLICK_CLEANUP_COMPLETED_RECEIPTS.get(value)
+        if receipt is not None:
+            return copy.deepcopy(receipt)
+        try:
+            path = one_click_cleanup_job_path(value)
+        except ValueError:
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return copy.deepcopy(raw) if isinstance(raw, dict) else None
+
+
+def one_click_cleanup_next_due_job() -> str | None:
+    now = time.time()
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        due = [
+            job for job in ONE_CLICK_CLEANUP_JOBS.values()
+            if str(job.get("status") or "") in {"queued", "failed"}
+            and float(job.get("next_attempt_at") or 0) <= now
+            and (
+                str(job.get("task_type") or "") not in {"main-image", "detail-page", "legacy-history"}
+                or (
+                    bool(job.get("authorized", True))
+                    and not bool(job.get("review_required"))
+                )
+            )
+        ]
+    if not due:
+        return None
+    due.sort(key=lambda item: (float(item.get("next_attempt_at") or 0), float(item.get("created_at") or 0)))
+    return str(due[0].get("job_id") or "") or None
+
+
+def one_click_cleanup_update_job(job_id: str, **updates: Any) -> Dict[str, Any] | None:
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        job = ONE_CLICK_CLEANUP_JOBS.get(str(job_id))
+        if not job:
+            return None
+        job.update(copy.deepcopy(updates))
+        job["updated_at"] = time.time()
+        one_click_cleanup_write_job_locked(job)
+        return copy.deepcopy(job)
+
+
+def one_click_cleanup_activate_job(job_id: str) -> Dict[str, Any]:
+    """Durably expose a prepared job to the worker after record commit."""
+    with ONE_CLICK_CLEANUP_JOB_LOCK:
+        current = ONE_CLICK_CLEANUP_JOBS.get(str(job_id))
+        if not current or str(current.get("status") or "") != "preparing":
+            raise OSError("一键清理任务无法激活")
+        activated = copy.deepcopy(current)
+        activated["status"] = "queued"
+        activated["updated_at"] = time.time()
+        activated["next_attempt_at"] = 0
+        activated["error"] = ""
+        # Persist first.  Until this succeeds the in-memory job remains in the
+        # non-runnable preparing state, so the worker cannot observe a partial
+        # record transaction.
+        one_click_cleanup_write_job_locked(activated)
+        ONE_CLICK_CLEANUP_JOBS[str(job_id)] = copy.deepcopy(activated)
+        return activated
+
+
+def run_storage_cleanup_job(job: Mapping[str, Any]) -> Dict[str, Any]:
+    """Recycle a mixed set of ordinary and stale fixed-example files."""
+    if str(job.get("task_type") or "") != "storage-cleanup":
+        raise ValueError("存储清理任务类型无效")
+    storage_cleanup_validate_scope("generated")
+    storage_cleanup_validate_scope("temporary-upload")
+    ordinary_paths: set[Path] = set()
+    for raw in job.get("media_paths") or []:
+        candidate = Path(os.path.abspath(str(raw)))
+        if not any(storage_cleanup_path_within(candidate, root) for root in storage_cleanup_all_roots()):
+            raise ValueError("存储清理文件路径越界")
+        if candidate.is_file():
+            ordinary_paths.add(candidate)
+    fixed_paths: set[Path] = set()
+    for raw in job.get("fixed_example_paths") or []:
+        candidate = Path(os.path.abspath(str(raw)))
+        if not storage_cleanup_path_within(candidate, storage_cleanup_fixed_example_root()):
+            raise ValueError("固定案例清理文件路径越界")
+        if candidate.is_file():
+            storage_cleanup_validate_fixed_example_file(candidate)
+            fixed_paths.add(candidate)
+    ordinary_referenced = storage_cleanup_referenced_paths() if ordinary_paths else set()
+    fixed_referenced = storage_cleanup_fixed_example_referenced_paths() if fixed_paths else set()
+    target_ordinary = {
+        path for path in ordinary_paths
+        if storage_cleanup_path_key(path) not in ordinary_referenced
+    }
+    target_fixed = {
+        path for path in fixed_paths
+        if storage_cleanup_path_key(path) not in fixed_referenced
+    }
+    targets = sorted(
+        target_ordinary | target_fixed,
+        key=storage_cleanup_path_key,
+    )
+    allowed_roots = (*storage_cleanup_all_roots(), storage_cleanup_fixed_example_root())
+    transaction: StorageCleanupTransaction | None = None
+    committed = False
+    try:
+        if targets:
+            transaction = StorageCleanupTransaction(
+                storage_cleanup_manifest_root(), allowed_roots
+            )
+            transaction.begin()
+            transaction.stage(targets)
+            ordinary_after = storage_cleanup_referenced_paths() if target_ordinary else set()
+            fixed_after = (
+                storage_cleanup_fixed_example_referenced_paths()
+                if target_fixed else set()
+            )
+            if any(
+                storage_cleanup_path_key(path) in ordinary_after
+                for path in target_ordinary
+            ):
+                raise ValueError("删除过程中检测到新的媒体引用")
+            if any(
+                storage_cleanup_path_key(path) in fixed_after
+                for path in target_fixed
+            ):
+                raise ValueError("删除过程中检测到新的固定案例引用")
+            transaction.commit_to_recycle_bin()
+            committed = True
+        storage_cleanup_prune_empty_fixed_example_directories()
+        candidate_count = len(ordinary_paths) + len(fixed_paths)
+        return {
+            "media_deleted": len(targets),
+            "media_preserved": max(0, candidate_count - len(targets)),
+            "destination": "windows-recycle-bin",
+            "moved_to_recycle_bin": bool(targets),
+        }
+    except Exception:
+        if transaction is not None and not committed:
+            try:
+                transaction.rollback()
+            except Exception:
+                pass
+        raise
+
+
+def one_click_cleanup_file_snapshot(path: Path | str) -> Dict[str, Any]:
+    """Hash one allowlisted file while proving it stayed unchanged."""
+    candidate = Path(os.path.abspath(str(path)))
+    try:
+        before = candidate.lstat()
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"删除任务记录失败：{exc}") from exc
-    return {"deleted": True, "task_id": task_id}
+        raise ValueError("清理候选文件无法读取") from exc
+    attributes = int(getattr(before, "st_file_attributes", 0) or 0)
+    if (
+        not candidate.is_file()
+        or stat.S_ISLNK(before.st_mode)
+        or bool(attributes & 0x0400)
+    ):
+        raise ValueError("清理候选文件不是普通文件")
+    digest = hashlib.sha256()
+    try:
+        with open(candidate, "rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        after = candidate.lstat()
+    except OSError as exc:
+        raise ValueError("清理候选文件读取失败") from exc
+    if (
+        int(before.st_size) != int(after.st_size)
+        or int(before.st_mtime_ns) != int(after.st_mtime_ns)
+    ):
+        raise ValueError("清理候选文件正在变化，稍后自动重试")
+    return {
+        "path": str(candidate),
+        "size": int(after.st_size),
+        "mtime_ns": int(after.st_mtime_ns),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def one_click_cleanup_validate_staged_files(
+    transaction: StorageCleanupTransaction,
+    snapshots: Iterable[Mapping[str, Any]],
+) -> None:
+    staged_by_source: dict[str, Path] = {}
+    for move in transaction.manifest.get("moves") or []:
+        source = transaction._path_from_move(move, "source")
+        staged = transaction._path_from_move(move, "staged")
+        staged_by_source[storage_cleanup_path_key(source)] = staged
+    for expected in snapshots:
+        source_key = storage_cleanup_path_key(str(expected.get("path") or ""))
+        staged = staged_by_source.get(source_key)
+        if staged is None:
+            raise ValueError("清理暂存清单不完整")
+        actual = one_click_cleanup_file_snapshot(staged)
+        if any(
+            actual.get(field) != expected.get(field)
+            for field in ("size", "mtime_ns", "sha256")
+        ):
+            raise ValueError("清理候选文件在暂存期间发生变化")
+
+
+def run_reference_scanned_one_click_media_cleanup_job(job: Mapping[str, Any]) -> Dict[str, Any]:
+    """Clean one deleted group through a CAS-aware, fail-closed transaction."""
+    if str(job.get("task_type") or "") not in {
+        "main-image", "detail-page", "legacy-history",
+    }:
+        raise ValueError("一键清理任务类型无效")
+    if not bool(job.get("authorized", True)) or bool(job.get("review_required")):
+        raise ValueError("清理任务尚未完成重新审计确认")
+    storage_cleanup_validate_scope("generated")
+    storage_cleanup_validate_scope("temporary-upload")
+    media_ids, normalized_paths = one_click_cleanup_normalize_candidates(
+        job.get("media_paths") or [],
+        job.get("media_ids") or [],
+    )
+    candidate_count = len(media_ids) + len(normalized_paths)
+
+    # The expensive operation happens only in this background worker.  The
+    # scan is accepted only when its inputs stayed unchanged from start to end.
+    referenced, reference_signature = storage_cleanup_stable_reference_snapshot()
+    target_ids: list[str] = []
+    target_paths: list[Path] = []
+    target_reference_paths: list[Path] = []
+    snapshots: list[Dict[str, Any]] = []
+
+    for media_id in media_ids:
+        record = IMAGE_GENERATION_MEDIA_STORE.media_record(media_id)
+        metadata = IMAGE_GENERATION_MEDIA_STORE._read_media_metadata(media_id)
+        if record is None or metadata is None:
+            # Missing/corrupt sidecars and hash-invalid images are never
+            # guessed safe. Preserve the whole object for manual repair.
+            continue
+        filename = Path(urllib.parse.urlsplit(str(record.get("url") or "")).path).name
+        image_path = Path(IMAGE_GENERATION_MEDIA_STORE.media_root) / media_id[:2] / filename
+        metadata_path = IMAGE_GENERATION_MEDIA_STORE._metadata_path(media_id)
+        if not metadata_path.is_file():
+            continue
+        if storage_cleanup_path_key(image_path) in referenced:
+            continue
+        pair = IMAGE_GENERATION_MEDIA_STORE.cleanup_paths([media_id])
+        if len(pair) != 2 or image_path not in pair or metadata_path not in pair:
+            continue
+        target_ids.append(media_id)
+        target_reference_paths.append(image_path)
+        target_paths.extend(pair)
+
+    for raw in normalized_paths:
+        path = Path(raw)
+        if not path.is_file():
+            continue
+        if storage_cleanup_path_key(path) in referenced:
+            continue
+        target_reference_paths.append(path)
+        target_paths.append(path)
+
+    target_paths = sorted(set(target_paths), key=storage_cleanup_path_key)
+    target_reference_keys = {
+        storage_cleanup_path_key(path) for path in target_reference_paths
+    }
+    for path in target_paths:
+        snapshot = one_click_cleanup_file_snapshot(path)
+        snapshot["kind"] = (
+            "metadata" if path.suffix.lower() == ".json" else "media"
+        )
+        snapshots.append(snapshot)
+    one_click_cleanup_update_job(
+        str(job.get("job_id") or ""),
+        candidate_snapshots=snapshots,
+        reference_signature=reference_signature,
+        scanned_at=time.time(),
+    )
+
+    transaction: StorageCleanupTransaction | None = None
+    committed = False
+    try:
+        if target_paths:
+            transaction = StorageCleanupTransaction(
+                storage_cleanup_manifest_root(),
+                image_generation_cleanup_path_roots(),
+            )
+            transaction.begin()
+            transaction.stage(target_paths)
+            one_click_cleanup_validate_staged_files(transaction, snapshots)
+
+            # Second check: a cheap signature normally reuses the first full
+            # scan. Only actual application-data changes pay for another scan.
+            current_signature = storage_cleanup_reference_signature()
+            if current_signature != reference_signature:
+                referenced, reference_signature = storage_cleanup_stable_reference_snapshot()
+                if target_reference_keys & referenced:
+                    raise ValueError("删除过程中检测到新的媒体引用")
+
+            # Third check is serialized with all other cleanup commits.  It is
+            # still lightweight unless reference data changed again.
+            with STORAGE_CLEANUP_REFERENCE_COMMIT_LOCK:
+                final_signature = storage_cleanup_reference_signature()
+                if final_signature != reference_signature:
+                    referenced, reference_signature = storage_cleanup_stable_reference_snapshot()
+                    if target_reference_keys & referenced:
+                        raise ValueError("回收前检测到新的媒体引用")
+                if storage_cleanup_reference_signature() != reference_signature:
+                    raise ValueError("回收前引用记录发生变化，稍后自动重试")
+                one_click_cleanup_validate_staged_files(transaction, snapshots)
+                transaction.commit_to_recycle_bin()
+                committed = True
+        if target_ids:
+            IMAGE_GENERATION_MEDIA_STORE.prune_empty_shard_directories()
+        deleted_count = len(target_ids) + sum(
+            1 for path in target_reference_paths
+            if one_click_cleanup_media_id_from_path(path) is None
+        )
+        return {
+            "media_deleted": deleted_count,
+            "media_preserved": max(0, candidate_count - deleted_count),
+            "destination": "windows-recycle-bin",
+            "moved_to_recycle_bin": bool(target_paths),
+        }
+    except Exception:
+        if transaction is not None and not committed:
+            try:
+                transaction.rollback()
+            except Exception:
+                pass
+        raise
+
+
+def one_click_cleanup_lightweight_file_snapshot(path: Path | str) -> Dict[str, Any]:
+    """Validate a direct-delete candidate without rereading the whole image."""
+    candidate = Path(os.path.abspath(str(path)))
+    try:
+        current = candidate.lstat()
+    except OSError as exc:
+        raise ValueError("清理候选文件无法读取") from exc
+    attributes = int(getattr(current, "st_file_attributes", 0) or 0)
+    if (
+        not candidate.is_file()
+        or stat.S_ISLNK(current.st_mode)
+        or bool(attributes & 0x0400)
+    ):
+        raise ValueError("清理候选文件不是普通文件")
+    return {
+        "path": str(candidate),
+        "size": int(current.st_size),
+        "mtime_ns": int(current.st_mtime_ns),
+    }
+
+
+def one_click_cleanup_validate_lightweight_staged_files(
+    transaction: StorageCleanupTransaction,
+    snapshots: Iterable[Mapping[str, Any]],
+) -> None:
+    staged_by_source: dict[str, Path] = {}
+    for move in transaction.manifest.get("moves") or []:
+        source = transaction._path_from_move(move, "source")
+        staged = transaction._path_from_move(move, "staged")
+        staged_by_source[storage_cleanup_path_key(source)] = staged
+    for expected in snapshots:
+        source_key = storage_cleanup_path_key(str(expected.get("path") or ""))
+        staged = staged_by_source.get(source_key)
+        if staged is None:
+            raise ValueError("清理暂存清单不完整")
+        actual = one_click_cleanup_lightweight_file_snapshot(staged)
+        if any(actual.get(field) != expected.get(field) for field in ("size", "mtime_ns")):
+            raise ValueError("清理候选文件在暂存期间发生变化")
+
+
+def one_click_same_module_input_reference_keys(
+    task_type: str,
+    *,
+    excluded_task_ids: Iterable[str] = (),
+) -> set[str]:
+    """Read uploaded-input references from only one one-click module."""
+    if task_type == "main-image":
+        root = Path(MAIN_IMAGE_TASK_DIR)
+        pattern = "main_image_*.json"
+    elif task_type == "detail-page":
+        root = Path(DETAIL_PAGE_TASK_DIR)
+        pattern = "detail_page_*.json"
+    else:
+        raise ValueError("一键上传图核对类型无效")
+    excluded = {str(item) for item in excluded_task_ids if str(item)}
+    tasks: dict[str, Dict[str, Any]] = {}
+    if root.exists():
+        for path in root.glob(pattern):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("同模块上传图引用无法安全读取") from exc
+            if not isinstance(value, dict) or str(value.get("type") or "") != task_type:
+                continue
+            task_id = str(value.get("id") or "")
+            if task_id and task_id not in excluded:
+                tasks[task_id] = value
+    with CANVAS_TASK_LOCK:
+        runtime_tasks = [
+            copy.deepcopy(item)
+            for item in CANVAS_TASKS.values()
+            if isinstance(item, dict)
+            and str(item.get("type") or "") == task_type
+            and str(item.get("id") or "") not in excluded
+        ]
+    for task in runtime_tasks:
+        task_id = str(task.get("id") or "")
+        if task_id:
+            tasks[task_id] = task
+    referenced: set[str] = set()
+    for task in tasks.values():
+        for path in one_click_task_input_media_paths(task):
+            referenced.add(storage_cleanup_path_key(path))
+    return referenced
+
+
+def one_click_cleanup_resolve_media_ids(
+    media_ids: Iterable[str],
+) -> tuple[list[str], list[Path], list[Path]]:
+    """Resolve CAS logical media without rereading image bytes or hashing."""
+    resolved_ids: list[str] = []
+    image_paths: list[Path] = []
+    all_paths: list[Path] = []
+    for media_id in sorted(set(media_ids)):
+        if not IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(media_id)):
+            continue
+        root = Path(IMAGE_GENERATION_MEDIA_STORE.media_root)
+        try:
+            shard = IMAGE_GENERATION_MEDIA_STORE._safe_directory(root / media_id[:2], root)
+            matches = [
+                item for item in IMAGE_GENERATION_MEDIA_STORE._safe_children(shard, root)
+                if item.is_file()
+                and item.stem.lower() == str(media_id).lower()
+                and item.suffix.lower() in STORAGE_IMAGE_EXTS
+            ]
+            if len(matches) != 1:
+                continue
+            image_path = IMAGE_GENERATION_MEDIA_STORE._safe_file(matches[0], root)
+            metadata_path = IMAGE_GENERATION_MEDIA_STORE._safe_file(
+                IMAGE_GENERATION_MEDIA_STORE._metadata_path(media_id),
+                Path(IMAGE_GENERATION_MEDIA_STORE.metadata_root),
+            ) if IMAGE_GENERATION_MEDIA_STORE._lexists(
+                IMAGE_GENERATION_MEDIA_STORE._metadata_path(media_id)
+            ) else None
+        except (OSError, ValueError):
+            continue
+        resolved_ids.append(media_id)
+        image_paths.append(image_path)
+        all_paths.append(image_path)
+        if metadata_path is not None:
+            all_paths.append(metadata_path)
+    return resolved_ids, image_paths, all_paths
+
+
+def run_same_module_one_click_media_cleanup_job(job: Mapping[str, Any]) -> Dict[str, Any]:
+    """Directly recycle outputs; protect uploads only inside the same module."""
+    task_type = str(job.get("task_type") or "")
+    if task_type not in {"main-image", "detail-page"}:
+        raise ValueError("一键清理任务类型无效")
+    if not bool(job.get("authorized", True)) or bool(job.get("review_required")):
+        raise ValueError("清理任务尚未完成重新审计确认")
+    storage_cleanup_validate_scope("generated")
+    storage_cleanup_validate_scope("temporary-upload")
+    direct_ids, direct_paths = one_click_cleanup_normalize_candidates(
+        job.get("direct_media_paths") or [],
+        job.get("direct_media_ids") or [],
+    )
+    input_ids, input_paths = one_click_cleanup_normalize_candidates(
+        job.get("input_media_paths") or [],
+        job.get("input_media_ids") or [],
+    )
+    direct_id_set = set(direct_ids)
+    direct_path_set = set(direct_paths)
+    input_ids = sorted(set(input_ids) - direct_id_set)
+    input_paths = sorted(set(input_paths) - direct_path_set, key=storage_cleanup_path_key)
+    candidate_count = len(direct_ids) + len(direct_paths) + len(input_ids) + len(input_paths)
+
+    referenced_inputs = (
+        one_click_same_module_input_reference_keys(
+            task_type,
+            excluded_task_ids={str(job.get("task_id") or "")},
+        )
+        if input_ids or input_paths
+        else set()
+    )
+    target_ids, direct_id_images, direct_id_paths = one_click_cleanup_resolve_media_ids(direct_ids)
+    input_resolved_ids, input_id_images, input_id_all_paths = one_click_cleanup_resolve_media_ids(input_ids)
+    target_reference_paths: list[Path] = list(direct_id_images)
+    target_paths: list[Path] = list(direct_id_paths)
+    target_input_reference_keys: set[str] = set()
+
+    for media_id, image_path in zip(input_resolved_ids, input_id_images):
+        image_key = storage_cleanup_path_key(image_path)
+        if image_key in referenced_inputs:
+            continue
+        pair = IMAGE_GENERATION_MEDIA_STORE.cleanup_paths([media_id])
+        target_ids.append(media_id)
+        target_reference_paths.append(image_path)
+        target_paths.extend(path for path in pair if path.is_file())
+        target_input_reference_keys.add(image_key)
+    for raw in direct_paths:
+        path = Path(raw)
+        if path.is_file():
+            target_reference_paths.append(path)
+            target_paths.append(path)
+    for raw in input_paths:
+        path = Path(raw)
+        key = storage_cleanup_path_key(path)
+        if path.is_file() and key not in referenced_inputs:
+            target_reference_paths.append(path)
+            target_paths.append(path)
+            target_input_reference_keys.add(key)
+
+    target_paths = sorted(set(target_paths), key=storage_cleanup_path_key)
+    snapshots = [one_click_cleanup_lightweight_file_snapshot(path) for path in target_paths]
+    one_click_cleanup_update_job(
+        str(job.get("job_id") or ""),
+        candidate_snapshots=snapshots,
+        scanned_at=time.time(),
+    )
+    transaction: StorageCleanupTransaction | None = None
+    committed = False
+    try:
+        if target_paths:
+            transaction = StorageCleanupTransaction(
+                storage_cleanup_manifest_root(),
+                image_generation_cleanup_path_roots(),
+            )
+            transaction.begin()
+            transaction.stage(target_paths)
+            one_click_cleanup_validate_lightweight_staged_files(transaction, snapshots)
+            with STORAGE_CLEANUP_REFERENCE_COMMIT_LOCK:
+                if target_input_reference_keys:
+                    final_referenced_inputs = one_click_same_module_input_reference_keys(
+                        task_type,
+                        excluded_task_ids={str(job.get("task_id") or "")},
+                    )
+                    if target_input_reference_keys & final_referenced_inputs:
+                        raise ValueError("回收前检测到同模块新的上传图引用")
+                one_click_cleanup_validate_lightweight_staged_files(transaction, snapshots)
+                transaction.commit_to_recycle_bin()
+                committed = True
+        if target_ids:
+            IMAGE_GENERATION_MEDIA_STORE.prune_empty_shard_directories()
+        deleted_count = len(set(target_ids)) + sum(
+            1 for path in target_reference_paths
+            if one_click_cleanup_media_id_from_path(path) is None
+        )
+        return {
+            "media_deleted": deleted_count,
+            "media_preserved": max(0, candidate_count - deleted_count),
+            "destination": "windows-recycle-bin",
+            "moved_to_recycle_bin": bool(target_paths),
+        }
+    except Exception:
+        if transaction is not None and not committed:
+            try:
+                transaction.rollback()
+            except Exception:
+                pass
+        raise
+
+
+def run_one_click_media_cleanup_job(job: Mapping[str, Any]) -> Dict[str, Any]:
+    if str(job.get("cleanup_policy") or "") == "same-module-inputs-v1":
+        return run_same_module_one_click_media_cleanup_job(job)
+    return run_reference_scanned_one_click_media_cleanup_job(job)
+
+
+def run_image_generation_media_cleanup_job(job: Mapping[str, Any]) -> Dict[str, Any]:
+    """Move unreferenced image-generation media to the Windows Recycle Bin.
+
+    Legacy quarantine pairs are handled conservatively: a still-referenced
+    pair is restored into CAS first, while an unreferenced valid pair is moved
+    as an image+JSON unit. Invalid pairs remain untouched for manual review.
+    """
+    if str(job.get("task_type") or "") != "image-generation":
+        raise ValueError("图片生成清理任务类型无效")
+    raw_media_ids = list(job.get("media_ids") or [])
+    raw_protected_ids = list(job.get("protected_media_ids") or [])
+    raw_quarantine_ids = list(job.get("quarantine_media_ids") or [])
+    media_ids = {
+        str(item) for item in raw_media_ids
+        if IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(item))
+    }
+    if len(media_ids) != len(raw_media_ids):
+        raise ValueError("图片生成清理媒体编号无效")
+    protected_ids = {
+        str(item) for item in raw_protected_ids
+        if IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(item))
+    }
+    if len(protected_ids) != len(raw_protected_ids):
+        raise ValueError("图片生成保护媒体编号无效")
+    quarantine_ids = {
+        str(item) for item in raw_quarantine_ids
+        if IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(item))
+    }
+    if len(quarantine_ids) != len(raw_quarantine_ids):
+        raise ValueError("图片生成隔离区媒体编号无效")
+    raw_media_paths = list(job.get("media_paths") or [])
+    raw_protected_paths = list(job.get("protected_media_paths") or [])
+    media_paths = {
+        Path(item) for item in image_generation_cleanup_normalize_paths(raw_media_paths)
+    }
+    protected_paths = {
+        Path(item) for item in image_generation_cleanup_normalize_paths(
+            raw_protected_paths, field_name="图片生成保护路径"
+        )
+    }
+    raw_quarantine_paths = list(job.get("quarantine_paths") or [])
+    quarantine_paths = {
+        Path(item) for item in image_generation_cleanup_normalize_paths(
+            raw_quarantine_paths, field_name="图片生成隔离区路径"
+        )
+    }
+    cutoff = job.get("media_cutoff")
+    if cutoff is not None:
+        if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
+            raise ValueError("图片生成清理截止时间无效")
+        media_ids = {
+            media_id for media_id in media_ids
+            if (
+                (activity := IMAGE_GENERATION_MEDIA_STORE.media_activity_time(media_id)) is not None
+                and activity.timestamp() < float(cutoff)
+            )
+        }
+        media_paths = {
+            path for path in media_paths
+            if path.is_file() and float(path.stat().st_mtime) < float(cutoff)
+        }
+        quarantine_paths = {
+            path for path in quarantine_paths
+            if path.is_file() and float(path.stat().st_mtime) < float(cutoff)
+        }
+
+    # Re-validate the exact sidecar/image pairs from the persisted allowlist.
+    quarantine_pairs: list[tuple[str, Path, Path]] = []
+    for sidecar in sorted(quarantine_paths, key=storage_cleanup_path_key):
+        if sidecar.suffix.lower() != ".json":
+            continue
+        pair = image_generation_cleanup_quarantine_pair(sidecar, cutoff=cutoff)
+        if pair is None:
+            continue
+        media_id, image_path, validated_sidecar = pair
+        if media_id not in quarantine_ids:
+            continue
+        if image_path not in quarantine_paths:
+            continue
+        quarantine_pairs.append((media_id, image_path, validated_sidecar))
+    quarantine_pair_ids = {item[0] for item in quarantine_pairs}
+
+    referenced_ids = IMAGE_GENERATION_MEDIA_STORE.referenced_media_ids(
+        include_missing_media_ids=media_ids | quarantine_ids
+    )
+    target_ids = sorted(media_ids - protected_ids - referenced_ids)
+    existing_target_ids = [
+        media_id for media_id in target_ids
+        if IMAGE_GENERATION_MEDIA_STORE.media_record(media_id) is not None
+    ]
+
+    # Legacy `/assets/output/online_*.png` records do not have a CAS id.  They
+    # use the same complete path-reference scan as one-click cleanup, including
+    # history, canvases, drafts, favorites/examples and runtime state.
+    referenced_paths = storage_cleanup_referenced_paths() if media_paths else set()
+    target_legacy_paths = sorted(
+        {
+            path for path in media_paths
+            if path not in protected_paths
+            and storage_cleanup_path_key(path) not in referenced_paths
+            and path.is_file()
+        },
+        key=storage_cleanup_path_key,
+    )
+    restored_quarantine_ids: set[str] = set()
+    for media_id, image_path, _sidecar in quarantine_pairs:
+        if media_id not in referenced_ids:
+            continue
+        # Restore a referenced legacy pair into canonical storage before the
+        # old pair is recycled. This is idempotent and writes its metadata JSON.
+        content = image_path.read_bytes()
+        restored = IMAGE_GENERATION_MEDIA_STORE.adopt_bytes(
+            content, image_path.suffix, mimetypes.guess_type(image_path.name)[0] or ""
+        )
+        if restored.get("id") != media_id:
+            raise ValueError("图片生成隔离区媒体恢复校验失败")
+        restored_quarantine_ids.add(media_id)
+
+    target_quarantine_paths = [
+        path for media_id, image_path, sidecar in quarantine_pairs
+        if media_id not in restored_quarantine_ids
+        for path in (image_path, sidecar)
+    ]
+    # Referenced pairs are also recycled after restoration; the canonical CAS
+    # copy is now the sole durable object.
+    target_quarantine_paths.extend(
+        path
+        for media_id, image_path, sidecar in quarantine_pairs
+        if media_id in restored_quarantine_ids
+        for path in (image_path, sidecar)
+    )
+    target_paths = [
+        *IMAGE_GENERATION_MEDIA_STORE.cleanup_paths(existing_target_ids),
+        *target_legacy_paths,
+        *target_quarantine_paths,
+    ]
+    transaction: StorageCleanupTransaction | None = None
+    committed = False
+    try:
+        if target_paths:
+            transaction = StorageCleanupTransaction(
+                storage_cleanup_manifest_root(), image_generation_cleanup_path_roots()
+            )
+            transaction.begin()
+            transaction.stage(target_paths)
+            referenced_after_stage = (
+                storage_cleanup_referenced_paths()
+                if target_legacy_paths or target_quarantine_paths
+                else set()
+            )
+            if any(
+                storage_cleanup_path_key(path) in referenced_after_stage
+                for path in [*target_legacy_paths, *target_quarantine_paths]
+            ):
+                raise ValueError("删除过程中检测到新的旧版图片引用")
+            referenced_ids_after_stage = IMAGE_GENERATION_MEDIA_STORE.referenced_media_ids(
+                include_missing_media_ids=set(existing_target_ids) | quarantine_pair_ids
+            )
+            if set(existing_target_ids) & referenced_ids_after_stage:
+                raise ValueError("删除过程中检测到新的图片生成媒体引用")
+            if (quarantine_pair_ids - restored_quarantine_ids) & referenced_ids_after_stage:
+                raise ValueError("删除过程中检测到新的隔离区媒体引用")
+            transaction.commit_to_recycle_bin()
+            committed = True
+        IMAGE_GENERATION_MEDIA_STORE.prune_empty_shard_directories()
+        candidate_count = len(
+            set(raw_media_ids)
+            | set(raw_media_paths)
+            | set(raw_quarantine_ids)
+            | set(raw_quarantine_paths)
+        )
+        deleted_count = (
+            len(existing_target_ids)
+            + len(target_legacy_paths)
+            + len(target_quarantine_paths)
+        )
+        return {
+            "media_deleted": deleted_count,
+            "media_preserved": max(0, candidate_count - deleted_count),
+            "media_restored": len(restored_quarantine_ids),
+            "quarantine_invalid": max(0, len(quarantine_ids - quarantine_pair_ids)),
+            "destination": "windows-recycle-bin",
+            "moved_to_recycle_bin": bool(target_paths),
+        }
+    except Exception:
+        if transaction is not None and not committed:
+            try:
+                transaction.rollback()
+            except Exception:
+                pass
+        raise
+
+
+def run_one_click_cleanup_job_once(job_id: str) -> Dict[str, Any]:
+    """Run one durable cleanup job once; failures stay queued for retry."""
+    if not STORAGE_CLEANUP_EXECUTION_LOCK.acquire(blocking=False):
+        raise OneClickCleanupBusyError("正在执行存储清理，请稍后重试")
+    try:
+        job = one_click_cleanup_job_snapshot(job_id)
+        if not job:
+            raise ValueError("一键清理任务不存在")
+        if (
+            str(job.get("task_type") or "") in {"main-image", "detail-page", "legacy-history"}
+            and (
+                not bool(job.get("authorized", True))
+                or bool(job.get("review_required"))
+            )
+        ):
+            return one_click_cleanup_public_job(job)
+        attempts = int(job.get("attempts") or 0) + 1
+        running = one_click_cleanup_update_job(
+            job_id,
+            status="running",
+            attempts=attempts,
+            error="",
+            next_attempt_at=0,
+        )
+        if not running:
+            raise ValueError("一键清理任务不存在")
+        try:
+            task_type = str(running.get("task_type") or "")
+            if task_type == "image-generation":
+                result = run_image_generation_media_cleanup_job(running)
+            elif task_type == "storage-cleanup":
+                result = run_storage_cleanup_job(running)
+            else:
+                result = run_one_click_media_cleanup_job(running)
+        except Exception as exc:
+            retry_after = min(60, ONE_CLICK_CLEANUP_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)))
+            failed = one_click_cleanup_update_job(
+                job_id,
+                status="failed",
+                error=str(exc) or "图片清理失败",
+                next_attempt_at=time.time() + retry_after,
+            )
+            return one_click_cleanup_public_job(failed or running)
+        success = {
+            **result,
+            "status": "succeeded",
+            "error": "",
+            "next_attempt_at": 0,
+        }
+        completed = one_click_cleanup_update_job(job_id, **success)
+        completed_job = completed or {**running, **success}
+        one_click_cleanup_remove_job(job_id, completed_job=completed_job)
+        return one_click_cleanup_public_job(completed_job)
+    finally:
+        STORAGE_CLEANUP_EXECUTION_LOCK.release()
+
+
+async def one_click_cleanup_worker() -> None:
+    """Process durable cleanup jobs without blocking the FastAPI event loop."""
+    while True:
+        job_id = one_click_cleanup_next_due_job()
+        if job_id:
+            try:
+                await asyncio.to_thread(run_one_click_cleanup_job_once, job_id)
+            except OneClickCleanupBusyError:
+                await asyncio.sleep(0.5)
+            except Exception as exc:
+                print(f"一键分组图片清理任务失败: {exc}")
+            continue
+        event = ONE_CLICK_CLEANUP_WAKE_EVENT
+        if event is None:
+            await asyncio.sleep(ONE_CLICK_CLEANUP_POLL_SECONDS)
+            continue
+        event.clear()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=ONE_CLICK_CLEANUP_POLL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
+def start_one_click_cleanup_worker() -> None:
+    global ONE_CLICK_CLEANUP_WAKE_EVENT, ONE_CLICK_CLEANUP_WORKER_TASK
+    if ONE_CLICK_CLEANUP_WORKER_TASK and not ONE_CLICK_CLEANUP_WORKER_TASK.done():
+        return
+    ONE_CLICK_CLEANUP_WAKE_EVENT = asyncio.Event()
+    ONE_CLICK_CLEANUP_WORKER_TASK = asyncio.create_task(one_click_cleanup_worker())
+    ONE_CLICK_CLEANUP_WAKE_EVENT.set()
+
+
+async def stop_one_click_cleanup_worker() -> None:
+    global ONE_CLICK_CLEANUP_WAKE_EVENT, ONE_CLICK_CLEANUP_WORKER_TASK
+    worker = ONE_CLICK_CLEANUP_WORKER_TASK
+    ONE_CLICK_CLEANUP_WORKER_TASK = None
+    ONE_CLICK_CLEANUP_WAKE_EVENT = None
+    if not worker:
+        return
+    worker.cancel()
+    try:
+        await worker
+    except asyncio.CancelledError:
+        pass
+
+
+def delete_one_click_task_record(task: Mapping[str, Any]) -> Dict[str, Any]:
+    """Serialize fast deletion against late one-click history commits."""
+    with ONE_CLICK_RECORD_MUTATION_LOCK:
+        return delete_one_click_task_record_locked(task)
+
+
+def delete_one_click_task_record_locked(task: Mapping[str, Any]) -> Dict[str, Any]:
+    """Delete task/history records quickly and enqueue media cleanup."""
+    if not isinstance(task, Mapping) or task.get("type") not in {"main-image", "detail-page"}:
+        raise ValueError("无效的一键分组")
+    task_type = str(task.get("type") or "")
+    task_id = str(task.get("id") or "")
+    if not task_id:
+        raise ValueError("一键分组缺少任务编号")
+    current_task = one_click_task_snapshot_by_type(task_id, task_type)
+    if not current_task:
+        raise HTTPException(status_code=404, detail="一键分组不存在")
+    task = current_task
+    task_status = str(task.get("status") or "")
+    if task_type == "main-image" and task_status in MAIN_IMAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="生成期间不能删除主图分组")
+    if task_type == "detail-page" and task_status in DETAIL_PAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="生成期间不能删除详情页分组")
+    storage_cleanup_validate_scope("generated")
+    storage_cleanup_validate_scope("temporary-upload")
+    task_path = main_image_task_file(task_id) if task.get("type") == "main-image" else detail_page_task_file(task_id)
+    task_file_existed = bool(task_path and os.path.isfile(task_path))
+    task_file_content = b""
+    if task_file_existed:
+        with open(task_path, "rb") as handle:
+            task_file_content = handle.read()
+    output_media_paths = one_click_task_output_media_paths(task)
+    input_media_paths = one_click_task_input_media_paths(task)
+    history_existed = os.path.isfile(HISTORY_FILE)
+    history_backup: list[Dict[str, Any]] = []
+    history_deleted = 0
+    task_deleted = False
+    runtime_task = None
+    job = None
+    try:
+        with HISTORY_LOCK:
+            history_backup = history_read_records_strict_locked()
+            for item in history_backup:
+                if one_click_history_record_owned_by_task(item, task):
+                    output_media_paths.update(
+                        one_click_urls_media_paths(one_click_history_output_urls(item))
+                    )
+            job = (
+                one_click_cleanup_create_job(
+                    task,
+                    output_media_paths,
+                    input_media_paths=input_media_paths,
+                    status="preparing",
+                )
+                if output_media_paths or input_media_paths
+                else None
+            )
+            history_deleted = delete_one_click_history_rows_locked(task)
+            if task_path and os.path.isfile(task_path):
+                os.remove(task_path)
+                task_deleted = True
+        with CANVAS_TASK_LOCK:
+            runtime_task = copy.deepcopy(CANVAS_TASKS.pop(task_id, None))
+        if job:
+            job = one_click_cleanup_activate_job(str(job["job_id"]))
+        event = ONE_CLICK_CLEANUP_WAKE_EVENT
+        if event is not None:
+            event.set()
+        return {
+            "deleted": True,
+            "task_id": task_id,
+            "history_deleted": history_deleted,
+            "cleanup_job_id": str((job or {}).get("job_id") or "") or None,
+            "cleanup_status": "queued" if job else "skipped",
+            "media_candidates": int((job or {}).get("media_candidates") or 0),
+        }
+    except Exception:
+        if job:
+            one_click_cleanup_remove_job(str(job["job_id"]))
+        if history_deleted:
+            with HISTORY_LOCK:
+                if history_existed:
+                    history_write_records_locked(history_backup)
+                elif os.path.isfile(HISTORY_FILE):
+                    try:
+                        os.remove(HISTORY_FILE)
+                    except OSError:
+                        pass
+        if task_deleted and task_file_existed and task_path and not os.path.exists(task_path):
+            restore_deleted_record_file(task_path, task_file_content)
+        if runtime_task is not None:
+            with CANVAS_TASK_LOCK:
+                CANVAS_TASKS[task_id] = runtime_task
+        raise
+
+
+def delete_one_click_task_group(task: Mapping[str, Any]) -> Dict[str, Any]:
+    """Compatibility alias for callers that only need record deletion."""
+    return delete_one_click_task_record(task)
+
+
+def one_click_persist_task_snapshot(task: Mapping[str, Any]) -> None:
+    if str(task.get("type") or "") == "main-image":
+        main_image_persist_task(dict(task))
+    elif str(task.get("type") or "") == "detail-page":
+        detail_page_persist_task(dict(task))
+    else:
+        raise ValueError("无效的一键任务类型")
+
+
+def one_click_task_record_path(task: Mapping[str, Any]) -> str:
+    task_id = str(task.get("id") or "")
+    if str(task.get("type") or "") == "main-image":
+        return main_image_task_file(task_id)
+    if str(task.get("type") or "") == "detail-page":
+        return detail_page_task_file(task_id)
+    return ""
+
+
+def one_click_forget_screen_runtime(task_type: str, task_id: str, screen_no: int, *, task_deleted: bool) -> None:
+    prefix = f"{task_id}:{int(screen_no)}:"
+    recovery_tasks = (
+        MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS
+        if task_type == "main-image"
+        else DETAIL_PAGE_CANDIDATE_RECOVERY_TASKS
+    )
+    for key, background in list(recovery_tasks.items()):
+        if not str(key).startswith(prefix):
+            continue
+        if background and not background.done():
+            background.cancel()
+        recovery_tasks.pop(key, None)
+    screen_tasks = MAIN_IMAGE_SCREEN_TASKS if task_type == "main-image" else DETAIL_PAGE_SCREEN_TASKS
+    registered = screen_tasks.get(task_id)
+    if isinstance(registered, dict):
+        background = registered.pop(int(screen_no), None)
+        if background and not background.done():
+            background.cancel()
+        if not registered or task_deleted:
+            screen_tasks.pop(task_id, None)
+    if not task_deleted:
+        return
+    group_tasks = MAIN_IMAGE_BACKGROUND_TASKS if task_type == "main-image" else DETAIL_PAGE_BACKGROUND_TASKS
+    background = group_tasks.pop(task_id, None)
+    if background and not background.done():
+        background.cancel()
+
+
+def delete_one_click_task_screen_record(task: Mapping[str, Any], screen_no: int) -> Dict[str, Any]:
+    """Delete one screen immediately and hand only its outputs to cleanup."""
+    with ONE_CLICK_RECORD_MUTATION_LOCK:
+        return delete_one_click_task_screen_record_locked(task, screen_no)
+
+
+def delete_one_click_task_screen_record_locked(task: Mapping[str, Any], screen_no: int) -> Dict[str, Any]:
+    if not isinstance(task, Mapping) or task.get("type") not in {"main-image", "detail-page"}:
+        raise ValueError("无效的一键任务")
+    task_id = str(task.get("id") or "")
+    task_type = str(task.get("type") or "")
+    active_statuses = MAIN_IMAGE_ACTIVE_STATUSES if task_type == "main-image" else DETAIL_PAGE_ACTIVE_STATUSES
+    if str(task.get("status") or "") in active_statuses:
+        raise HTTPException(status_code=409, detail="生成期间不能删除图片")
+    try:
+        target_no = int(screen_no)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="图片不存在") from exc
+    current_task = one_click_task_snapshot_by_type(task_id, task_type)
+    if not current_task:
+        raise HTTPException(status_code=404, detail="一键任务不存在")
+    if str(current_task.get("status") or "") in active_statuses:
+        raise HTTPException(status_code=409, detail="生成期间不能删除图片")
+    screens = [item for item in (current_task.get("screens") or []) if isinstance(item, Mapping)]
+    removed_screen = next(
+        (copy.deepcopy(dict(item)) for item in screens if int(item.get("screen_no") or 0) == target_no),
+        None,
+    )
+    if removed_screen is None:
+        raise HTTPException(status_code=404, detail="图片不存在")
+
+    if len(screens) == 1:
+        result = delete_one_click_task_record_locked(current_task)
+        one_click_forget_screen_runtime(task_type, task_id, target_no, task_deleted=True)
+        return {
+            **result,
+            "screen_no": target_no,
+            "task_deleted": True,
+            "task": None,
+            "history_updated": 0,
+        }
+
+    updated_task = copy.deepcopy(current_task)
+    updated_task["screens"] = [
+        copy.deepcopy(dict(item))
+        for item in screens
+        if int(item.get("screen_no") or 0) != target_no
+    ]
+    updated_task["updated_at"] = time.time()
+    task_path = one_click_task_record_path(current_task)
+    task_file_existed = bool(task_path and os.path.isfile(task_path))
+    task_file_content = b""
+    if task_file_existed:
+        with open(task_path, "rb") as handle:
+            task_file_content = handle.read()
+    history_existed = os.path.isfile(HISTORY_FILE)
+    history_backup: list[Dict[str, Any]] = []
+    history_changed = False
+    job = None
+    screen_task = {
+        "id": task_id,
+        "type": task_type,
+        "settings": {},
+        "screens": [copy.deepcopy(removed_screen)],
+    }
+    media_paths = one_click_task_output_media_paths(screen_task)
+    runtime_before = copy.deepcopy(current_task)
+    try:
+        with HISTORY_LOCK:
+            history_backup = history_read_records_strict_locked()
+            retained, history_deleted, history_updated, history_media_paths = prepare_one_click_screen_history_mutation(
+                history_backup,
+                current_task,
+                removed_screen,
+            )
+            media_paths.update(history_media_paths)
+            job = one_click_cleanup_create_job(screen_task, media_paths, status="preparing") if media_paths else None
+            history_changed = retained != history_backup
+            if history_changed:
+                history_write_records_locked(retained)
+        one_click_persist_task_snapshot(updated_task)
+        with CANVAS_TASK_LOCK:
+            latest = CANVAS_TASKS.get(task_id)
+            if not latest or str(latest.get("type") or "") != task_type:
+                raise ValueError("一键任务在删除过程中发生变化")
+            latest_screens = [
+                int(item.get("screen_no") or 0)
+                for item in (latest.get("screens") or [])
+                if isinstance(item, Mapping)
+            ]
+            if target_no not in latest_screens:
+                raise ValueError("图片在删除过程中发生变化")
+            CANVAS_TASKS[task_id] = copy.deepcopy(updated_task)
+        if job:
+            job = one_click_cleanup_activate_job(str(job["job_id"]))
+        one_click_forget_screen_runtime(task_type, task_id, target_no, task_deleted=False)
+        event = ONE_CLICK_CLEANUP_WAKE_EVENT
+        if event is not None and job is not None:
+            event.set()
+        return {
+            "deleted": True,
+            "task_id": task_id,
+            "screen_no": target_no,
+            "task_deleted": False,
+            "task": copy.deepcopy(updated_task),
+            "history_deleted": history_deleted,
+            "history_updated": history_updated,
+            "cleanup_job_id": str((job or {}).get("job_id") or "") or None,
+            "cleanup_status": "queued" if job else "skipped",
+            "media_candidates": int((job or {}).get("media_candidates") or 0),
+        }
+    except Exception:
+        if job:
+            one_click_cleanup_remove_job(str(job.get("job_id") or ""))
+        if history_changed:
+            with HISTORY_LOCK:
+                if history_existed:
+                    history_write_records_locked(history_backup)
+                elif os.path.isfile(HISTORY_FILE):
+                    try:
+                        os.remove(HISTORY_FILE)
+                    except OSError:
+                        pass
+        if task_path:
+            if task_file_existed:
+                restore_deleted_record_file(task_path, task_file_content)
+            elif os.path.isfile(task_path):
+                try:
+                    os.remove(task_path)
+                except OSError:
+                    pass
+        with CANVAS_TASK_LOCK:
+            CANVAS_TASKS[task_id] = runtime_before
+        raise
+
+
+def main_image_persisted_inventory() -> tuple[set[str], list[set[str]]]:
+    """Read all persisted main-image groups, including groups beyond the UI page limit."""
+    task_ids: set[str] = set()
+    input_sets: list[set[str]] = []
+    root = Path(MAIN_IMAGE_TASK_DIR)
+    if not root.exists():
+        return task_ids, input_sets
+    for path in root.glob("main_image_*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or value.get("type") != "main-image":
+            continue
+        task_id = str(value.get("id") or "").strip()
+        if task_id:
+            task_ids.add(task_id)
+        refs = main_image_task_input_urls(value)
+        if refs:
+            input_sets.append(refs)
+    with CANVAS_TASK_LOCK:
+        runtime_tasks = [copy.deepcopy(item) for item in CANVAS_TASKS.values() if item.get("type") == "main-image"]
+    for task in runtime_tasks:
+        task_id = str(task.get("id") or "").strip()
+        if task_id:
+            task_ids.add(task_id)
+        refs = main_image_task_input_urls(task)
+        if refs and refs not in input_sets:
+            input_sets.append(refs)
+    return task_ids, input_sets
+
+
+def load_persisted_main_image_tasks(max_records: int = 200):
+    os.makedirs(MAIN_IMAGE_TASK_DIR, exist_ok=True)
+    loaded = []
+    for path in glob.glob(os.path.join(MAIN_IMAGE_TASK_DIR, "main_image_*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                task = json.load(handle)
+            if not isinstance(task, dict) or task.get("type") != "main-image" or not main_image_task_file(task.get("id")):
+                continue
+            if str(task.get("status") or "") in MAIN_IMAGE_ACTIVE_STATUSES:
+                recoverable = False
+                task["cancel_requested"] = False
+                for screen in task.get("screens") or []:
+                    screen_recoverable = False
+                    for candidate in screen.get("candidates") or []:
+                        if str(candidate.get("status") or "") not in {"submitting", "generating", "recovering"}:
+                            continue
+                        if candidate.get("upstream_task_id") and isinstance(candidate.get("provider_snapshot"), dict):
+                            candidate["status"] = "recovering"
+                            candidate["error"] = "服务重启后正在恢复查询，上游任务不会重复提交"
+                            recoverable = True
+                            screen_recoverable = True
+                        else:
+                            candidate["status"] = "unknown"
+                            candidate["error"] = "结果未知，未获得任务编号，无法自动回补；重新生成可能再次扣费。"
+                    if screen_recoverable:
+                        screen["status"] = "generating"
+                        screen["error"] = "正在恢复异步查询"
+                    elif str(screen.get("status") or "") in {"queued", "submitting", "generating", "recovering"}:
+                        has_unknown = any(str(item.get("status") or "") == "unknown" for item in screen.get("candidates") or [])
+                        screen["status"] = "unknown" if has_unknown else "interrupted"
+                        screen["error"] = "结果未知，未获得任务编号，无法自动回补" if has_unknown else "生成被服务重启中断"
+                task["status"] = "generating" if recoverable else (
+                    "unknown" if any(str(screen.get("status") or "") == "unknown" for screen in task.get("screens") or []) else "interrupted"
+                )
+                task["error"] = "服务重启后正在恢复异步查询" if recoverable else "任务在服务停止时中断"
+                main_image_persist_task(task)
+            loaded.append(task)
+        except Exception as exc:
+            print(f"忽略损坏的主图任务记录 {os.path.basename(path)}: {exc}")
+    used = set()
+    for task in sorted(loaded, key=lambda item: (float(item.get("created_at") or 0), str(item.get("id") or ""))):
+        group_no = int(task.get("group_no") or 0)
+        if group_no <= 0 or group_no in used:
+            group_no = 1
+            while group_no in used:
+                group_no += 1
+            task["group_no"] = group_no
+            main_image_persist_task(task)
+        used.add(group_no)
+    main_image_write_next_group_no(max(main_image_read_next_group_no(), (max(used) + 1) if used else 1))
+    loaded.sort(key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0), reverse=True)
+    for task in loaded[:max_records]:
+        CANVAS_TASKS[str(task.get("id"))] = task
+
+
+def main_image_task_snapshot(task_id: str):
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(task_id)
+        return copy.deepcopy(task) if task and task.get("type") == "main-image" else None
+
+
+def main_image_update_task(task_id: str, **updates):
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(task_id)
+        if not task or task.get("type") != "main-image":
+            return None
+        task.update(copy.deepcopy(updates))
+        task["updated_at"] = time.time()
+        snapshot = copy.deepcopy(task)
+    main_image_persist_task(snapshot)
+    return snapshot
+
+
+def main_image_update_screen(task_id: str, screen_no: int, **updates):
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(task_id)
+        if not task or task.get("type") != "main-image":
+            return None
+        screen = next((item for item in task.get("screens") or [] if int(item.get("screen_no") or 0) == int(screen_no)), None)
+        if not screen:
+            return None
+        screen.update(copy.deepcopy(updates))
+        screen["updated_at"] = time.time()
+        task["updated_at"] = screen["updated_at"]
+        snapshot = copy.deepcopy(task)
+        result = copy.deepcopy(screen)
+    main_image_persist_task(snapshot)
+    return result
+
+
+def main_image_get_candidate(task_id: str, screen_no: int, candidate_id: str):
+    screen = next((item for item in (main_image_task_snapshot(task_id) or {}).get("screens") or [] if int(item.get("screen_no") or 0) == int(screen_no)), None)
+    if not screen:
+        return None
+    candidate = next((item for item in screen.get("candidates") or [] if str(item.get("id") or "") == str(candidate_id or "")), None)
+    return copy.deepcopy(candidate) if candidate else None
+
+
+def main_image_append_candidate(task_id: str, screen_no: int, candidate):
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(task_id)
+        if not task or task.get("type") != "main-image":
+            return None
+        screen = next((item for item in task.get("screens") or [] if int(item.get("screen_no") or 0) == int(screen_no)), None)
+        if not screen:
+            return None
+        screen.setdefault("candidates", []).append(copy.deepcopy(candidate))
+        screen["updated_at"] = time.time()
+        task["updated_at"] = screen["updated_at"]
+        snapshot = copy.deepcopy(task)
+    main_image_persist_task(snapshot)
+    return copy.deepcopy(candidate)
+
+
+def main_image_update_candidate(task_id: str, screen_no: int, candidate_id: str, **updates):
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(task_id)
+        if not task or task.get("type") != "main-image":
+            return None
+        screen = next((item for item in task.get("screens") or [] if int(item.get("screen_no") or 0) == int(screen_no)), None)
+        candidates = screen.get("candidates") if screen and isinstance(screen.get("candidates"), list) else []
+        index = next((i for i, item in enumerate(candidates) if str(item.get("id") or "") == str(candidate_id or "")), -1)
+        if index < 0:
+            return None
+        candidate = candidates[index]
+        candidate.update(copy.deepcopy(updates))
+        candidate["updated_at"] = time.time()
+        if candidate.get("status") == "succeeded" and candidate.get("result"):
+            screen["selected_candidate"] = index
+            screen["result"] = copy.deepcopy(candidate.get("result"))
+        screen["updated_at"] = candidate["updated_at"]
+        task["updated_at"] = candidate["updated_at"]
+        snapshot = copy.deepcopy(task)
+        result = copy.deepcopy(candidate)
+    main_image_persist_task(snapshot)
+    return result
+
+
+def main_image_screen_records(records):
+    result = []
+    for raw in records or []:
+        item = copy.deepcopy(raw)
+        item.update({
+            "status": "queued", "result": None, "candidates": [], "selected_candidate": -1,
+            "prompt_candidates": [], "generation_params": {}, "error": "", "attempt": 0,
+            "submitted_prompt": "", "updated_at": time.time(),
+        })
+        result.append(item)
+    return result
+
+
+def new_main_image_task_record(task_id: str, payload: MainImageTaskRequest, submission_id: str, fingerprint: str, group_no: int):
+    now = time.time()
+    return {
+        "id": task_id, "type": "main-image", "title": str(payload.product_name or "").strip()[:60],
+        "group_no": int(group_no), "status": "planning", "created_at": now, "updated_at": now,
+        "runtime_id": CANVAS_TASK_RUNTIME_ID, "settings": main_image_generation_settings(payload),
+        "submission_id": submission_id, "submission_ids": [submission_id], "config_fingerprint": fingerprint,
+        "llm_trace": {
+            "model": payload.llm_model,
+            "provider_id": payload.llm_provider_id,
+            "planning_calls": 0,
+            "repair_calls": 0,
+            "parse_method": "",
+            "planning_parse_method": "",
+            "repair_parse_method": "",
+            "resolved_language": "",
+            "stage": "",
+            "planning_error": "",
+            "repair_error": "",
+            "planning_response_excerpt": "",
+            "repair_response_excerpt": "",
+        },
+        "request_preview": None, "screens": [], "error": "", "cancel_requested": False,
+    }
+
+
+def main_image_update_llm_trace(
+    task_id: str,
+    *,
+    stage: str = "",
+    call: bool = False,
+    response_text: Optional[str] = None,
+    error: Optional[str] = None,
+    parse_method: str = "",
+    resolved_language: str = "",
+    final: bool = False,
+):
+    normalized_stage = str(stage or "").strip().lower()
+    if normalized_stage not in {"", "planning", "repair"}:
+        raise ValueError("不支持的主图 LLM 诊断阶段")
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(task_id)
+        if not task or task.get("type") != "main-image":
+            return None
+        trace = task.setdefault("llm_trace", {})
+        if call and normalized_stage == "planning":
+            trace["planning_calls"] = int(trace.get("planning_calls") or 0) + 1
+        elif call and normalized_stage == "repair":
+            trace["repair_calls"] = int(trace.get("repair_calls") or 0) + 1
+        if normalized_stage:
+            trace["stage"] = normalized_stage
+        if resolved_language:
+            trace["resolved_language"] = str(resolved_language)[:40]
+        if response_text is not None and normalized_stage:
+            trace[f"{normalized_stage}_response_excerpt"] = main_image_v4.planning_diagnostic_excerpt(response_text)
+            trace[f"{normalized_stage}_response_length"] = len(str(response_text or ""))
+        if parse_method and normalized_stage:
+            trace[f"{normalized_stage}_parse_method"] = str(parse_method)[:80]
+            if final:
+                trace["parse_method"] = str(parse_method)[:80]
+        if error is not None and normalized_stage:
+            trace[f"{normalized_stage}_error"] = str(error or "")[:1600]
+        if final:
+            trace["stage"] = "completed"
+        task["updated_at"] = time.time()
+        snapshot = copy.deepcopy(task)
+        result = copy.deepcopy(trace)
+    main_image_persist_task(snapshot)
+    return result
+
+
+def main_image_payload_from_task(task):
+    try:
+        return MainImageTaskRequest(**(task.get("settings") or {}))
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"主图任务参数已经失效：{exc}") from exc
+
+
+def main_image_image_request(screen, payload: MainImageTaskRequest):
+    references = [
+        AIReference(url=url, name=f"产品图{index + 1}", role="product", kind="image")
+        for index, url in enumerate(payload.product_images)
+    ] + [
+        AIReference(url=url, name=f"设计参考图{index + 1}", role="reference", kind="image")
+        for index, url in enumerate(payload.reference_images)
+    ]
+    overrides = screen.get("generation_params") if isinstance(screen.get("generation_params"), dict) else {}
+    return OnlineImageRequest(
+        prompt=str(screen.get("prompt") or "").strip(),
+        provider_id=str(overrides.get("image_provider_id") or payload.image_provider_id),
+        model=str(overrides.get("image_model") or payload.image_model),
+        size=str(overrides.get("size") or payload.size or "2048x2048"),
+        aspect_ratio=str(overrides.get("aspect_ratio") or payload.aspect_ratio),
+        resolution=str(overrides.get("resolution") or payload.resolution),
+        quality=str(overrides.get("quality") or payload.quality or "auto"),
+        n=1,
+        reference_images=references,
+    )
+
+
+def main_image_finalize_task(task_id: str):
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(task_id)
+        if not task or task.get("type") != "main-image":
+            return None
+        statuses = [str(screen.get("status") or "") for screen in task.get("screens") or []]
+        if task.get("cancel_requested"):
+            status = "cancelled"
+        elif any(value in {"queued", "submitting", "generating", "recovering"} for value in statuses):
+            status = "generating"
+        elif statuses and all(value == "succeeded" for value in statuses):
+            status = "succeeded"
+        elif any(value == "succeeded" for value in statuses):
+            status = "partial"
+        elif any(value == "unknown" for value in statuses):
+            status = "unknown"
+        elif any(value == "interrupted" for value in statuses):
+            status = "interrupted"
+        else:
+            status = "failed"
+        task["status"] = status
+        if status == "failed" and not task.get("error"):
+            task["error"] = "所有主图生成失败"
+        elif status in {"succeeded", "partial"}:
+            task["error"] = ""
+        task["updated_at"] = time.time()
+        snapshot = copy.deepcopy(task)
+    main_image_persist_task(snapshot)
+    return snapshot
+
+
+def main_image_semaphore():
+    global MAIN_IMAGE_GENERATION_SEMAPHORE
+    if MAIN_IMAGE_GENERATION_SEMAPHORE is None:
+        MAIN_IMAGE_GENERATION_SEMAPHORE = asyncio.Semaphore(10)
+    return MAIN_IMAGE_GENERATION_SEMAPHORE
+
+
+async def run_main_image_screen(task_id: str, payload: MainImageTaskRequest, screen_no: int):
+    task = main_image_task_snapshot(task_id)
+    screen = next((item for item in (task or {}).get("screens") or [] if int(item.get("screen_no") or 0) == int(screen_no)), None)
+    if not screen or task.get("cancel_requested"):
+        return
+    request = main_image_image_request(screen, payload)
+    main_image_update_screen(task_id, screen_no, status="generating", error="", attempt=int(screen.get("attempt") or 0) + 1, submitted_prompt=request.prompt)
+    candidate_id = f"candidate_{uuid.uuid4().hex}"
+    provider_snapshot = detail_page_async_snapshot_for_request(request)
+    main_image_append_candidate(task_id, screen_no, {
+        "id": candidate_id, "candidate_no": len(screen.get("candidates") or []) + 1, "status": "submitting",
+        "prompt": request.prompt, "generation_params": detail_page_model_dump(request), "result": None,
+        "image_url": "", "error": "", "upstream_task_id": "", "provider_snapshot": provider_snapshot or {},
+        "query_attempts": 0, "last_query_at": 0, "last_error": "", "created_at": time.time(),
+    })
+
+    async def observer(event, details):
+        details = details if isinstance(details, dict) else {}
+        if event == "submitted":
+            main_image_update_candidate(task_id, screen_no, candidate_id, status="generating", upstream_task_id=str(details.get("task_id") or ""), provider_snapshot=details.get("provider") or provider_snapshot or {}, submitted_at=float(details.get("submitted_at") or time.time()), error="", last_error="")
+        elif event == "recovering":
+            main_image_update_candidate(task_id, screen_no, candidate_id, status="recovering", query_attempts=max(0, int(details.get("attempt") or 0)), last_query_at=float(details.get("last_query_at") or time.time()), last_error=str(details.get("error") or "")[:800], error="正在恢复查询，上游任务不会重复提交")
+        elif event == "querying":
+            main_image_update_candidate(task_id, screen_no, candidate_id, status="generating", query_attempts=max(0, int(details.get("attempt") or 0)), last_query_at=float(details.get("last_query_at") or time.time()), last_error="", error="")
+
+    history_metadata = {
+        "source_type": "main-image",
+        "source_task_id": task_id,
+        "source_screen_no": screen_no,
+    }
+    try:
+        async with main_image_semaphore():
+            latest = main_image_task_snapshot(task_id)
+            if not latest or latest.get("cancel_requested"):
+                raise asyncio.CancelledError()
+            result = await (
+                build_online_image_result(
+                    request,
+                    async_task_observer=observer,
+                    history_metadata=history_metadata,
+                    persist_mode="image_generation_media",
+                )
+                if provider_snapshot
+                else build_online_image_result(
+                    request,
+                    history_metadata=history_metadata,
+                    persist_mode="image_generation_media",
+                )
+            )
+        annotate_one_click_history_record(
+            task_id,
+            "main-image",
+            result,
+            history_metadata,
+        )
+        main_image_update_candidate(task_id, screen_no, candidate_id, status="succeeded", result=result, image_url=detail_page_candidate_image(result), upstream_task_id=str(result.get("task_id") or (main_image_get_candidate(task_id, screen_no, candidate_id) or {}).get("upstream_task_id") or ""), error="", last_error="", completed_at=time.time())
+        main_image_update_screen(task_id, screen_no, status="succeeded", error="")
+    except asyncio.CancelledError:
+        main_image_update_screen(task_id, screen_no, status="cancelled", error="")
+        raise
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc) or "主图生成失败"
+        current = main_image_get_candidate(task_id, screen_no, candidate_id) or {}
+        upstream_task_id = str(getattr(exc, "upstream_task_id", "") or current.get("upstream_task_id") or "")
+        explicit_status = str(getattr(exc, "async_candidate_status", "") or "")
+        unknown = explicit_status == "unknown" or (bool(provider_snapshot) and not upstream_task_id and detail_page_async_submission_is_unknown(detail))
+        status = "unknown" if unknown else "failed"
+        error = "结果未知，未获得任务编号，无法自动回补；重新生成可能再次扣费。" if unknown and not upstream_task_id else str(detail)[:1200]
+        main_image_update_candidate(task_id, screen_no, candidate_id, status=status, upstream_task_id=upstream_task_id, result=None, image_url="", error=error, last_error=str(detail)[:800], completed_at=time.time())
+        main_image_update_screen(task_id, screen_no, status=status, error=error)
+
+
+async def run_main_image_task(task_id: str, payload: MainImageTaskRequest):
+    preview = main_image_v4.build_planning_request(payload)
+    main_image_update_task(task_id, status="planning", error="", request_preview=preview)
+    try:
+        llm_payload = DetailPageLLMRequest(
+            message=preview["request"], system_prompt=main_image_v4.MAIN_IMAGE_SYSTEM_PROMPT,
+            provider=payload.llm_provider_id, model=payload.llm_model,
+            images=[*payload.product_images, *payload.reference_images], temperature=0.7,
+            max_tokens=main_image_v4.planning_max_tokens(payload.image_count), response_schema=main_image_v4.PLANNING_RESPONSE_SCHEMA,
+        )
+        main_image_update_llm_trace(
+            task_id,
+            stage="planning",
+            call=True,
+            resolved_language=preview["resolved_language"],
+        )
+        try:
+            llm_result = await execute_canvas_llm(llm_payload)
+        except Exception as exc:
+            detail = getattr(exc, "detail", None) or str(exc) or "主图规划请求失败"
+            main_image_update_llm_trace(task_id, stage="planning", error=detail)
+            raise
+        raw_text = str((llm_result or {}).get("text") or "")
+        main_image_update_llm_trace(task_id, stage="planning", response_text=raw_text)
+        try:
+            prompts, parse_method = main_image_v4.parse_planning_output(raw_text, payload.image_count)
+            main_image_update_llm_trace(task_id, stage="planning", parse_method=parse_method)
+            prompts = main_image_v4.postprocess_prompts(prompts, payload)
+            main_image_v4.validate_planning_prompts(prompts, payload)
+        except main_image_v4.MainImagePlanningError as first_error:
+            main_image_update_llm_trace(task_id, stage="planning", error=str(first_error))
+            main_image_update_task(task_id, status="repairing", error=str(first_error)[:1200])
+            main_image_update_llm_trace(task_id, stage="repair", call=True)
+            try:
+                repair_result = await execute_canvas_llm(DetailPageLLMRequest(
+                    message=main_image_v4.build_repair_request(raw_text, first_error, preview["request"]),
+                    system_prompt=main_image_v4.MAIN_IMAGE_SYSTEM_PROMPT + "\n这是唯一一次契约修复。只返回完整合法的 prompts JSON。",
+                    provider=payload.llm_provider_id, model=payload.llm_model,
+                    images=[*payload.product_images, *payload.reference_images], temperature=0.5,
+                    max_tokens=main_image_v4.planning_max_tokens(payload.image_count), response_schema=main_image_v4.PLANNING_RESPONSE_SCHEMA,
+                ))
+            except Exception as exc:
+                detail = getattr(exc, "detail", None) or str(exc) or "主图规划修复请求失败"
+                main_image_update_llm_trace(task_id, stage="repair", error=detail)
+                raise
+            repaired_text = str((repair_result or {}).get("text") or "")
+            main_image_update_llm_trace(task_id, stage="repair", response_text=repaired_text)
+            try:
+                prompts, parse_method = main_image_v4.parse_planning_output(repaired_text, payload.image_count)
+                main_image_update_llm_trace(task_id, stage="repair", parse_method=parse_method)
+                prompts = main_image_v4.postprocess_prompts(prompts, payload)
+                main_image_v4.validate_planning_prompts(prompts, payload)
+            except main_image_v4.MainImagePlanningError as second_error:
+                main_image_update_llm_trace(task_id, stage="repair", error=str(second_error))
+                raise main_image_v4.MainImagePlanningError(f"规划修复失败：{second_error}") from second_error
+            main_image_update_llm_trace(
+                task_id,
+                stage="repair",
+                error="",
+                parse_method=parse_method,
+                final=True,
+            )
+        else:
+            main_image_update_llm_trace(
+                task_id,
+                stage="planning",
+                error="",
+                parse_method=parse_method,
+                final=True,
+            )
+        screens = main_image_screen_records(main_image_v4.infer_screen_records(prompts, payload))
+        with CANVAS_TASK_LOCK:
+            task = CANVAS_TASKS.get(task_id)
+            if not task or task.get("cancel_requested"):
+                if task:
+                    task["status"] = "cancelled"
+                snapshot = copy.deepcopy(task) if task else None
+            else:
+                task["screens"] = screens
+                task["status"] = "generating"
+                task["error"] = ""
+                task["updated_at"] = time.time()
+                snapshot = copy.deepcopy(task)
+        if snapshot:
+            main_image_persist_task(snapshot)
+        if not snapshot or snapshot.get("status") == "cancelled":
+            return
+        jobs = {screen["screen_no"]: asyncio.create_task(run_main_image_screen(task_id, payload, screen["screen_no"])) for screen in screens}
+        MAIN_IMAGE_SCREEN_TASKS[task_id] = jobs
+        await asyncio.gather(*jobs.values(), return_exceptions=True)
+        main_image_finalize_task(task_id)
+    except asyncio.CancelledError:
+        main_image_update_task(task_id, status="cancelled", cancel_requested=True, error="")
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc) or "主图规划失败"
+        main_image_update_task(task_id, status="failed", error=f"主图规划失败：{detail}"[:1600])
+    finally:
+        MAIN_IMAGE_SCREEN_TASKS.pop(task_id, None)
+
+
+async def run_main_image_candidate_recovery(task_id: str, screen_no: int, candidate_id: str):
+    candidate = main_image_get_candidate(task_id, screen_no, candidate_id)
+    if not candidate or not candidate.get("upstream_task_id"):
+        raise HTTPException(status_code=409, detail="该主图候选没有可查询的上游任务编号")
+    provider = candidate.get("provider_snapshot") if isinstance(candidate.get("provider_snapshot"), dict) else {}
+    if not provider.get("base_url") or not provider.get("id"):
+        raise HTTPException(status_code=409, detail="该候选缺少原平台快照，无法安全回补")
+    main_image_update_task(task_id, status="generating", error="", cancel_requested=False)
+    main_image_update_screen(task_id, screen_no, status="generating", error="正在回补上游结果")
+    main_image_update_candidate(task_id, screen_no, candidate_id, status="recovering", error="正在回补，只查询原任务，不会重新生图")
+
+    async def observer(event, details):
+        if event in {"querying", "recovering"}:
+            main_image_update_candidate(task_id, screen_no, candidate_id, status="generating" if event == "querying" else "recovering", query_attempts=max(0, int((details or {}).get("attempt") or 0)), last_query_at=float((details or {}).get("last_query_at") or time.time()), last_error=str((details or {}).get("error") or "")[:800], error="" if event == "querying" else "正在恢复查询，上游任务不会重复提交")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0)) as client:
+            raw = await wait_for_detail_page_image_task(client, str(candidate.get("upstream_task_id")), provider, observer)
+        current = main_image_get_candidate(task_id, screen_no, candidate_id) or candidate
+        history_metadata = {
+            "source_type": "main-image",
+            "source_task_id": task_id,
+            "source_screen_no": screen_no,
+        }
+        result = await detail_page_result_from_async_payload(
+            current,
+            raw,
+            history_metadata,
+            persist_mode="image_generation_media",
+        )
+        annotate_one_click_history_record(
+            task_id,
+            "main-image",
+            result,
+            history_metadata,
+        )
+        main_image_update_candidate(task_id, screen_no, candidate_id, status="succeeded", result=result, image_url=detail_page_candidate_image(result), error="", last_error="", completed_at=time.time())
+        main_image_update_screen(task_id, screen_no, status="succeeded", error="")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        status = "failed" if str(getattr(exc, "async_candidate_status", "")) == "failed" else "unknown"
+        main_image_update_candidate(task_id, screen_no, candidate_id, status=status, error=str(getattr(exc, "detail", None) or exc)[:1200], last_error=str(exc)[:800], completed_at=time.time())
+        main_image_update_screen(task_id, screen_no, status=status, error=str(getattr(exc, "detail", None) or exc)[:1200])
+    finally:
+        main_image_finalize_task(task_id)
+
+
+def main_image_recovery_key(task_id, screen_no, candidate_id):
+    return f"{task_id}:{int(screen_no)}:{candidate_id}"
+
+
+def schedule_main_image_candidate_recoveries():
+    targets = []
+    with CANVAS_TASK_LOCK:
+        for task in CANVAS_TASKS.values():
+            if task.get("type") != "main-image" or task.get("cancel_requested"):
+                continue
+            for screen in task.get("screens") or []:
+                for candidate in screen.get("candidates") or []:
+                    if str(candidate.get("status") or "") == "recovering" and candidate.get("upstream_task_id"):
+                        targets.append((str(task.get("id") or ""), int(screen.get("screen_no") or 0), str(candidate.get("id") or "")))
+    for task_id, screen_no, candidate_id in targets:
+        key = main_image_recovery_key(task_id, screen_no, candidate_id)
+        current = MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS.get(key)
+        if current and not current.done():
+            continue
+        job = asyncio.create_task(run_main_image_candidate_recovery(task_id, screen_no, candidate_id))
+        MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS[key] = job
+        job.add_done_callback(lambda finished, item_key=key: MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS.pop(item_key, None))
+    return len(targets)
+
+
+def prune_main_image_task_records_locked(max_completed: int = 200):
+    terminal = [
+        (float(task.get("updated_at") or task.get("created_at") or 0), task_id)
+        for task_id, task in CANVAS_TASKS.items()
+        if task.get("type") == "main-image" and str(task.get("status") or "") in MAIN_IMAGE_TERMINAL_STATUSES
+    ]
+    terminal.sort(reverse=True)
+    for _updated_at, task_id in terminal[max_completed:]:
+        CANVAS_TASKS.pop(task_id, None)
+        try:
+            main_image_delete_persisted_task(task_id)
+        except OSError:
+            pass
+
+
+def main_image_background_done(task_id: str, job):
+    if MAIN_IMAGE_BACKGROUND_TASKS.get(task_id) is job:
+        MAIN_IMAGE_BACKGROUND_TASKS.pop(task_id, None)
+
+
+def main_image_screen_job_done(task_id: str, screen_no: int, job):
+    jobs = MAIN_IMAGE_SCREEN_TASKS.get(task_id)
+    if jobs and jobs.get(screen_no) is job:
+        jobs.pop(screen_no, None)
+        if not jobs:
+            MAIN_IMAGE_SCREEN_TASKS.pop(task_id, None)
+
+
+@app.post("/api/main-image/analyze")
+async def analyze_main_image(payload: MainImageAnalyzeRequest):
+    images = [*payload.product_images, *payload.reference_images]
+    if len(images) > 6 or any(not is_image_reference_value(value) for value in images):
+        raise HTTPException(status_code=400, detail="产品图和参考图合计最多6张，且必须是有效图片地址")
+    llm_payload = DetailPageLLMRequest(
+        message=main_image_v4.build_analysis_request(payload),
+        system_prompt=main_image_v4.ANALYSIS_SYSTEM_PROMPT,
+        provider=payload.llm_provider_id,
+        model=payload.llm_model,
+        images=images,
+        temperature=0.2,
+        max_tokens=4096,
+        response_schema=main_image_v4.ANALYSIS_RESPONSE_SCHEMA,
+    )
+    result = await execute_canvas_llm(llm_payload)
+    try:
+        analysis = main_image_v4.parse_analysis_output(str((result or {}).get("text") or ""))
+    except main_image_v4.MainImagePlanningError as exc:
+        raise HTTPException(status_code=502, detail=f"智能识别结果无法解析：{exc}") from exc
+    return {"analysis": analysis}
+
+
+@app.post("/api/main-image-tasks")
+async def create_main_image_task(payload: MainImageTaskRequest):
+    validate_main_image_task_request(payload)
+    submission_id = normalize_detail_page_submission_id(payload.submission_id)
+    fingerprint = main_image_config_fingerprint(payload)
+    reused = False
+    reuse_reason = ""
+    with CANVAS_TASK_LOCK:
+        prune_main_image_task_records_locked()
+        tasks = [task for task in CANVAS_TASKS.values() if isinstance(task, dict) and task.get("type") == "main-image"]
+        exact = next((task for task in tasks if submission_id == str(task.get("submission_id") or "") or submission_id in [str(value) for value in task.get("submission_ids") or []]), None)
+        snapshot = None
+        if exact:
+            snapshot = copy.deepcopy(exact)
+            reused = True
+            reuse_reason = "submission_id"
+        elif not payload.force_new:
+            matching = [task for task in tasks if str(task.get("status") or "") in MAIN_IMAGE_ACTIVE_STATUSES and str(task.get("config_fingerprint") or "") == fingerprint]
+            if matching:
+                matched = max(matching, key=lambda item: float(item.get("created_at") or 0))
+                aliases = [str(value) for value in matched.get("submission_ids") or [] if str(value)]
+                matched["submission_ids"] = list(dict.fromkeys([str(matched.get("submission_id") or ""), *aliases, submission_id]))[-32:]
+                snapshot = copy.deepcopy(matched)
+                reused = True
+                reuse_reason = "active_config"
+        if snapshot is None:
+            task_id = f"main_image_{uuid.uuid4().hex}"
+            group_no = main_image_allocate_group_no_locked()
+            CANVAS_TASKS[task_id] = new_main_image_task_record(task_id, payload, submission_id, fingerprint, group_no)
+            snapshot = copy.deepcopy(CANVAS_TASKS[task_id])
+        else:
+            task_id = str(snapshot.get("id") or "")
+    main_image_persist_task(snapshot)
+    if not reused:
+        job = asyncio.create_task(run_main_image_task(task_id, payload))
+        MAIN_IMAGE_BACKGROUND_TASKS[task_id] = job
+        job.add_done_callback(lambda finished: main_image_background_done(task_id, finished))
+    return {
+        "task_id": task_id, "group_no": int(snapshot.get("group_no") or 0),
+        "status": str(snapshot.get("status") or "planning"), "runtime_id": snapshot.get("runtime_id") or CANVAS_TASK_RUNTIME_ID,
+        "reused": reused, "reuse_reason": reuse_reason,
+    }
+
+
+@app.get("/api/main-image-tasks")
+async def list_main_image_tasks():
+    with CANVAS_TASK_LOCK:
+        tasks = [copy.deepcopy(task) for task in CANVAS_TASKS.values() if task.get("type") == "main-image"]
+    tasks.sort(key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0), reverse=True)
+    return {"tasks": tasks[:200], "runtime_id": CANVAS_TASK_RUNTIME_ID}
+
+
+@app.get("/api/main-image-tasks/{task_id}")
+async def get_main_image_task(task_id: str):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    return task
+
+
+@app.patch("/api/main-image-tasks/{task_id}")
+async def rename_main_image_task(task_id: str, payload: MainImageTaskRenameRequest):
+    if not main_image_task_snapshot(task_id):
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    title = re.sub(r"\s+", " ", str(payload.title or "")).strip()[:60]
+    return main_image_update_task(task_id, title=title)
+
+
+@app.post("/api/main-image-tasks/{task_id}/cancel")
+async def cancel_main_image_task(task_id: str):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    main_image_update_task(task_id, cancel_requested=True, status="cancelled", error="已停止本地等待；不支持远程取消的平台任务可能仍在运行")
+    background = MAIN_IMAGE_BACKGROUND_TASKS.get(task_id)
+    if background and not background.done():
+        background.cancel()
+    for job in list((MAIN_IMAGE_SCREEN_TASKS.get(task_id) or {}).values()):
+        if not job.done():
+            job.cancel()
+    for key, job in list(MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS.items()):
+        if key.startswith(f"{task_id}:") and not job.done():
+            job.cancel()
+    return main_image_task_snapshot(task_id)
+
+
+async def run_main_image_resume(task_id: str, payload: MainImageTaskRequest, screen_numbers):
+    jobs = {number: asyncio.create_task(run_main_image_screen(task_id, payload, number)) for number in screen_numbers}
+    MAIN_IMAGE_SCREEN_TASKS[task_id] = jobs
+    try:
+        await asyncio.gather(*jobs.values(), return_exceptions=True)
+        main_image_finalize_task(task_id)
+    finally:
+        MAIN_IMAGE_SCREEN_TASKS.pop(task_id, None)
+
+
+@app.post("/api/main-image-tasks/{task_id}/resume")
+async def resume_main_image_task(task_id: str):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    if str(task.get("status") or "") in MAIN_IMAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="主图任务仍在运行")
+    numbers = [int(screen.get("screen_no") or 0) for screen in task.get("screens") or [] if str(screen.get("status") or "") in {"failed", "cancelled", "interrupted", "queued"}]
+    if not numbers:
+        raise HTTPException(status_code=409, detail="当前没有可恢复的主图")
+    with CANVAS_TASK_LOCK:
+        current = CANVAS_TASKS.get(task_id)
+        current["cancel_requested"] = False
+        current["status"] = "generating"
+        current["error"] = ""
+        for screen in current.get("screens") or []:
+            if int(screen.get("screen_no") or 0) in numbers:
+                screen["status"] = "queued"
+                screen["error"] = ""
+        snapshot = copy.deepcopy(current)
+    main_image_persist_task(snapshot)
+    job = asyncio.create_task(run_main_image_resume(task_id, main_image_payload_from_task(task), numbers))
+    MAIN_IMAGE_BACKGROUND_TASKS[task_id] = job
+    job.add_done_callback(lambda finished: main_image_background_done(task_id, finished))
+    return snapshot
+
+
+@app.patch("/api/main-image-tasks/{task_id}/screens/{screen_no}")
+async def patch_main_image_screen(task_id: str, screen_no: int, payload: MainImageScreenPatchRequest):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    if str(task.get("status") or "") in MAIN_IMAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="生成期间不能编辑主图")
+    screen = next((item for item in task.get("screens") or [] if int(item.get("screen_no") or 0) == int(screen_no)), None)
+    if not screen:
+        raise HTTPException(status_code=404, detail="主图不存在")
+    updates = {}
+    if payload.prompt is not None:
+        if not payload.prompt.strip():
+            raise HTTPException(status_code=400, detail="提示词不能为空")
+        updates["prompt"] = payload.prompt.strip()
+    if payload.generation_params is not None:
+        allowed = {"image_provider_id", "image_model", "size", "aspect_ratio", "resolution", "quality"}
+        updates["generation_params"] = {key: value for key, value in payload.generation_params.items() if key in allowed and str(value or "").strip()}
+    if payload.selected_candidate is not None:
+        candidates = screen.get("candidates") if isinstance(screen.get("candidates"), list) else []
+        if payload.selected_candidate >= len(candidates) or candidates[payload.selected_candidate].get("status") != "succeeded":
+            raise HTTPException(status_code=400, detail="不能选择该候选")
+        updates["selected_candidate"] = payload.selected_candidate
+        updates["result"] = copy.deepcopy(candidates[payload.selected_candidate].get("result"))
+    return main_image_update_screen(task_id, screen_no, **updates)
+
+
+@app.post("/api/main-image-tasks/{task_id}/screens/{screen_no}/optimize-prompt")
+async def optimize_main_image_prompt(task_id: str, screen_no: int, payload: MainImagePromptOptimizeRequest):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    if str(task.get("status") or "") in MAIN_IMAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="生成期间不能优化提示词")
+    settings = main_image_payload_from_task(task)
+    result = await execute_canvas_llm(DetailPageLLMRequest(
+        message=f"修改要求：{payload.instruction}\n原提示词：{payload.prompt}\n只返回严格JSON {{\"prompts\":[\"优化后的完整提示词\"]}}。",
+        system_prompt="你是电商主图提示词编辑器。只修改用户明确要求的部分，保留产品事实、画幅、图片职责和禁止项，不要生图。",
+        provider=settings.llm_provider_id, model=settings.llm_model,
+        images=[*settings.product_images, *settings.reference_images], temperature=0.4, max_tokens=4096,
+        response_schema=main_image_v4.PLANNING_RESPONSE_SCHEMA,
+    ))
+    prompts, _ = main_image_v4.parse_planning_output(str((result or {}).get("text") or ""), 1)
+    optimized_prompt = main_image_v4.postprocess_prompt(prompts[0], settings, screen_no)
+    candidate = {"id": f"prompt_{uuid.uuid4().hex}", "prompt": optimized_prompt, "created_at": time.time()}
+    screen = next((item for item in task.get("screens") or [] if int(item.get("screen_no") or 0) == int(screen_no)), None)
+    if not screen:
+        raise HTTPException(status_code=404, detail="主图不存在")
+    candidates = [*list(screen.get("prompt_candidates") or []), candidate][-12:]
+    main_image_update_screen(task_id, screen_no, prompt_candidates=candidates)
+    return {"screen_no": screen_no, "prompt_candidates": candidates}
+
+
+@app.post("/api/main-image-tasks/{task_id}/screens/{screen_no}/regenerate")
+async def regenerate_main_image_screen(task_id: str, screen_no: int, payload: MainImageRegenerateRequest):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    running = (MAIN_IMAGE_SCREEN_TASKS.get(task_id) or {}).get(screen_no)
+    if running and not running.done():
+        raise HTTPException(status_code=409, detail="当前主图正在生成")
+    screen = next((item for item in task.get("screens") or [] if int(item.get("screen_no") or 0) == int(screen_no)), None)
+    if not screen:
+        raise HTTPException(status_code=404, detail="主图不存在")
+    allowed = {"image_provider_id", "image_model", "size", "aspect_ratio", "resolution", "quality"}
+    main_image_update_task(task_id, status="generating", error="", cancel_requested=False)
+    main_image_update_screen(task_id, screen_no, status="queued", error="", prompt=payload.prompt.strip(), generation_params={key: value for key, value in payload.generation_params.items() if key in allowed and str(value or "").strip()})
+    job = asyncio.create_task(run_main_image_screen(task_id, main_image_payload_from_task(task), screen_no))
+    MAIN_IMAGE_SCREEN_TASKS.setdefault(task_id, {})[screen_no] = job
+    job.add_done_callback(lambda finished: (main_image_finalize_task(task_id), main_image_screen_job_done(task_id, screen_no, finished)))
+    return main_image_task_snapshot(task_id)
+
+
+@app.post("/api/main-image-tasks/{task_id}/screens/{screen_no}/candidates/{candidate_id}/recover")
+async def recover_main_image_candidate(task_id: str, screen_no: int, candidate_id: str):
+    candidate = main_image_get_candidate(task_id, screen_no, candidate_id)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="主图候选不存在")
+    if candidate.get("status") == "succeeded":
+        raise HTTPException(status_code=409, detail="候选已经成功")
+    if not candidate.get("upstream_task_id"):
+        raise HTTPException(status_code=409, detail="候选没有上游任务编号")
+    key = main_image_recovery_key(task_id, screen_no, candidate_id)
+    current = MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS.get(key)
+    if current and not current.done():
+        return {"task": main_image_task_snapshot(task_id), "reused": True}
+    job = asyncio.create_task(run_main_image_candidate_recovery(task_id, screen_no, candidate_id))
+    MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS[key] = job
+    job.add_done_callback(lambda finished: MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS.pop(key, None))
+    return {"task": main_image_task_snapshot(task_id), "reused": False}
+
+
+@app.delete("/api/main-image-tasks/{task_id}/screens/{screen_no}", status_code=202)
+async def delete_main_image_screen(task_id: str, screen_no: int):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    if str(task.get("status") or "") in MAIN_IMAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="生成期间不能删除主图")
+    try:
+        result = delete_one_click_task_screen_record(task, screen_no)
+        return JSONResponse(status_code=202, content=result)
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=f"删除主图失败，未执行清理：{exc}") from exc
+
+
+@app.post("/api/main-image-tasks/{task_id}/screens/reorder")
+async def reorder_main_image_screens(task_id: str, payload: MainImageScreenReorderRequest):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    if str(task.get("status") or "") in MAIN_IMAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="生成期间不能调整顺序")
+    numbers = [int(item.get("screen_no") or 0) for item in task.get("screens") or []]
+    if len(payload.screen_order) != len(set(payload.screen_order)) or set(payload.screen_order) != set(numbers):
+        raise HTTPException(status_code=400, detail="主图顺序必须完整且不能重复")
+    by_number = {int(item.get("screen_no") or 0): item for item in task.get("screens") or []}
+    with CANVAS_TASK_LOCK:
+        current = CANVAS_TASKS.get(task_id)
+        current["screens"] = [copy.deepcopy(by_number[number]) for number in payload.screen_order]
+        for order, screen in enumerate(current["screens"]):
+            screen["order"] = order
+        current["updated_at"] = time.time()
+        snapshot = copy.deepcopy(current)
+    main_image_persist_task(snapshot)
+    return snapshot
+
+
+@app.get("/api/main-image-tasks/{task_id}/download.zip")
+async def download_main_image_task(task_id: str):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    selected = [(int(screen.get("screen_no") or 0), detail_page_selected_image(screen)) for screen in task.get("screens") or []]
+    selected = [(number, url) for number, url in selected if url]
+    if not selected:
+        raise HTTPException(status_code=409, detail="当前没有可下载结果")
+    buffer = BytesIO()
+    errors = []
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for number, url in selected:
+            try:
+                data, extension = await asyncio.to_thread(detail_page_download_bytes, url)
+                archive.writestr(f"main-image-{number:02d}{extension}", data)
+            except Exception as exc:
+                errors.append(f"第 {number} 张：{exc}")
+        if errors:
+            archive.writestr("download-errors.txt", "\n".join(errors).encode("utf-8"))
+    if len(errors) == len(selected):
+        raise HTTPException(status_code=502, detail="所有主图下载失败")
+    return Response(content=buffer.getvalue(), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="main-image-{task_id[-8:]}.zip"'})
+
+
+@app.delete("/api/main-image-tasks/{task_id}", status_code=202)
+async def delete_main_image_task(task_id: str):
+    task = main_image_task_snapshot(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="主图任务不存在")
+    if str(task.get("status") or "") in MAIN_IMAGE_ACTIVE_STATUSES:
+        raise HTTPException(status_code=409, detail="生成期间不能删除主图分组")
+    try:
+        # Only mutate records and enqueue here. Physical media cleanup is
+        # serialized later by the durable background worker.
+        background = MAIN_IMAGE_BACKGROUND_TASKS.pop(task_id, None)
+        if background and not background.done():
+            background.cancel()
+        for job in list((MAIN_IMAGE_SCREEN_TASKS.pop(task_id, {}) or {}).values()):
+            if not job.done():
+                job.cancel()
+        for key, job in list(MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS.items()):
+            if key.startswith(f"{task_id}:"):
+                if not job.done():
+                    job.cancel()
+                MAIN_IMAGE_CANDIDATE_RECOVERY_TASKS.pop(key, None)
+        result = delete_one_click_task_record(task)
+        return JSONResponse(status_code=202, content=result)
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=f"删除主图分组失败，未执行清理：{exc}") from exc
+
 
 # --- 对话管理 ---
 
@@ -21080,6 +27986,10 @@ def backup_options_payload():
             copy.deepcopy(task) for task in CANVAS_TASKS.values()
             if isinstance(task, dict) and task.get("type") == "detail-page"
         ]
+        main_image_tasks = [
+            copy.deepcopy(task) for task in CANVAS_TASKS.values()
+            if isinstance(task, dict) and task.get("type") == "main-image"
+        ]
     detail_tasks.sort(key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0), reverse=True)
     detail_pages_payload = [{
         "id": str(task.get("id") or ""),
@@ -21091,9 +28001,43 @@ def backup_options_payload():
         "screen_count": len(task.get("screens") or []),
         "media_count": len(backup_io.collect_detail_page_media_urls(task)),
     } for task in detail_tasks if task.get("id")]
+    main_image_tasks.sort(key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0), reverse=True)
+    main_images_payload = [{
+        "id": str(task.get("id") or ""),
+        "group_no": int(task.get("group_no") or 0),
+        "title": str(task.get("title") or ""),
+        "status": str(task.get("status") or ""),
+        "created_at": float(task.get("created_at") or 0),
+        "updated_at": float(task.get("updated_at") or task.get("created_at") or 0),
+        "screen_count": len(task.get("screens") or []),
+        "media_count": len(backup_io.collect_main_image_media_urls(task)),
+    } for task in main_image_tasks if task.get("id")]
+    image_generation_tasks = IMAGE_GENERATION_STORE.list_task_summaries(limit=200)
+    image_generations_payload = [{
+        "id": str(task.get("id") or ""),
+        "group_no": int(task.get("group_no") or 0),
+        "mode_id": str(task.get("mode_id") or ""),
+        "mode_name": str(task.get("mode_name") or ""),
+        "name": str(task.get("name") or ""),
+        "status": str(task.get("status") or ""),
+        "created_at": task.get("created_at") or "",
+        "updated_at": task.get("updated_at") or task.get("created_at") or "",
+        "candidate_count": int(task.get("candidate_count") or 0),
+    } for task in image_generation_tasks if task.get("id")]
+    image_generation_modes = IMAGE_GENERATION_STORE.list_modes(include_admin=True)
     return {
         "projects": projects_payload,
         "detail_pages": detail_pages_payload,
+        "main_images": main_images_payload,
+        "image_generations": image_generations_payload,
+        "image_generation_modes": {
+            "available": bool(image_generation_modes),
+            "mode_count": len(image_generation_modes),
+            "example_count": sum(
+                1 for mode in image_generation_modes
+                if isinstance(mode.get("example"), dict)
+            ),
+        },
         "providers": providers_payload,
         "runninghub": {"apps": apps_payload, "workflows": workflows_payload},
         "prompt_libraries": prompt_payload,
@@ -21147,6 +28091,14 @@ def backup_summary_from_manifest(manifest):
         })
     resources = [item for item in manifest.get("resources") or [] if isinstance(item, dict)]
     detail_pages = [item for item in manifest.get("detail_pages") or [] if isinstance(item, dict) and item.get("id")]
+    main_images = [item for item in manifest.get("main_images") or [] if isinstance(item, dict) and item.get("id")]
+    image_generations = [
+        item for item in manifest.get("image_generations") or []
+        if isinstance(item, dict) and item.get("id")
+    ]
+    image_generation_modes = manifest.get("image_generation_modes")
+    if not isinstance(image_generation_modes, dict):
+        image_generation_modes = {"available": False, "mode_count": 0, "example_count": 0}
     return {
         "format": manifest.get("format"),
         "version": manifest.get("version"),
@@ -21155,6 +28107,17 @@ def backup_summary_from_manifest(manifest):
         "projects": projects,
         "detail_pages": detail_pages,
         "detail_page_count": len(detail_pages),
+        "main_images": main_images,
+        "main_image_count": len(main_images),
+        "image_generations": image_generations,
+        "image_generation_count": len(image_generations),
+        "image_generation_modes": {
+            "available": bool(image_generation_modes.get("available")),
+            "mode_count": max(0, int(image_generation_modes.get("mode_count") or 0)),
+            "example_count": max(0, int(image_generation_modes.get("example_count") or 0)),
+            "official_content_version": str(image_generation_modes.get("official_content_version") or ""),
+            "official_complete": image_generation_modes.get("official_complete") is True,
+        },
         "providers": manifest.get("providers") or [],
         "runninghub": manifest.get("runninghub") or {"apps": [], "workflows": []},
         "prompt_libraries": manifest.get("prompt_libraries") or [],
@@ -21338,10 +28301,19 @@ def backup_download_public_image(url):
         session.close()
     raise ValueError("公网图片下载失败")
 
+
+def backup_read_image_generation_cas(url):
+    """Read only a canonical, hash-verified image-generation media URL."""
+    record = IMAGE_GENERATION_MEDIA_STORE.adopt_local_url(str(url or ""))
+    content, extension, _media_type = IMAGE_GENERATION_MEDIA_STORE.read_bytes(record["id"])
+    return content, extension
+
 def build_backup_archive(payload):
     requested_projects = set(backup_id_set(payload.project_ids, 1000))
     requested_canvases = set(backup_id_set(payload.canvas_ids, 5000))
     requested_detail_pages = set(backup_id_set(payload.detail_page_task_ids, 200))
+    requested_main_images = set(backup_id_set(payload.main_image_task_ids, 200))
+    requested_image_generations = set(backup_id_set(payload.image_generation_task_ids, 200))
     projects = {str(item.get("id")): item for item in load_projects() if isinstance(item, dict) and item.get("id")}
     canvas_records = {str(item.get("id")): item for item in list_canvases() if item.get("id")}
     canvas_payloads = []
@@ -21359,11 +28331,42 @@ def build_backup_archive(payload):
             for task in CANVAS_TASKS.values()
             if isinstance(task, dict) and task.get("type") == "detail-page" and task.get("id")
         }
+        main_image_records = {
+            str(task.get("id")): copy.deepcopy(task)
+            for task in CANVAS_TASKS.values()
+            if isinstance(task, dict) and task.get("type") == "main-image" and task.get("id")
+        }
     detail_payloads = []
     for task_id in requested_detail_pages:
         task = detail_records.get(task_id)
         if task:
             detail_payloads.append((task_id, backup_io.prepare_exported_detail_task(task)))
+    main_image_payloads = []
+    for task_id in requested_main_images:
+        task = main_image_records.get(task_id)
+        if task:
+            main_image_payloads.append((task_id, backup_io.prepare_exported_main_image_task(task)))
+    image_generation_payloads = []
+    for task_id in requested_image_generations:
+        task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+        if task:
+            image_generation_payloads.append((
+                task_id, backup_io.prepare_exported_image_generation_task(task)
+            ))
+    image_generation_bundle = {
+        "modes": [], "versions": [], "drafts": [],
+        "official_content_version": "", "official_complete": False,
+    }
+    if payload.include_image_generation_modes:
+        raw_bundle = IMAGE_GENERATION_STORE.export_backup_bundle()
+        image_generation_bundle = {
+            key: [backup_io.prepare_exported_image_generation_config(item) for item in raw_bundle.get(key) or []]
+            for key in ("modes", "versions", "drafts")
+        }
+        image_generation_bundle.update({
+            "official_content_version": str(raw_bundle.get("official_content_version") or ""),
+            "official_complete": raw_bundle.get("official_complete") is True,
+        })
     selected_projects = [projects[project_id] for project_id in requested_projects if project_id in projects]
 
     selected_provider_ids = set(backup_id_set(payload.provider_ids, 500))
@@ -21406,7 +28409,12 @@ def build_backup_archive(payload):
             item["thumbnail"] = f"backup://{member}"
             prompt_thumbnail_exports.append((source_path, member, digest))
 
-    if not (selected_projects or canvas_payloads or detail_payloads or provider_configs or runninghub_apps or runninghub_workflows or prompt_libraries or portable_preferences):
+    if not (
+        selected_projects or canvas_payloads or detail_payloads or main_image_payloads
+        or image_generation_payloads or image_generation_bundle["modes"]
+        or provider_configs or runninghub_apps or runninghub_workflows
+        or prompt_libraries or portable_preferences
+    ):
         raise ValueError("请至少选择一项备份内容")
 
     timestamp = now_ms()
@@ -21438,14 +28446,53 @@ def build_backup_archive(payload):
         "screen_count": len(task.get("screens") or []),
         "file": f"detail-pages/{task_id}.json",
     } for task_id, task in detail_payloads]
+    main_image_entries = [{
+        "id": task_id,
+        "group_no": int(task.get("group_no") or 0),
+        "title": str(task.get("title") or ""),
+        "status": str(task.get("status") or ""),
+        "created_at": float(task.get("created_at") or 0),
+        "updated_at": float(task.get("updated_at") or task.get("created_at") or 0),
+        "screen_count": len(task.get("screens") or []),
+        "file": f"main-images/{task_id}.json",
+    } for task_id, task in main_image_payloads]
+    image_generation_entries = [{
+        "id": task_id,
+        "group_no": int(task.get("group_no") or 0),
+        "mode_id": str(task.get("mode_id") or ""),
+        "mode_name": str(task.get("mode_name") or ""),
+        "name": str(task.get("name") or ""),
+        "status": str(task.get("status") or ""),
+        "created_at": task.get("created_at") or "",
+        "updated_at": task.get("updated_at") or task.get("created_at") or "",
+        "candidate_count": len(task.get("candidates") or []),
+        "file": f"image-generations/{task_id}.json",
+    } for task_id, task in image_generation_payloads]
+    image_generation_examples = sum(
+        1 for mode in image_generation_bundle["modes"] if isinstance(mode.get("example"), dict)
+    )
 
     manifest = {
         "format": backup_io.BACKUP_FORMAT,
-        "version": backup_io.BACKUP_VERSION if detail_entries else backup_io.BACKUP_LEGACY_VERSION,
+        "version": (
+            backup_io.BACKUP_VERSION if (image_generation_entries or image_generation_bundle["modes"])
+            else backup_io.BACKUP_MAIN_IMAGE_VERSION if main_image_entries
+            else backup_io.BACKUP_DETAIL_VERSION if detail_entries
+            else backup_io.BACKUP_LEGACY_VERSION
+        ),
         "backup_id": backup_id,
         "created_at": timestamp,
         "projects": project_entries,
         "detail_pages": detail_entries,
+        "main_images": main_image_entries,
+        "image_generations": image_generation_entries,
+        "image_generation_modes": {
+            "available": bool(image_generation_bundle["modes"]),
+            "mode_count": len(image_generation_bundle["modes"]),
+            "example_count": image_generation_examples,
+            "official_content_version": image_generation_bundle["official_content_version"],
+            "official_complete": image_generation_bundle["official_complete"],
+        },
         "providers": [{
             "id": item.get("id"),
             "name": item.get("name") or item.get("id"),
@@ -21472,25 +28519,66 @@ def build_backup_archive(payload):
                 archive.writestr(f"canvases/{canvas_id}.json", backup_json_bytes(canvas))
             for task_id, task in detail_payloads:
                 archive.writestr(f"detail-pages/{task_id}.json", backup_json_bytes(task))
-            if payload.include_assets:
+            for task_id, task in main_image_payloads:
+                archive.writestr(f"main-images/{task_id}.json", backup_json_bytes(task))
+            for task_id, task in image_generation_payloads:
+                archive.writestr(f"image-generations/{task_id}.json", backup_json_bytes(task))
+            # Official mode cases are part of the configuration package and
+            # are always included when modes are exported. Ordinary history
+            # and user media continue to follow include_assets.
+            if payload.include_assets or image_generation_bundle["modes"]:
                 urls = []
                 seen_urls = set()
-                for _canvas_id, _project_id, canvas in canvas_payloads:
-                    for url in backup_io.collect_local_resource_urls(canvas):
-                        if url not in seen_urls:
-                            seen_urls.add(url)
-                            urls.append(url)
-                for _task_id, task in detail_payloads:
-                    for url in backup_io.collect_detail_page_media_urls(task):
-                        if url not in seen_urls:
-                            seen_urls.add(url)
-                            urls.append(url)
-                written_hashes = set()
+                image_generation_urls = set()
+                if payload.include_assets:
+                    for _canvas_id, _project_id, canvas in canvas_payloads:
+                        for url in backup_io.collect_local_resource_urls(canvas):
+                            if url not in seen_urls:
+                                seen_urls.add(url)
+                                urls.append(url)
+                    for _task_id, task in detail_payloads:
+                        for url in backup_io.collect_detail_page_media_urls(task):
+                            if url not in seen_urls:
+                                seen_urls.add(url)
+                                urls.append(url)
+                    for _task_id, task in main_image_payloads:
+                        for url in backup_io.collect_main_image_media_urls(task):
+                            if url not in seen_urls:
+                                seen_urls.add(url)
+                                urls.append(url)
+                    for _task_id, task in image_generation_payloads:
+                        for url in backup_io.collect_image_generation_media_urls(task=task):
+                            image_generation_urls.add(url)
+                            if url not in seen_urls:
+                                seen_urls.add(url)
+                                urls.append(url)
+                for url in backup_io.collect_image_generation_media_urls(
+                    modes=image_generation_bundle["modes"],
+                    drafts=image_generation_bundle["drafts"] if payload.include_assets else [],
+                ):
+                    image_generation_urls.add(url)
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        urls.append(url)
+                written_resources = {}
                 for url in urls:
-                    path = output_file_from_url(url)
+                    parsed_url = urllib.parse.urlsplit(str(url))
+                    is_image_generation_cas = (
+                        url in image_generation_urls
+                        and parsed_url.path.startswith("/assets/image-generation/media/")
+                    )
+                    path = None if is_image_generation_cas else output_file_from_url(url)
                     content = None
                     extension = ""
-                    if path and os.path.isfile(path):
+                    if is_image_generation_cas:
+                        try:
+                            content, extension = backup_read_image_generation_cas(url)
+                            digest = hashlib.sha256(content).hexdigest()
+                            size = len(content)
+                        except (OSError, ValueError):
+                            manifest["missing_resources"].append(url)
+                            continue
+                    elif path and os.path.isfile(path):
                         digest = backup_file_sha256(path)
                         size = os.path.getsize(path)
                         extension = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lower()
@@ -21508,18 +28596,21 @@ def build_backup_archive(payload):
                     else:
                         manifest["missing_resources"].append(url)
                         continue
-                    member = f"resources/{digest[:2]}/{digest}{extension}"
-                    if digest not in written_hashes:
+                    member = written_resources.get(digest)
+                    if member is None:
+                        prefix = "image-generation-resources" if url in image_generation_urls else "resources"
+                        member = f"{prefix}/{digest[:2]}/{digest}{extension}"
                         if content is None:
                             archive.write(path, member)
                         else:
                             archive.writestr(member, content)
-                        written_hashes.add(digest)
+                        written_resources[digest] = member
                     manifest["resources"].append({
                         "url": url,
                         "file": member,
                         "sha256": digest,
                         "size": size,
+                        "scope": "image-generation" if url in image_generation_urls else "shared",
                     })
             if provider_configs:
                 manifest["configs"]["providers"] = "configs/providers.json"
@@ -21543,6 +28634,24 @@ def build_backup_archive(payload):
             if portable_preferences:
                 manifest["configs"]["preferences"] = "configs/preferences.json"
                 archive.writestr("configs/preferences.json", backup_json_bytes(portable_preferences))
+            if image_generation_bundle["modes"]:
+                manifest["configs"].update({
+                    "image_generation_modes": "image-generation-config/modes.json",
+                    "image_generation_versions": "image-generation-config/versions.json",
+                    "image_generation_drafts": "image-generation-config/drafts.json",
+                })
+                archive.writestr(
+                    "image-generation-config/modes.json",
+                    backup_json_bytes(image_generation_bundle["modes"]),
+                )
+                archive.writestr(
+                    "image-generation-config/versions.json",
+                    backup_json_bytes(image_generation_bundle["versions"]),
+                )
+                archive.writestr(
+                    "image-generation-config/drafts.json",
+                    backup_json_bytes(image_generation_bundle["drafts"]),
+                )
             archive.writestr("manifest.json", backup_json_bytes(manifest))
         date = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
         return archive_path, f"Infinite-Canvas备份_{date}.zip"
@@ -21627,35 +28736,101 @@ def backup_copy_resource(archive, item, created_paths):
     return f"/assets/{rel}"
 
 
-def backup_validate_selected_resources(archive, manifest, referenced_urls):
+def backup_validate_selected_resources(
+    archive, manifest, referenced_urls, image_generation_urls=None,
+):
     """Validate selected resource members before any persistent import write occurs."""
-    checked_members = set()
-    for item in manifest.get("resources") or []:
-        if not isinstance(item, dict) or str(item.get("url") or "") not in referenced_urls:
-            continue
-        member = str(item.get("file") or "")
-        if not backup_io.is_safe_archive_member(member):
-            raise ValueError(f"资源路径无效：{member}")
-        try:
-            info = archive.getinfo(member)
-        except KeyError as exc:
-            raise ValueError(f"备份缺少资源：{member}") from exc
-        declared_size = item.get("size")
-        if declared_size is not None and int(declared_size or 0) != int(info.file_size or 0):
-            raise ValueError(f"资源大小校验失败：{member}")
-        expected = str(item.get("sha256") or "").strip().lower()
-        if expected and not re.fullmatch(r"[a-f0-9]{64}", expected):
-            raise ValueError(f"资源哈希格式无效：{member}")
-        if member in checked_members:
-            continue
-        checked_members.add(member)
-        if expected:
-            digest = hashlib.sha256()
-            with archive.open(info, "r") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            if digest.hexdigest() != expected:
+    checked_members = {}
+    checked_image_members = set()
+    url_members = {}
+    image_generation_urls = {str(item) for item in (image_generation_urls or set())}
+    with tempfile.TemporaryDirectory() as validation_root:
+        media_validator = ImageGenerationMediaStore(Path(validation_root))
+        for item in manifest.get("resources") or []:
+            url = str(item.get("url") or "") if isinstance(item, dict) else ""
+            if not isinstance(item, dict) or url not in referenced_urls:
+                continue
+            member = str(item.get("file") or "")
+            if not backup_io.is_safe_archive_member(member):
+                raise ValueError(f"资源路径无效：{member}")
+            prior_member = url_members.get(url)
+            if prior_member is not None and prior_member != member:
+                raise ValueError(f"资源地址映射冲突：{url}")
+            url_members[url] = member
+            try:
+                info = archive.getinfo(member)
+            except KeyError as exc:
+                raise ValueError(f"备份缺少资源：{member}") from exc
+            if url in image_generation_urls and int(info.file_size or 0) > 50 * 1024 * 1024:
+                raise ValueError(f"图片生成资源超过 50MB 限制：{member}")
+            declared_size = item.get("size")
+            if declared_size is not None and int(declared_size or 0) != int(info.file_size or 0):
+                raise ValueError(f"资源大小校验失败：{member}")
+            expected = str(item.get("sha256") or "").strip().lower()
+            if url in image_generation_urls and not expected:
+                raise ValueError(f"图片生成资源缺少哈希：{member}")
+            if expected and not re.fullmatch(r"[a-f0-9]{64}", expected):
+                raise ValueError(f"资源哈希格式无效：{member}")
+            actual = checked_members.get(member)
+            if actual is None:
+                digest = hashlib.sha256()
+                with archive.open(info, "r") as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                actual = (int(info.file_size or 0), digest.hexdigest())
+                checked_members[member] = actual
+            actual_size, actual_digest = actual
+            if actual_size != int(info.file_size or 0):
+                raise ValueError(f"资源大小校验失败：{member}")
+            if expected and actual_digest != expected:
                 raise ValueError(f"资源校验失败：{member}")
+            if url in image_generation_urls:
+                media_id = backup_io.image_generation_media_id_from_url(url)
+                is_static_example = url.startswith("/static/image-generation-examples/")
+                if not is_static_example and (
+                    not media_id or media_id != expected or media_id != actual_digest
+                ):
+                    raise ValueError(f"图片生成资源媒体标识不一致：{member}")
+            if url in image_generation_urls and member not in checked_image_members:
+                checked_image_members.add(member)
+                try:
+                    media_validator.adopt_bytes(archive.read(info), member)
+                except ValueError as exc:
+                    raise ValueError(f"图片生成资源格式无效：{member}") from exc
+
+
+def backup_adopt_image_generation_resource(archive, item, created_paths):
+    """Restore one selected resource through the image-generation CAS."""
+    member = str(item.get("file") or "")
+    if not backup_io.is_safe_archive_member(member):
+        raise ValueError(f"图片生成资源路径无效：{member}")
+    try:
+        info = archive.getinfo(member)
+    except KeyError as exc:
+        raise ValueError(f"备份缺少图片生成资源：{member}") from exc
+    content = archive.read(info)
+    expected = str(item.get("sha256") or "").strip().lower()
+    actual = hashlib.sha256(content).hexdigest()
+    existing = IMAGE_GENERATION_MEDIA_STORE.media_record(expected or actual)
+    record = IMAGE_GENERATION_MEDIA_STORE.adopt_bytes(
+        content, member, mimetypes.guess_type(member)[0] or ""
+    )
+    if expected and record.get("id") != expected:
+        raise ValueError(f"图片生成资源校验失败：{member}")
+    if existing is None and str(record.get("id") or "") == actual:
+        created_paths.append(str(record.get("path") or ""))
+    return str(record.get("url") or "")
+
+
+def backup_prevalidate_image_generation(bundle, task_sources):
+    """Validate a selected v4 payload using isolated stores before real writes."""
+    with tempfile.TemporaryDirectory() as validation_root:
+        data_root = Path(validation_root) / "data"
+        validator = ImageGenerationStore(data_root, IMAGE_GENERATION_STORE.seed_path)
+        validator.initialize()
+        validator.import_backup_bundle(
+            bundle, task_sources, imported_at=0.0, task_limit=200,
+        )
 
 def backup_restore_prompt_thumbnails(archive, prompt_payload, created_paths):
     payload = copy.deepcopy(prompt_payload if isinstance(prompt_payload, dict) else {})
@@ -21702,6 +28877,8 @@ def backup_selected_ids(selection, key, available):
 
 
 DETAIL_PAGE_BACKUP_MAX_RECORDS = 200
+MAIN_IMAGE_BACKUP_MAX_RECORDS = 200
+IMAGE_GENERATION_BACKUP_MAX_RECORDS = 200
 
 
 def backup_detail_page_count():
@@ -21712,8 +28889,37 @@ def backup_detail_page_count():
         )
 
 
+def backup_main_image_count():
+    with CANVAS_TASK_LOCK:
+        return sum(
+            1 for task in CANVAS_TASKS.values()
+            if isinstance(task, dict) and task.get("type") == "main-image"
+        )
+
+
+def backup_image_generation_count():
+    return len(IMAGE_GENERATION_STORE.list_task_summaries(limit=200))
+
+
 def backup_restore_detail_group_meta(existed, content):
     path = detail_page_group_meta_file()
+    if not existed:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    with open(temp_path, "wb") as handle:
+        handle.write(content or b"")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
+def backup_restore_main_image_group_meta(existed, content):
+    path = main_image_group_meta_file()
     if not existed:
         try:
             os.remove(path)
@@ -21799,6 +29005,77 @@ def backup_import_detail_pages(
             raise
     return imported
 
+
+def backup_import_main_images(
+    sources,
+    *,
+    url_mapping,
+    provider_id_map,
+    unavailable_urls,
+):
+    imported = []
+    created_paths = []
+    with CANVAS_TASK_LOCK:
+        existing_count = sum(
+            1 for task in CANVAS_TASKS.values()
+            if isinstance(task, dict) and task.get("type") == "main-image"
+        )
+        if existing_count + len(sources) > MAIN_IMAGE_BACKUP_MAX_RECORDS:
+            remaining = max(0, MAIN_IMAGE_BACKUP_MAX_RECORDS - existing_count)
+            raise ValueError(
+                f"一键主图历史最多保留 {MAIN_IMAGE_BACKUP_MAX_RECORDS} 组；本机已有 {existing_count} 组，"
+                f"本次最多还能导入 {remaining} 组，请减少选择或先手动删除旧分组"
+            )
+        meta_path = main_image_group_meta_file()
+        meta_existed = os.path.isfile(meta_path)
+        meta_content = b""
+        if meta_existed:
+            with open(meta_path, "rb") as handle:
+                meta_content = handle.read()
+        try:
+            for source in sources:
+                new_task_id = f"main_image_{uuid.uuid4().hex}"
+                submission_id = str(uuid.uuid4())
+                group_no = main_image_allocate_group_no_locked()
+                task = backup_io.prepare_imported_main_image_task(
+                    source,
+                    new_task_id=new_task_id,
+                    new_submission_id=submission_id,
+                    new_group_no=group_no,
+                    runtime_id=CANVAS_TASK_RUNTIME_ID,
+                    imported_at=time.time(),
+                    url_mapping=url_mapping,
+                    provider_id_map=provider_id_map,
+                )
+                missing = [
+                    url for url in backup_io.collect_main_image_media_urls(source)
+                    if url in unavailable_urls or (
+                        url.startswith(("/assets/", "/output/", "/api/storage-files/"))
+                        and url not in url_mapping
+                    )
+                ]
+                if missing:
+                    task["import_missing_media"] = list(dict.fromkeys(missing))
+                    task["import_warning"] = f"导入记录中有 {len(task['import_missing_media'])} 个媒体文件未包含在备份中"
+                main_image_persist_task(task)
+                task_path = main_image_task_file(new_task_id)
+                if not task_path or not os.path.isfile(task_path):
+                    raise OSError("一键主图历史写入失败")
+                created_paths.append(task_path)
+                CANVAS_TASKS[new_task_id] = copy.deepcopy(task)
+                imported.append(copy.deepcopy(task))
+        except Exception:
+            for task in imported:
+                CANVAS_TASKS.pop(str(task.get("id") or ""), None)
+            for path in created_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            backup_restore_main_image_group_meta(meta_existed, meta_content)
+            raise
+    return imported
+
 def import_backup_path(path, selection):
     with BACKUP_IMPORT_LOCK:
         with zipfile.ZipFile(path, "r") as archive:
@@ -21824,9 +29101,73 @@ def import_backup_path(path, selection):
             }
             selected_detail_ids = backup_selected_ids(selection, "detail_page_task_ids", detail_entries.keys())
             selected_detail_ids = {item for item in selected_detail_ids if item in detail_entries}
+            main_image_entry_list = [
+                item for item in manifest.get("main_images") or []
+                if isinstance(item, dict) and item.get("id")
+            ]
+            main_image_entries = {str(item.get("id")): item for item in main_image_entry_list}
+            selected_main_image_ids = backup_selected_ids(selection, "main_image_task_ids", main_image_entries.keys())
+            selected_main_image_ids = {item for item in selected_main_image_ids if item in main_image_entries}
+            image_generation_entry_list = [
+                item for item in manifest.get("image_generations") or []
+                if isinstance(item, dict) and item.get("id")
+            ]
+            raw_image_generation_entries = manifest.get("image_generations") or []
+            if not isinstance(raw_image_generation_entries, list) or len(image_generation_entry_list) != len(raw_image_generation_entries):
+                raise ValueError("图片生成历史清单结构无效")
+            image_generation_entry_ids = [str(item.get("id") or "") for item in image_generation_entry_list]
+            if len(set(image_generation_entry_ids)) != len(image_generation_entry_ids):
+                raise ValueError("图片生成历史清单包含重复任务")
+            image_generation_entries = {
+                str(item.get("id")): item for item in image_generation_entry_list
+            }
+            if len(image_generation_entries) != len(image_generation_entry_list):
+                raise ValueError("图片生成历史编号重复")
+            selected_image_generation_ids = backup_selected_ids(
+                selection, "image_generation_task_ids", image_generation_entries.keys()
+            )
+            selected_image_generation_ids = {
+                item for item in selected_image_generation_ids if item in image_generation_entries
+            }
+            manifest_configs = manifest.get("configs") if isinstance(manifest.get("configs"), dict) else {}
+            mode_summary = manifest.get("image_generation_modes")
+            include_image_generation_modes = bool(selection.get(
+                "include_image_generation_modes",
+                isinstance(mode_summary, dict) and mode_summary.get("available") is True,
+            ))
+            image_generation_bundle = {"modes": [], "versions": [], "drafts": []}
+            if include_image_generation_modes:
+                members = {
+                    "modes": manifest_configs.get("image_generation_modes"),
+                    "versions": manifest_configs.get("image_generation_versions"),
+                    "drafts": manifest_configs.get("image_generation_drafts"),
+                }
+                if not all(isinstance(member, str) and member for member in members.values()):
+                    raise ValueError("备份缺少图片生成模式配置")
+                image_generation_bundle = {
+                    key: backup_archive_json(archive, member, default=[])
+                    for key, member in members.items()
+                }
+                if isinstance(mode_summary, dict):
+                    image_generation_bundle.update({
+                        "official_content_version": str(mode_summary.get("official_content_version") or ""),
+                        "official_complete": mode_summary.get("official_complete") is True,
+                    })
+                if not all(
+                    isinstance(image_generation_bundle.get(key), list)
+                    for key in ("modes", "versions", "drafts")
+                ):
+                    raise ValueError("图片生成模式配置结构无效")
+                if (
+                    len(image_generation_bundle["modes"]) > 1000
+                    or len(image_generation_bundle["versions"]) > 10000
+                    or len(image_generation_bundle["drafts"]) > 1000
+                ):
+                    raise ValueError("图片生成模式配置数量异常")
 
             canvas_sources = {}
             referenced_urls = set()
+            image_generation_referenced_urls = set()
             for canvas_id in selected_canvas_ids:
                 member = str(all_canvas_entries[canvas_id].get("file") or "")
                 canvas = backup_archive_json(archive, member)
@@ -21846,6 +29187,42 @@ def import_backup_path(path, selection):
                 task = backup_io.prepare_exported_detail_task(task)
                 detail_sources.append(task)
                 referenced_urls.update(backup_io.collect_detail_page_media_urls(task))
+            main_image_sources = []
+            for main_image_entry in main_image_entry_list:
+                task_id = str(main_image_entry.get("id") or "")
+                if task_id not in selected_main_image_ids:
+                    continue
+                member = str(main_image_entries[task_id].get("file") or "")
+                task = backup_archive_json(archive, member)
+                if not isinstance(task, dict) or task.get("type") != "main-image":
+                    raise ValueError(f"一键主图历史数据无效：{task_id}")
+                task = backup_io.prepare_exported_main_image_task(task)
+                main_image_sources.append(task)
+                referenced_urls.update(backup_io.collect_main_image_media_urls(task))
+            image_generation_sources = []
+            for image_generation_entry in image_generation_entry_list:
+                task_id = str(image_generation_entry.get("id") or "")
+                if task_id not in selected_image_generation_ids:
+                    continue
+                member = str(image_generation_entries[task_id].get("file") or "")
+                task = backup_archive_json(archive, member)
+                if not isinstance(task, dict) or task.get("type") != "image-generation":
+                    raise ValueError(f"图片生成历史数据无效：{task_id}")
+                if str(task.get("id") or "") != task_id:
+                    raise ValueError(f"图片生成历史任务编号不匹配：{task_id}")
+                task = backup_io.prepare_exported_image_generation_task(task)
+                if str(task.get("id") or "") != task_id:
+                    raise ValueError(f"图片生成历史编号不一致：{task_id}")
+                image_generation_sources.append(task)
+                urls = backup_io.collect_image_generation_media_urls(task=task)
+                referenced_urls.update(urls)
+                image_generation_referenced_urls.update(urls)
+            config_urls = backup_io.collect_image_generation_media_urls(
+                modes=image_generation_bundle["modes"],
+                drafts=image_generation_bundle["drafts"],
+            )
+            referenced_urls.update(config_urls)
+            image_generation_referenced_urls.update(config_urls)
             current_detail_count = backup_detail_page_count()
             if current_detail_count + len(detail_sources) > DETAIL_PAGE_BACKUP_MAX_RECORDS:
                 remaining = max(0, DETAIL_PAGE_BACKUP_MAX_RECORDS - current_detail_count)
@@ -21853,8 +29230,26 @@ def import_backup_path(path, selection):
                     f"详情页历史最多保留 {DETAIL_PAGE_BACKUP_MAX_RECORDS} 组；本机已有 {current_detail_count} 组，"
                     f"本次最多还能导入 {remaining} 组，请减少选择或先手动删除旧分组"
                 )
-            if selection.get("include_assets", True):
-                backup_validate_selected_resources(archive, manifest, referenced_urls)
+            current_main_image_count = backup_main_image_count()
+            if current_main_image_count + len(main_image_sources) > MAIN_IMAGE_BACKUP_MAX_RECORDS:
+                remaining = max(0, MAIN_IMAGE_BACKUP_MAX_RECORDS - current_main_image_count)
+                raise ValueError(
+                    f"一键主图历史最多保留 {MAIN_IMAGE_BACKUP_MAX_RECORDS} 组；本机已有 {current_main_image_count} 组，"
+                    f"本次最多还能导入 {remaining} 组，请减少选择或先手动删除旧分组"
+                )
+            current_image_generation_count = backup_image_generation_count()
+            if current_image_generation_count + len(image_generation_sources) > IMAGE_GENERATION_BACKUP_MAX_RECORDS:
+                remaining = max(0, IMAGE_GENERATION_BACKUP_MAX_RECORDS - current_image_generation_count)
+                raise ValueError(
+                    f"图片生成历史最多保留 {IMAGE_GENERATION_BACKUP_MAX_RECORDS} 组；本机已有 {current_image_generation_count} 组，"
+                    f"本次最多还能导入 {remaining} 组，请减少选择或先手动删除旧分组"
+                )
+            if image_generation_sources or image_generation_bundle["modes"]:
+                backup_prevalidate_image_generation(image_generation_bundle, image_generation_sources)
+            if selection.get("include_assets", True) or image_generation_bundle["modes"]:
+                backup_validate_selected_resources(
+                    archive, manifest, referenced_urls, image_generation_referenced_urls,
+                )
 
             created_resource_paths = []
             created_prompt_thumbnail_paths = []
@@ -21880,17 +29275,43 @@ def import_backup_path(path, selection):
             runninghub_changed = False
             imported_preferences = {}
             imported_detail_records = []
+            imported_main_image_records = []
+            imported_image_generation = {"mode_ids": [], "tasks": [], "mode_id_map": {}}
+            image_generation_snapshot = (
+                IMAGE_GENERATION_STORE.snapshot_backup_state()
+                if image_generation_sources or image_generation_bundle["modes"] else None
+            )
             unavailable_detail_urls = {
                 str(item) for item in manifest.get("missing_resources") or []
                 if isinstance(item, str) and item
             }
+            unavailable_image_generation_urls = set(image_generation_referenced_urls)
             runninghub_workflows_need_static_sync = False
             try:
-                if selection.get("include_assets", True):
+                if selection.get("include_assets", True) or image_generation_bundle["modes"]:
                     for item in manifest.get("resources") or []:
-                        if not isinstance(item, dict) or str(item.get("url") or "") not in referenced_urls:
+                        url = str(item.get("url") or "") if isinstance(item, dict) else ""
+                        if not isinstance(item, dict) or url not in referenced_urls:
                             continue
-                        url_mapping[str(item.get("url"))] = backup_copy_resource(archive, item, created_resource_paths)
+                        if url in image_generation_referenced_urls:
+                            restored_url = backup_adopt_image_generation_resource(
+                                archive, item, created_resource_paths,
+                            )
+                            unavailable_image_generation_urls.discard(url)
+                        else:
+                            restored_url = backup_copy_resource(archive, item, created_resource_paths)
+                        url_mapping[url] = restored_url
+
+                missing_official_case_urls = []
+                for mode in image_generation_bundle["modes"]:
+                    if not isinstance(mode, dict) or not (mode.get("source_id") or mode.get("builtin")):
+                        continue
+                    missing_official_case_urls.extend(
+                        url for url in backup_io.collect_image_generation_media_urls(modes=[mode])
+                        if url in unavailable_image_generation_urls
+                    )
+                if missing_official_case_urls:
+                    raise ValueError("官方案例图缺失，图片生成内容包未完整恢复")
 
                 existing_projects = copy.deepcopy(original_projects)
                 existing_names = {str(item.get("name") or "") for item in existing_projects}
@@ -22110,16 +29531,49 @@ def import_backup_path(path, selection):
                     if restored_runninghub:
                         sync_runninghub_provider_workflows_to_static_template(restored_runninghub)
 
+                if image_generation_sources or image_generation_bundle["modes"]:
+                    imported_image_generation = IMAGE_GENERATION_STORE.import_backup_bundle(
+                        image_generation_bundle,
+                        image_generation_sources,
+                        imported_at=time.time(),
+                        url_mapping=url_mapping,
+                        provider_id_map=provider_id_map,
+                        unavailable_urls=unavailable_image_generation_urls,
+                        task_limit=IMAGE_GENERATION_BACKUP_MAX_RECORDS,
+                    )
+
                 # Detail-page histories are intentionally written last. The helper
                 # snapshots and restores its permanent group counter and removes all
                 # records it created if any task fails, while the outer transaction
                 # still owns canvas, resource and configuration rollback.
+                detail_meta_path = detail_page_group_meta_file()
+                detail_meta_existed = os.path.isfile(detail_meta_path)
+                detail_meta_content = b""
+                if detail_meta_existed:
+                    with open(detail_meta_path, "rb") as handle:
+                        detail_meta_content = handle.read()
                 imported_detail_records = backup_import_detail_pages(
                     detail_sources,
                     url_mapping=url_mapping,
                     provider_id_map=provider_id_map,
                     unavailable_urls=unavailable_detail_urls,
                 )
+                try:
+                    imported_main_image_records = backup_import_main_images(
+                        main_image_sources,
+                        url_mapping=url_mapping,
+                        provider_id_map=provider_id_map,
+                        unavailable_urls=unavailable_detail_urls,
+                    )
+                except Exception:
+                    # Main-image import happens after detail-page import. Roll back the
+                    # records from this transaction if the second history family fails.
+                    for task in imported_detail_records:
+                        task_id = str(task.get("id") or "")
+                        CANVAS_TASKS.pop(task_id, None)
+                        detail_page_delete_persisted_task(task_id)
+                    backup_restore_detail_group_meta(detail_meta_existed, detail_meta_content)
+                    raise
 
                 try:
                     history = backup_load_history()
@@ -22129,6 +29583,8 @@ def import_backup_path(path, selection):
                         "project_count": len(project_map),
                         "canvas_count": len(imported_canvas_records),
                         "detail_page_count": len(imported_detail_records),
+                        "main_image_count": len(imported_main_image_records),
+                        "image_generation_count": len(imported_image_generation["tasks"]),
                     })
                     backup_save_history(history)
                 except Exception:
@@ -22142,6 +29598,23 @@ def import_backup_path(path, selection):
                     "detail_page_missing_media": sum(
                         len(item.get("import_missing_media") or []) for item in imported_detail_records
                     ),
+                    "main_images": len(imported_main_image_records),
+                    "main_image_task_ids": [str(item.get("id") or "") for item in imported_main_image_records],
+                    "main_image_missing_media": sum(
+                        len(item.get("import_missing_media") or []) for item in imported_main_image_records
+                    ),
+                    "image_generations": len(imported_image_generation["tasks"]),
+                    "image_generation_task_ids": [
+                        str(item.get("id") or "") for item in imported_image_generation["tasks"]
+                    ],
+                    "image_generation_modes_imported": len(imported_image_generation["mode_ids"]),
+                    "image_generation_examples_imported": sum(
+                        1 for mode in image_generation_bundle["modes"]
+                        if isinstance(mode.get("example"), dict)
+                    ),
+                    "image_generations_skipped": 0,
+                    "image_generation_modes_skipped": 0,
+                    "image_generation_missing_media": len(unavailable_image_generation_urls),
                     "resources": len(url_mapping),
                     "providers_changed": providers_changed,
                     "prompts_changed": prompts_changed,
@@ -22159,17 +29632,24 @@ def import_backup_path(path, selection):
                     "provider_id_map": provider_id_map,
                     "preferences": imported_preferences,
                 }
-            except Exception:
+            except Exception as import_error:
                 for canvas_path_created in created_canvas_paths:
                     try:
                         os.remove(canvas_path_created)
                     except OSError:
                         pass
                 for resource_path in created_resource_paths:
+                    if not resource_path:
+                        continue
                     try:
                         os.remove(resource_path)
                     except OSError:
                         pass
+                if image_generation_snapshot is not None:
+                    try:
+                        IMAGE_GENERATION_STORE.restore_backup_state(image_generation_snapshot)
+                    except Exception as rollback_error:
+                        raise ValueError("图片生成备份事务回滚失败") from rollback_error
                 try:
                     if runninghub_keys_cleared and runninghub_key_snapshot is not None:
                         update_env_values(runninghub_key_snapshot)
@@ -22184,7 +29664,7 @@ def import_backup_path(path, selection):
                         save_runninghub_workflow_store(original_workflows)
                 except Exception:
                     pass
-                raise
+                raise import_error
 
 @app.get("/api/backups/options")
 async def backup_options():
@@ -22427,30 +29907,75 @@ async def touch_canvas(canvas_id: str):
 async def list_canvas_assets():
     # canvas_assets_index 会同步遍历并解析所有画布 JSON，放进线程池避免阻塞事件循环
     # （否则画布多时一次请求就会卡住整个 asyncio loop，连 WebSocket 一起掉线）。
-    return await asyncio.to_thread(canvas_assets_index)
+    return await asyncio.to_thread(canvas_assets_index_cached)
 
 @app.get("/api/canvas-assets/orphans")
 async def list_orphan_canvas_assets():
-    return {"items": await asyncio.to_thread(canvas_orphan_assets_index)}
+    raise HTTPException(status_code=410, detail="孤立素材功能已停用，请使用存储清理")
 
 @app.post("/api/canvas-assets/orphans/delete")
 async def delete_orphan_canvas_assets(payload: CanvasAssetDeleteRequest):
-    allowed = {str(item.get("url") or ""): item for item in canvas_orphan_assets_index()}
-    deleted = []
-    skipped = []
-    for raw_url in (payload.urls or [])[:1000]:
+    """Move selected, still-orphaned canvas assets to the Windows Recycle Bin.
+
+    The orphan list is recomputed immediately before the move so a stale UI
+    selection cannot delete a file that has since become a current or shared
+    asset. Unknown URLs are reported as skipped and never reach the recycle
+    bin helper.
+    """
+    requested_urls = []
+    seen_urls = set()
+    for raw_url in payload.urls:
         url = str(raw_url or "").strip()
-        item = allowed.get(url)
-        path = output_file_from_url(url)
-        if not item or not path or os.path.abspath(path) != os.path.abspath(str(item.get("path") or "")):
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        requested_urls.append(url)
+
+    index = await asyncio.to_thread(canvas_assets_index_cached)
+    orphan_items = index.get("orphan_items") if isinstance(index, Mapping) else []
+    orphan_items = orphan_items if isinstance(orphan_items, list) else []
+    allowed_paths = {}
+    for item in orphan_items:
+        item_url = str(item.get("url") or "").strip()
+        local_path = _canvas_asset_local_path(item_url)
+        if local_path is None:
+            continue
+        allowed_paths[storage_cleanup_path_key(local_path)] = local_path
+
+    skipped = []
+    selected_urls = []
+    selected_paths = []
+    selected_path_keys = set()
+    for url in requested_urls:
+        local_path = _canvas_asset_local_path(url)
+        path_key = storage_cleanup_path_key(local_path) if local_path is not None else ""
+        if not path_key or path_key not in allowed_paths or path_key in selected_path_keys:
             skipped.append(url)
             continue
+        selected_path_keys.add(path_key)
+        selected_urls.append(url)
+        selected_paths.append(allowed_paths[path_key])
+
+    if selected_paths:
         try:
-            os.remove(path)
-            deleted.append(url)
-        except OSError:
-            skipped.append(url)
-    return {"deleted": deleted, "skipped": skipped}
+            await asyncio.to_thread(storage_cleanup.move_paths_to_recycle_bin, selected_paths)
+        except OSError as exc:
+            raise HTTPException(status_code=409, detail=f"移入 Windows 回收站失败：{exc}") from exc
+        invalidate_canvas_assets_index_cache()
+
+    return {
+        "deleted": selected_urls,
+        "skipped": skipped,
+        "destination": "windows-recycle-bin",
+    }
+
+
+@app.post("/api/canvas-assets/reconcile-delete")
+async def reconcile_deleted_canvas_assets():
+    raise HTTPException(
+        status_code=410,
+        detail="画布节点删除不会自动清理，请使用素材管理中的存储清理",
+    )
 
 @app.get("/api/smart-canvas/prompt-templates")
 async def smart_canvas_prompt_templates():
@@ -24554,46 +32079,59 @@ async def get_queue_status(client_id: str):
         position = positions[0] if positions else 0
     return {"total": total, "position": position}
 
-@app.post("/api/history/delete")
+@app.post("/api/history/delete", status_code=202)
 async def delete_history(req: DeleteHistoryRequest):
-    if not os.path.exists(HISTORY_FILE):
-        return {"success": False, "message": "History file not found"}
     try:
         with HISTORY_LOCK:
-            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-            target_record = None
-            new_history = []
-            for item in history:
-                is_match = False
+            history = history_read_records_strict_locked()
+            matches: list[tuple[int, Dict[str, Any]]] = []
+            for index, item in enumerate(history):
+                if not isinstance(item, dict):
+                    continue
                 item_ts = item.get("timestamp", 0)
                 if isinstance(req.timestamp, (int, float)) and isinstance(item_ts, (int, float)):
-                    if abs(float(item_ts) - float(req.timestamp)) < 0.001:
-                        is_match = True
-                elif str(item_ts) == str(req.timestamp):
-                    is_match = True
-                if is_match:
-                    target_record = item
+                    is_match = abs(float(item_ts) - float(req.timestamp)) < 0.001
                 else:
-                    new_history.append(item)
-            if target_record:
-                with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(new_history, f, ensure_ascii=False, indent=4)
-
-        if target_record:
-            for img_url in target_record.get("images", []):
-                file_path = output_file_from_url(img_url)
-                if file_path and os.path.exists(file_path):
-                    try:
-                        os.remove(file_path)
-                    except Exception as e:
-                        print(f"Failed to delete file {file_path}: {e}")
-            return {"success": True}
-        else:
-            return {"success": False, "message": "Record not found"}
-    except Exception as e:
-        print(f"Delete history error: {e}")
-        return {"success": False, "message": str(e)}
+                    is_match = str(item_ts) == str(req.timestamp)
+                if is_match:
+                    matches.append((index, item))
+            if not matches:
+                raise HTTPException(status_code=404, detail="历史记录不存在")
+            if len(matches) != 1:
+                raise HTTPException(status_code=409, detail="历史记录编号不唯一，未执行删除")
+            target_index, target_record = matches[0]
+            media_paths = one_click_value_media_paths(target_record)
+            retained = [item for index, item in enumerate(history) if index != target_index]
+            history_write_records_locked(retained)
+            try:
+                job = one_click_cleanup_create_job(
+                    {
+                        "id": f"legacy-history-{uuid.uuid4().hex}",
+                        "type": "legacy-history",
+                    },
+                    media_paths,
+                )
+            except Exception:
+                history_write_records_locked(history)
+                raise
+        event = ONE_CLICK_CLEANUP_WAKE_EVENT
+        if event is not None:
+            event.set()
+        return {
+            "success": True,
+            "history_deleted": 1,
+            "cleanup_job_id": str(job["job_id"]),
+            "cleanup_status": "queued",
+            "media_candidates": len(media_paths),
+        }
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        print(f"Delete history error: {exc}")
+        raise HTTPException(
+            status_code=409,
+            detail="历史记录或本机引用无法安全核对，未执行删除",
+        ) from exc
 
 # --- ModelScope 角度控制 ---
 
@@ -25835,6 +33373,2097 @@ def run_workflow(name: str, payload: WorkflowRunRequest):
         client_id=payload.client_id or str(uuid.uuid4()),
     )
     return generate(req)
+
+# --- 独立图片生成任务（Task 5）---
+
+
+def normalize_image_generation_submission_id(value) -> str:
+    try:
+        normalized = str(uuid.UUID(str(value or "").strip()))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail="submission_id 必须是 UUID") from exc
+    return normalized
+
+
+def image_generation_candidate_key(task_id, candidate_id) -> str:
+    return f"{str(task_id or '')}:{str(candidate_id or '')}"
+
+
+def image_generation_recovery_done(key, job):
+    with IMAGE_GENERATION_TASK_LOCK:
+        if IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS.get(key) is job:
+            IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS.pop(key, None)
+    try:
+        if not job.cancelled():
+            job.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def image_generation_candidate_done(key, job):
+    with IMAGE_GENERATION_TASK_LOCK:
+        if IMAGE_GENERATION_CANDIDATE_TASKS.get(key) is job:
+            IMAGE_GENERATION_CANDIDATE_TASKS.pop(key, None)
+    try:
+        if not job.cancelled():
+            job.exception()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def image_generation_all_tasks_locked() -> List[Dict[str, Any]]:
+    tasks: Dict[str, Dict[str, Any]] = {}
+    offset = 0
+    while True:
+        page = IMAGE_GENERATION_STORE.list_task_summaries(offset=offset, limit=200)
+        for summary in page:
+            task_id = str(summary.get("id") or "")
+            if not task_id:
+                continue
+            task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+            if isinstance(task, dict) and task.get("type") == "image-generation":
+                tasks[task_id] = task
+        if len(page) < 200:
+            break
+        offset += len(page)
+    for task_id, task in IMAGE_GENERATION_RUNTIME_TASKS.items():
+        if isinstance(task, dict) and task.get("type") == "image-generation":
+            tasks[str(task_id)] = copy.deepcopy(task)
+    return list(tasks.values())
+
+
+def image_generation_task_snapshot(task_id: str, *, include_admin: bool = False):
+    task = IMAGE_GENERATION_STORE.load_task(str(task_id or ""), include_admin=include_admin)
+    return task if isinstance(task, dict) and task.get("type") == "image-generation" else None
+
+
+def image_generation_get_candidate(task, candidate_id):
+    return next((
+        item for item in (task or {}).get("candidates") or []
+        if isinstance(item, dict) and str(item.get("id") or "") == str(candidate_id or "")
+    ), None)
+
+
+def image_generation_provider_secret_values(task) -> List[str]:
+    provider_ids = set()
+    settings = (task or {}).get("generation_settings")
+    if isinstance(settings, dict) and settings.get("image_provider_id"):
+        provider_ids.add(str(settings["image_provider_id"]))
+    for candidate in (task or {}).get("candidates") or []:
+        snapshot = candidate.get("provider_snapshot") if isinstance(candidate, dict) else None
+        if isinstance(snapshot, dict) and snapshot.get("id"):
+            provider_ids.add(str(snapshot["id"]))
+    values = []
+    for provider_id in provider_ids:
+        try:
+            secret = str(provider_env_key_value(provider_id) or "")
+        except Exception:
+            secret = ""
+        if secret:
+            values.append(secret)
+    return values
+
+
+def image_generation_task_media_ids(task, *, outputs: bool) -> set[str]:
+    """Collect only task output or input media IDs for scoped cleanup.
+
+    The media store is shared by uploads and generated results, so bulk task
+    cleanup must carry an explicit allowlist instead of sweeping every orphan.
+    """
+    result: set[str] = set()
+
+    def collect(value):
+        if not isinstance(value, dict):
+            return
+        candidate = value.get("id") or value.get("media_id")
+        if isinstance(candidate, str) and re.fullmatch(r"[0-9a-f]{64}", candidate.strip().lower()):
+            result.add(candidate.strip().lower())
+
+    if outputs:
+        for candidate in task.get("candidates") or []:
+            if isinstance(candidate, dict):
+                collect(candidate.get("image"))
+    else:
+        for item in task.get("inputs") or []:
+            if isinstance(item, dict):
+                collect(item.get("media") if isinstance(item.get("media"), dict) else item)
+    return result
+
+
+def image_generation_cleanup_path_roots() -> tuple[Path, ...]:
+    """Return every local root that an image-generation cleanup may own."""
+    roots = (
+        *storage_cleanup_all_roots(),
+        Path(IMAGE_GENERATION_MEDIA_STORE.media_root),
+        Path(IMAGE_GENERATION_MEDIA_STORE.metadata_root),
+        Path(IMAGE_GENERATION_MEDIA_STORE.trash_root),
+    )
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for raw in roots:
+        root = Path(os.path.abspath(raw))
+        key = os.path.normcase(str(root))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return tuple(unique)
+
+
+def image_generation_cleanup_normalize_paths(
+    values: Iterable[Path | str], *, field_name: str = "图片生成清理路径"
+) -> list[str]:
+    """Validate and normalize legacy local paths stored in cleanup jobs."""
+    roots = image_generation_cleanup_path_roots()
+    normalized: set[str] = set()
+    for raw in values or ():
+        if not isinstance(raw, (Path, str)):
+            raise ValueError(f"{field_name}无效")
+        candidate = Path(os.path.abspath(str(raw)))
+        if not any(storage_cleanup_path_within(candidate, root) for root in roots):
+            raise ValueError(f"{field_name}越界")
+        if candidate.exists() and not candidate.is_file():
+            raise ValueError(f"{field_name}不是文件")
+        normalized.add(str(candidate))
+    return sorted(normalized, key=storage_cleanup_path_key)
+
+
+def image_generation_task_media_paths(task, *, outputs: bool) -> set[Path]:
+    """Collect legacy `/assets/...` paths from one task without accepting arbitrary URLs.
+
+    New records use content-addressed media IDs.  Older records can still hold
+    `/assets/output/online_*.png` (or `/assets/input/...`) directly, so those
+    paths must travel with the deletion hand-off as well.  Missing files are
+    retained in the job: a late provider result can land after record deletion
+    and will then be picked up by the background worker.
+    """
+    if not isinstance(task, Mapping):
+        return set()
+    values: list[Any] = []
+    if outputs:
+        for candidate in task.get("candidates") or []:
+            if not isinstance(candidate, Mapping):
+                continue
+            values.extend((candidate.get("image"), candidate.get("image_url"), candidate.get("result")))
+        values.extend((task.get("result"), task.get("image"), task.get("images")))
+        roots = storage_cleanup_target_roots("generated")
+    else:
+        values.extend((task.get("inputs"), task.get("reference_images"), task.get("images")))
+        roots = storage_cleanup_target_roots("temporary-upload")
+
+    paths: set[Path] = set()
+    stack = list(values)
+    while stack:
+        current = stack.pop()
+        if isinstance(current, Mapping):
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple, set)):
+            stack.extend(current)
+        elif isinstance(current, str):
+            try:
+                candidates = storage_cleanup_paths_from_text(current)
+            except Exception:
+                candidates = set()
+            for candidate in candidates:
+                absolute = Path(os.path.abspath(candidate))
+                if any(storage_cleanup_path_within(absolute, root) for root in roots):
+                    paths.add(absolute)
+    return paths
+
+
+def image_generation_refresh_summary(task: Dict[str, Any]) -> None:
+    candidates = [item for item in task.get("candidates") or [] if isinstance(item, dict)]
+    statuses = [str(item.get("status") or "queued") for item in candidates]
+    task["candidate_count"] = len(candidates)
+    task["successful_candidate_count"] = sum(status == "succeeded" for status in statuses)
+    if task.get("deleting"):
+        status = "deleting"
+    elif task.get("cancel_requested"):
+        status = "cancelled"
+    elif any(value == "queued" for value in statuses):
+        status = "queued"
+    elif any(value == "submitting" for value in statuses):
+        status = "submitting"
+    elif any(value == "generating" for value in statuses):
+        status = "generating"
+    elif any(value == "recovering" for value in statuses):
+        status = "recovering"
+    elif any(value == "succeeded" for value in statuses):
+        status = "succeeded"
+    elif task.get("results_deleted"):
+        status = "deleted"
+    elif any(value == "unknown" for value in statuses):
+        status = "unknown"
+    elif statuses and all(value == "cancelled" for value in statuses):
+        status = "cancelled"
+    else:
+        status = "failed"
+    task["status"] = status
+    errors = [str(item.get("error") or "").strip() for item in candidates if item.get("error")]
+    if status in {"succeeded", "queued", "submitting", "generating", "recovering"}:
+        task["error_summary"] = ""
+    elif errors:
+        task["error_summary"] = "；".join(dict.fromkeys(errors))[:1600]
+    task["updated_at"] = time.time()
+    if status in IMAGE_GENERATION_TERMINAL_STATUSES:
+        task.setdefault("completed_at", task["updated_at"])
+    else:
+        task.pop("completed_at", None)
+
+
+def image_generation_mutate_task(task_id: str, mutate):
+    with IMAGE_GENERATION_TASK_LOCK:
+        current = IMAGE_GENERATION_RUNTIME_TASKS.get(task_id)
+        if not isinstance(current, dict):
+            current = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+        if not isinstance(current, dict) or current.get("type") != "image-generation":
+            return None
+        if current.get("deleting"):
+            return None
+        updated = copy.deepcopy(current)
+        mutate(updated)
+        image_generation_refresh_summary(updated)
+        # Disk is authoritative. Never publish a runtime mutation that failed to
+        # persist (especially an upstream task ID).
+        IMAGE_GENERATION_STORE.save_task(updated)
+        IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(updated)
+        return copy.deepcopy(updated)
+
+
+def image_generation_update_candidate(task_id: str, candidate_id: str, **updates):
+    found = {"value": False}
+    current = image_generation_task_snapshot(task_id, include_admin=True) or {}
+    if current.get("deleting"):
+        raise asyncio.CancelledError()
+    known_secrets = image_generation_provider_secret_values(current)
+    for key in ("error", "last_error"):
+        if key in updates:
+            updates[key] = image_generation_redact_sensitive_text(updates[key], known_secrets)
+
+    def mutate(task):
+        candidate = image_generation_get_candidate(task, candidate_id)
+        if candidate is None:
+            return
+        candidate.update(copy.deepcopy(updates))
+        if str(updates.get("status") or "") == "succeeded":
+            task.pop("results_deleted", None)
+        candidate["updated_at"] = time.time()
+        found["value"] = True
+
+    task = image_generation_mutate_task(task_id, mutate)
+    if not task or not found["value"]:
+        return None
+    return copy.deepcopy(image_generation_get_candidate(task, candidate_id))
+
+
+def image_generation_public_response(task_id: str):
+    internal = image_generation_task_snapshot(task_id, include_admin=True)
+    if internal is None:
+        raise HTTPException(status_code=404, detail="图片生成任务不存在")
+    public = IMAGE_GENERATION_STORE.load_task(task_id)
+    return image_generation_redact_sensitive_value(
+        public, image_generation_provider_secret_values(internal)
+    )
+
+
+def image_generation_normalize_inputs(mode, images) -> List[Dict[str, Any]]:
+    images = images if isinstance(images, list) else []
+    maximum = min(6, int(mode.get("max_upload_count") or 0))
+    if len(images) > maximum:
+        raise HTTPException(status_code=422, detail="图片数量超出模式限制")
+    slots = list(mode.get("reference_images") or [])
+    slot_by_key = {str(item.get("key") or ""): item for item in slots}
+    required = {key for key, item in slot_by_key.items() if item.get("required")}
+    seen = set()
+    extra_count = 0
+    normalized = []
+    for index, raw in enumerate(images):
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=422, detail="图片记录无效")
+        nested = raw.get("media") if isinstance(raw.get("media"), dict) else {}
+        default_slot = str(slots[index].get("key") or "") if index < len(slots) else f"extra-{index - len(slots) + 1}"
+        slot_key = str(raw.get("slot_key") or raw.get("role_key") or default_slot).strip()
+        if not slot_key or slot_key in seen:
+            raise HTTPException(status_code=422, detail="图片槽位必须唯一")
+        seen.add(slot_key)
+        definition = slot_by_key.get(slot_key)
+        if definition is None:
+            if not mode.get("allow_extra_images"):
+                raise HTTPException(status_code=422, detail="当前模式不支持额外图片")
+            extra_count += 1
+            if extra_count > int(mode.get("extra_image_limit") or 0):
+                raise HTTPException(status_code=422, detail="额外图片数量超限")
+        media_id = str(raw.get("media_id") or raw.get("id") or nested.get("id") or "").strip().lower()
+        url = str(raw.get("url") or nested.get("url") or "").strip()
+        claimed_hash = str(raw.get("hash") or nested.get("hash") or "").strip().lower()
+        record = IMAGE_GENERATION_MEDIA_STORE.media_record(media_id) if media_id else None
+        if record is None and url:
+            try:
+                adopted = IMAGE_GENERATION_MEDIA_STORE.adopt_local_url(url)
+                record = IMAGE_GENERATION_MEDIA_STORE.media_record(adopted["id"])
+            except (ValueError, OSError):
+                record = None
+        if not record:
+            raise HTTPException(status_code=422, detail="图片素材不存在或哈希无效")
+        if media_id and record.get("id") != media_id:
+            raise HTTPException(status_code=422, detail="图片素材哈希不匹配")
+        if claimed_hash and claimed_hash != record.get("id"):
+            raise HTTPException(status_code=422, detail="图片素材哈希不匹配")
+        if url and url != record.get("url"):
+            raise HTTPException(status_code=422, detail="图片地址与素材哈希不匹配")
+        expected_role = str((definition or {}).get("label") or f"附加参考图{extra_count}").strip()
+        claimed_role = str(raw.get("role") or "").strip()
+        if claimed_role and claimed_role not in {slot_key, expected_role}:
+            raise HTTPException(status_code=422, detail="图片角色与模式槽位不匹配")
+        normalized.append({
+            "slot_key": slot_key,
+            "role": expected_role,
+            "order": index,
+            "media": record,
+        })
+    if not required.issubset(seen):
+        raise HTTPException(status_code=422, detail="缺少必填图片槽位")
+    if int(mode.get("required_reference_count") or 0) != len(required):
+        raise HTTPException(status_code=422, detail="模式图片规则无效")
+    return normalized
+
+
+def image_generation_version_for_request(mode, prompt_version_id, request: Request):
+    current_version_id = str(mode.get("current_version_id") or "")
+    version_id = str(prompt_version_id or current_version_id).strip()
+    if not version_id:
+        raise HTTPException(status_code=422, detail="模式没有可用提示词版本")
+    try:
+        version = IMAGE_GENERATION_STORE.get_prompt_version(mode["id"], version_id)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="提示词版本不存在、损坏或不属于该模式") from exc
+    if version_id != current_version_id:
+        require_image_generation_admin(request)
+    return version
+
+
+def image_generation_ratio_parts(value: Any) -> Tuple[int, int] | None:
+    match = re.fullmatch(r"\s*([1-9]\d{0,2})\s*:\s*([1-9]\d{0,2})\s*", str(value or ""))
+    if not match:
+        return None
+    width, height = int(match.group(1)), int(match.group(2))
+    divisor = math.gcd(width, height) or 1
+    return width // divisor, height // divisor
+
+
+def image_generation_closest_supported_ratio(width: Any, height: Any) -> str:
+    try:
+        source_width, source_height = float(width), float(height)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(source_width) or not math.isfinite(source_height) or source_width <= 0 or source_height <= 0:
+        return ""
+    best_ratio = ""
+    best_score = math.inf
+    epsilon = 1e-9
+    for candidate in _IMAGE_GENERATION_SUPPORTED_RATIOS:
+        parts = image_generation_ratio_parts(candidate)
+        if not parts:
+            continue
+        ratio_width, ratio_height = parts
+        # Match the ordinary canvas helper exactly. Candidate order is the
+        # intentional tie-breaker (for example 3:4 precedes 4:5).
+        score = abs(source_width - source_height * ratio_width / ratio_height)
+        if score < best_score - epsilon:
+            best_ratio, best_score = candidate, score
+    return best_ratio
+
+
+def image_generation_pixel_size_for_ratio(aspect_ratio: str, resolution: str) -> str:
+    parts = image_generation_ratio_parts(aspect_ratio)
+    if not parts:
+        return ""
+    resolution_key = str(resolution or "").strip().lower()
+    if resolution_key not in _IMAGE_GENERATION_RES_LONG_SIDE:
+        resolution_key = "1k"
+    width, height = parts
+    long_side = _IMAGE_GENERATION_RES_LONG_SIDE[resolution_key]
+    pixel_limit = _IMAGE_GENERATION_RES_PIXEL_LIMIT[resolution_key]
+    scale = min(
+        long_side / max(width, height),
+        math.sqrt(pixel_limit / (width * height)),
+    )
+    snapped_scale = max(16, math.floor(scale / 16) * 16)
+    return f"{width * snapped_scale}x{height * snapped_scale}"
+
+
+def image_generation_effective_settings(payload: ImageGenerationTaskRequest, inputs) -> Dict[str, Any]:
+    ratio_mode = str(payload.ratio_mode or "fixed").strip().lower()
+    if ratio_mode not in _IMAGE_GENERATION_RATIO_MODES:
+        raise HTTPException(status_code=422, detail="图片比例模式无效")
+    resolution = str(payload.resolution or "").strip().lower()
+    auto_size = resolution == "auto"
+    custom_width = str(payload.custom_ratio_width or "").strip()
+    custom_height = str(payload.custom_ratio_height or "").strip()
+
+    if ratio_mode == "adaptive":
+        aspect_ratio = ""
+        size = "auto"
+    elif ratio_mode == "source":
+        first_media = (
+            inputs[0].get("media")
+            if inputs and isinstance(inputs[0], dict) and isinstance(inputs[0].get("media"), dict)
+            else {}
+        )
+        aspect_ratio = image_generation_closest_supported_ratio(
+            first_media.get("width"), first_media.get("height")
+        )
+        if not aspect_ratio:
+            raise HTTPException(status_code=422, detail="拉伸适配需要第一张已保存图片的有效尺寸")
+        size = "auto" if auto_size else image_generation_pixel_size_for_ratio(aspect_ratio, resolution)
+    elif ratio_mode == "custom":
+        if (
+            not re.fullmatch(r"[1-9]\d{0,2}", custom_width)
+            or not re.fullmatch(r"[1-9]\d{0,2}", custom_height)
+        ):
+            raise HTTPException(status_code=422, detail="自定义比例宽高必须是 1 到 999 的正整数")
+        width, height = int(custom_width), int(custom_height)
+        divisor = math.gcd(width, height) or 1
+        aspect_ratio = f"{width // divisor}:{height // divisor}"
+        size = "auto" if auto_size else image_generation_pixel_size_for_ratio(aspect_ratio, resolution)
+    else:
+        fixed_match = re.fullmatch(
+            r"\s*([1-9]\d{0,2})\s*:\s*([1-9]\d{0,2})\s*",
+            str(payload.aspect_ratio or ""),
+        )
+        aspect_ratio = (
+            f"{int(fixed_match.group(1))}:{int(fixed_match.group(2))}"
+            if fixed_match
+            else ""
+        )
+        if aspect_ratio not in _IMAGE_GENERATION_SUPPORTED_RATIOS:
+            raise HTTPException(status_code=422, detail="固定图片比例不受支持")
+        size = "auto" if auto_size else image_generation_pixel_size_for_ratio(aspect_ratio, resolution)
+
+    return {
+        "ratio_mode": ratio_mode,
+        "custom_ratio_width": custom_width if ratio_mode == "custom" else "",
+        "custom_ratio_height": custom_height if ratio_mode == "custom" else "",
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "size": size,
+    }
+
+
+def image_generation_fingerprint(payload, mode, version_id, inputs, final_prompt, provider_snapshot, settings=None) -> str:
+    execution_provider = copy.deepcopy(provider_snapshot)
+    execution_provider.pop("name", None)
+    effective = settings if isinstance(settings, dict) else {
+        "ratio_mode": str(getattr(payload, "ratio_mode", "fixed") or "fixed").strip().lower(),
+        "aspect_ratio": str(payload.aspect_ratio or "").strip().lower(),
+        "resolution": str(payload.resolution or "").strip().lower(),
+        "size": re.sub(r"\s+", "", str(payload.size or "")).lower(),
+    }
+    canonical = {
+        "mode_id": mode["id"],
+        "prompt_version_id": version_id,
+        "images": [{
+            "media_hash": item["media"]["id"],
+            "slot_key": item["slot_key"],
+            "role": item["role"],
+            "order": item["order"],
+        } for item in inputs],
+        "user_prompt": str(payload.user_prompt or "").strip(),
+        "final_prompt": str(final_prompt or ""),
+        "provider": execution_provider,
+        "image_provider_id": str(provider_snapshot.get("id") or "").strip().lower(),
+        "image_model": str(provider_snapshot.get("model") or "").strip(),
+        "ratio_mode": str(effective.get("ratio_mode") or "fixed").strip().lower(),
+        "aspect_ratio": str(effective.get("aspect_ratio") or "").strip().lower(),
+        "resolution": str(effective.get("resolution") or "").strip().lower(),
+        "size": re.sub(r"\s+", "", str(effective.get("size") or "")).lower(),
+        "image_count": int(payload.image_count),
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def image_generation_request_from_task(task):
+    settings = task.get("generation_settings") if isinstance(task.get("generation_settings"), dict) else {}
+    ratio_mode = str(settings.get("ratio_mode") or "fixed").strip().lower()
+    stretch_aspect_ratio = (
+        str(settings.get("aspect_ratio") or "").strip()
+        if ratio_mode == "source"
+        else ""
+    )
+    references = [
+        AIReference(
+            url=str(item.get("media", {}).get("url") or ""),
+            name=str(item.get("role") or ""),
+            role=str(item.get("slot_key") or "reference"),
+            kind="image",
+            stretch_aspect_ratio=stretch_aspect_ratio,
+        )
+        for item in task.get("inputs") or []
+        if isinstance(item, dict) and isinstance(item.get("media"), dict)
+    ]
+    return OnlineImageRequest(
+        prompt=str(task.get("final_prompt") or ""),
+        provider_id=str(settings.get("image_provider_id") or ""),
+        model=str(settings.get("image_model") or ""),
+        aspect_ratio=str(settings.get("aspect_ratio") or ""),
+        resolution=str(settings.get("resolution") or ""),
+        size=str(settings.get("size") or "2048x2048"),
+        quality="auto",
+        n=1,
+        reference_images=references,
+    )
+
+
+async def image_generation_adopt_result(result):
+    urls = result.get("images") if isinstance(result, dict) else []
+    url = str(urls[0] or "") if isinstance(urls, list) and urls else ""
+    if not url:
+        raise ValueError("上游没有返回可保存图片")
+    try:
+        adopted = IMAGE_GENERATION_MEDIA_STORE.adopt_local_url(url)
+    except (ValueError, OSError):
+        data, extension = await asyncio.to_thread(detail_page_download_bytes, url)
+        adopted = IMAGE_GENERATION_MEDIA_STORE.adopt_bytes(data, extension)
+    record = IMAGE_GENERATION_MEDIA_STORE.media_record(adopted["id"])
+    if not record:
+        raise ValueError("生成结果未能写入素材库")
+    return record
+
+
+def image_generation_semaphore():
+    global IMAGE_GENERATION_SEMAPHORE, IMAGE_GENERATION_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    if IMAGE_GENERATION_SEMAPHORE is None or IMAGE_GENERATION_SEMAPHORE_LOOP is not loop:
+        IMAGE_GENERATION_SEMAPHORE = asyncio.Semaphore(6)
+        IMAGE_GENERATION_SEMAPHORE_LOOP = loop
+    return IMAGE_GENERATION_SEMAPHORE
+
+
+@asynccontextmanager
+async def image_generation_request_slot():
+    """Cap paid image requests at six even if more than one loop exists."""
+    acquired = False
+    async with image_generation_semaphore():
+        try:
+            while not IMAGE_GENERATION_PROCESS_SEMAPHORE.acquire(blocking=False):
+                await asyncio.sleep(0.01)
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                IMAGE_GENERATION_PROCESS_SEMAPHORE.release()
+
+
+async def run_image_generation_candidate(task_id: str, candidate_id: str):
+    try:
+        image_generation_update_candidate(task_id, candidate_id, status="queued", error="")
+        async with image_generation_request_slot():
+            task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+            candidate = image_generation_get_candidate(task, candidate_id)
+            if not task or not candidate or task.get("cancel_requested") or task.get("deleting"):
+                raise asyncio.CancelledError()
+            request = image_generation_request_from_task(task)
+            provider_snapshot = candidate.get("provider_snapshot") if isinstance(candidate.get("provider_snapshot"), dict) else {}
+            image_generation_update_candidate(task_id, candidate_id, status="submitting", error="")
+
+            async def observer(event, details):
+                details = details if isinstance(details, dict) else {}
+                if event == "submitted":
+                    upstream_id = str(details.get("task_id") or "").strip()
+                    if not upstream_id:
+                        raise ValueError("异步提交未返回任务编号")
+                    # This atomic save must finish before the provider helper is
+                    # allowed to perform its first query.
+                    image_generation_update_candidate(
+                        task_id, candidate_id,
+                        status="generating", upstream_task_id=upstream_id,
+                        provider_snapshot=provider_snapshot,
+                        submitted_at=float(details.get("submitted_at") or time.time()),
+                        error="", last_error="",
+                    )
+                elif event == "querying":
+                    image_generation_update_candidate(
+                        task_id, candidate_id, status="generating",
+                        query_attempts=max(0, int(details.get("attempt") or 0)),
+                        last_query_at=float(details.get("last_query_at") or time.time()),
+                        last_error="", error="",
+                    )
+                elif event == "recovering":
+                    image_generation_update_candidate(
+                        task_id, candidate_id, status="recovering",
+                        query_attempts=max(0, int(details.get("attempt") or 0)),
+                        last_query_at=float(details.get("last_query_at") or time.time()),
+                        last_error=str(details.get("error") or "")[:800],
+                        error="正在恢复查询，上游任务不会重复提交",
+                    )
+
+            if provider_snapshot:
+                result = await build_online_image_result(
+                    request,
+                    async_task_observer=observer,
+                    provider_override=provider_snapshot,
+                    history_metadata={
+                        "source_type": "image-generation",
+                        "source_task_id": task_id,
+                        "source_candidate_id": candidate_id,
+                    },
+                    persist_mode="image_generation_media",
+                )
+            else:
+                image_generation_update_candidate(task_id, candidate_id, status="generating")
+                result = await build_online_image_result(
+                    request,
+                    history_metadata={
+                        "source_type": "image-generation",
+                        "source_task_id": task_id,
+                        "source_candidate_id": candidate_id,
+                    },
+                    persist_mode="image_generation_media",
+                )
+            media = await image_generation_adopt_result(result)
+            current = image_generation_task_snapshot(task_id, include_admin=True) or {}
+            current_candidate = image_generation_get_candidate(current, candidate_id) or {}
+            image_generation_update_candidate(
+                task_id, candidate_id, status="succeeded", image=media,
+                result={
+                    "images": [media["url"]],
+                    "source_images": [
+                        str(item) for item in (result or {}).get("images") or []
+                        if isinstance(item, str) and item
+                    ],
+                    "provider_id": str((result or {}).get("provider_id") or request.provider_id),
+                    "model": str((result or {}).get("model") or request.model),
+                    "task_id": str((result or {}).get("task_id") or current_candidate.get("upstream_task_id") or ""),
+                },
+                upstream_task_id=str((result or {}).get("task_id") or current_candidate.get("upstream_task_id") or ""),
+                error="", last_error="", completed_at=time.time(),
+            )
+    except asyncio.CancelledError:
+        try:
+            image_generation_update_candidate(task_id, candidate_id, status="cancelled", error="已停止本地等待；上游任务可能仍在运行", completed_at=time.time())
+        except Exception:
+            pass
+        raise
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc) or "候选生成失败"
+        task = image_generation_task_snapshot(task_id, include_admin=True) or {}
+        candidate = image_generation_get_candidate(task, candidate_id) or {}
+        upstream_id = str(getattr(exc, "upstream_task_id", "") or candidate.get("upstream_task_id") or "")
+        explicit = str(getattr(exc, "async_candidate_status", "") or "")
+        provider_snapshot = candidate.get("provider_snapshot") if isinstance(candidate.get("provider_snapshot"), dict) else {}
+        if explicit == "failed":
+            status = "failed"
+        elif explicit == "unknown":
+            status = "unknown"
+        elif provider_snapshot and upstream_id:
+            status = "recovering"
+        elif provider_snapshot and detail_page_async_submission_is_unknown(detail):
+            status = "unknown"
+        else:
+            status = "failed"
+        message = str(detail)[:1200]
+        if status == "unknown" and not upstream_id:
+            message = "结果未知，未获得任务编号，无法自动回补；重新生成可能再次扣费。"
+        try:
+            image_generation_update_candidate(
+                task_id, candidate_id, status=status, upstream_task_id=upstream_id,
+                error=message, last_error=str(detail)[:800],
+                **({} if status == "recovering" else {"completed_at": time.time()}),
+            )
+        except Exception as persist_exc:
+            print(f"保存图片生成候选失败 {task_id}/{candidate_id}: {persist_exc}")
+
+
+def image_generation_schedule_candidate(task_id: str, candidate_id: str):
+    with IMAGE_GENERATION_TASK_LOCK:
+        task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+        if not task or task.get("deleting"):
+            return None, True
+        key = image_generation_candidate_key(task_id, candidate_id)
+        current = IMAGE_GENERATION_CANDIDATE_TASKS.get(key)
+        if current and not current.done():
+            return current, True
+        job = asyncio.create_task(run_image_generation_candidate(task_id, candidate_id))
+        IMAGE_GENERATION_CANDIDATE_TASKS[key] = job
+        job.add_done_callback(lambda finished, item_key=key: image_generation_candidate_done(item_key, finished))
+        return job, False
+
+
+async def run_image_generation_candidate_recovery(task_id: str, candidate_id: str):
+    task = image_generation_task_snapshot(task_id, include_admin=True)
+    candidate = image_generation_get_candidate(task, candidate_id)
+    if not task or not candidate or task.get("deleting"):
+        return
+    upstream_id = str(candidate.get("upstream_task_id") or "")
+    provider = candidate.get("provider_snapshot") if isinstance(candidate.get("provider_snapshot"), dict) else {}
+    if str(candidate.get("status") or "") not in {"unknown", "recovering"} or not upstream_id:
+        return
+    if not provider.get("id") or not provider.get("base_url"):
+        image_generation_update_candidate(task_id, candidate_id, status="unknown", error="缺少原平台快照，无法安全回补")
+        return
+    image_generation_update_candidate(task_id, candidate_id, status="recovering", error="正在回补，只查询原任务，不会重新生图")
+
+    async def observer(event, details):
+        details = details if isinstance(details, dict) else {}
+        if event == "querying":
+            image_generation_update_candidate(
+                task_id, candidate_id, status="generating",
+                query_attempts=max(0, int(details.get("attempt") or 0)),
+                last_query_at=float(details.get("last_query_at") or time.time()),
+                error="", last_error="",
+            )
+        elif event == "recovering":
+            image_generation_update_candidate(
+                task_id, candidate_id, status="recovering",
+                query_attempts=max(0, int(details.get("attempt") or 0)),
+                last_query_at=float(details.get("last_query_at") or time.time()),
+                error="正在恢复查询，上游任务不会重复提交",
+                last_error=str(details.get("error") or "")[:800],
+            )
+
+    try:
+        query_strategy = str(provider.get("_task5_query_strategy") or "image-task").strip().lower()
+        if query_strategy == "runninghub-entry":
+            persist_token = IMAGE_GENERATION_PERSIST_MODE.set("image_generation_media")
+            try:
+                raw = await wait_for_runninghub_entry_task(
+                    upstream_id, provider, False, observer
+                )
+            finally:
+                IMAGE_GENERATION_PERSIST_MODE.reset(persist_token)
+        else:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0)) as client:
+                if detail_page_async_image_enabled(provider) or query_strategy == "openai-responses":
+                    raw = await wait_for_detail_page_image_task(client, upstream_id, provider, observer)
+                else:
+                    raw = await wait_for_image_task(client, upstream_id, provider)
+        current = image_generation_task_snapshot(task_id, include_admin=True) or task
+        current_candidate = image_generation_get_candidate(current, candidate_id) or candidate
+        result = await detail_page_result_from_async_payload(
+            current_candidate,
+            raw,
+            history_metadata={
+                "source_type": "image-generation",
+                "source_task_id": task_id,
+                "source_candidate_id": candidate_id,
+            },
+            persist_mode="image_generation_media",
+        )
+        media = await image_generation_adopt_result(result)
+        image_generation_update_candidate(
+            task_id, candidate_id, status="succeeded", image=media,
+            result={
+                "images": [media["url"]],
+                "source_images": [
+                    str(item) for item in (result or {}).get("images") or []
+                    if isinstance(item, str) and item
+                ],
+                "provider_id": provider.get("id"),
+                "model": provider.get("model"),
+                "task_id": upstream_id,
+            },
+            error="", last_error="", completed_at=time.time(),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc) or "回补查询失败"
+        explicit = str(getattr(exc, "async_candidate_status", "") or "")
+        status = "failed" if explicit == "failed" else "unknown" if explicit == "unknown" else "recovering"
+        image_generation_update_candidate(
+            task_id, candidate_id, status=status,
+            error=str(detail)[:1200], last_error=str(detail)[:800],
+            **({} if status == "recovering" else {"completed_at": time.time()}),
+        )
+
+
+def image_generation_cancel_jobs(task_id: str):
+    prefix = f"{task_id}:"
+    with IMAGE_GENERATION_TASK_LOCK:
+        jobs = [
+            job
+            for registry in (IMAGE_GENERATION_CANDIDATE_TASKS, IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS)
+            for key, job in list(registry.items())
+            if key.startswith(prefix) and not job.done()
+        ]
+    for job in jobs:
+        image_generation_cancel_job_threadsafe(job)
+
+
+def image_generation_cancel_job_threadsafe(job):
+    if job.done():
+        return
+    try:
+        owner_loop = job.get_loop()
+    except (AttributeError, RuntimeError):
+        owner_loop = None
+    if owner_loop is None:
+        job.cancel()
+        return
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    if owner_loop is current_loop:
+        job.cancel()
+    elif not owner_loop.is_closed():
+        owner_loop.call_soon_threadsafe(job.cancel)
+
+
+async def image_generation_wait_for_registered_jobs(jobs, timeout=5.0):
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    while any(not job.done() for job in jobs):
+        if time.monotonic() >= deadline:
+            raise HTTPException(status_code=409, detail="本地生成任务尚未安全停止；删除标记已保留，可稍后重试")
+        await asyncio.sleep(0.01)
+
+
+def image_generation_cancel_local(task_id: str):
+    cancellation_warning = "已停止本地等待；不支持远程取消的平台上游任务可能仍在运行"
+
+    def mutate(task):
+        task["cancel_requested"] = True
+        task["error_summary"] = cancellation_warning
+        for candidate in task.get("candidates") or []:
+            if str(candidate.get("status") or "") in IMAGE_GENERATION_ACTIVE_STATUSES:
+                candidate["status"] = "cancelled"
+                candidate["error"] = "已停止本地等待；上游任务可能仍在运行"
+                candidate["completed_at"] = time.time()
+
+    task = image_generation_mutate_task(task_id, mutate)
+    if task:
+        # refresh_summary intentionally preserves this user-facing warning.
+        with IMAGE_GENERATION_TASK_LOCK:
+            current = IMAGE_GENERATION_RUNTIME_TASKS.get(task_id) or task
+            current = copy.deepcopy(current)
+            current["error_summary"] = cancellation_warning
+            IMAGE_GENERATION_STORE.save_task(current)
+            IMAGE_GENERATION_RUNTIME_TASKS[task_id] = current
+    image_generation_cancel_jobs(task_id)
+    return image_generation_task_snapshot(task_id)
+
+
+@app.post("/api/image-generation-tasks")
+async def create_image_generation_task(payload: ImageGenerationTaskRequest, request: Request):
+    submission_id = normalize_image_generation_submission_id(payload.submission_id)
+    with IMAGE_GENERATION_TASK_LOCK:
+        if IMAGE_GENERATION_HISTORY_CLEARING:
+            raise HTTPException(status_code=409, detail="正在清除图片生成记录，请稍后重试")
+        tasks = image_generation_all_tasks_locked()
+        exact = next((task for task in tasks if submission_id == str(task.get("submission_id") or "") or submission_id in [str(item) for item in task.get("submission_ids") or []]), None)
+        if exact:
+            IMAGE_GENERATION_RUNTIME_TASKS[str(exact["id"])] = copy.deepcopy(exact)
+            return {
+                "task_id": exact["id"], "group_no": int(exact.get("group_no") or 0),
+                "status": str(exact.get("status") or "queued"), "runtime_id": exact.get("runtime_id") or CANVAS_TASK_RUNTIME_ID,
+                "reused": True, "reuse_reason": "submission_id",
+            }
+        mode = IMAGE_GENERATION_STORE.get_mode(payload.mode_id, include_admin=True)
+        if not mode or mode.get("status") != "active":
+            raise HTTPException(status_code=422, detail="图片生成模式不存在或未启用")
+        inputs = image_generation_normalize_inputs(mode, payload.images)
+        version = image_generation_version_for_request(mode, payload.prompt_version_id, request)
+        provider = get_api_provider_exact(payload.image_provider_id)
+        resolved_model = resolve_image_model_for_resolution(provider, payload.image_model, payload.resolution)
+        provider_snapshot = image_generation_provider_snapshot(provider, resolved_model)
+        effective_settings = image_generation_effective_settings(payload, inputs)
+        roles = [f"图{index + 1}={item['role']}" for index, item in enumerate(inputs)]
+        prompt_mode = copy.deepcopy(mode)
+        prompt_mode["preset_prompt"] = str(version.get("prompt") or "")
+        normalized_user_prompt = str(payload.user_prompt or "").strip()
+        prompt_ratio = "自适应" if effective_settings["ratio_mode"] == "adaptive" else effective_settings["aspect_ratio"]
+        final_prompt = compose_final_prompt(
+            prompt_mode, roles, normalized_user_prompt, prompt_ratio, effective_settings["resolution"]
+        )
+        if len(final_prompt) > ONLINE_IMAGE_PROMPT_MAX_LENGTH:
+            raise HTTPException(status_code=422, detail="最终提示词超过图片模型上限")
+        fingerprint = image_generation_fingerprint(
+            payload, mode, version["id"], inputs, final_prompt, provider_snapshot, effective_settings
+        )
+        if not payload.force_new:
+            matching = [task for task in tasks if str(task.get("status") or "") in IMAGE_GENERATION_ACTIVE_STATUSES and str(task.get("config_fingerprint") or "") == fingerprint]
+            if matching:
+                matched = max(matching, key=lambda item: float(item.get("created_at") or 0))
+                aliases = list(dict.fromkeys([str(matched.get("submission_id") or ""), *[str(item) for item in matched.get("submission_ids") or []], submission_id]))
+                matched["submission_ids"] = [item for item in aliases if item]
+                matched["updated_at"] = time.time()
+                IMAGE_GENERATION_STORE.save_task(matched)
+                IMAGE_GENERATION_RUNTIME_TASKS[str(matched["id"])] = copy.deepcopy(matched)
+                return {
+                    "task_id": matched["id"], "group_no": int(matched.get("group_no") or 0),
+                    "status": str(matched.get("status") or "queued"), "runtime_id": matched.get("runtime_id") or CANVAS_TASK_RUNTIME_ID,
+                    "reused": True, "reuse_reason": "active_config",
+                }
+        task_id = f"image_generation_{uuid.uuid4().hex}"
+        group_no = IMAGE_GENERATION_STORE.allocate_task_group_no()
+        now = time.time()
+        settings = {
+            "image_provider_id": str(provider_snapshot.get("id") or ""), "image_model": resolved_model,
+            **effective_settings,
+            "image_count": int(payload.image_count),
+        }
+        candidates = [{
+            "id": f"candidate_{uuid.uuid4().hex}", "candidate_no": index + 1,
+            "status": "queued", "generation_params": copy.deepcopy(settings),
+            "provider_snapshot": copy.deepcopy(provider_snapshot), "upstream_task_id": "",
+            "query_attempts": 0, "last_query_at": 0, "last_error": "", "error": "",
+            "image": None, "result": None, "created_at": now, "updated_at": now,
+        } for index in range(int(payload.image_count))]
+        task = {
+            "id": task_id, "type": "image-generation", "group_no": group_no,
+            "name": str(mode.get("display_name") or "")[:80], "mode_id": mode["id"],
+            "mode_no": int(mode.get("mode_no") or 0), "mode_name": str(mode.get("display_name") or ""),
+            "mode_snapshot": {"reference_images": copy.deepcopy(mode.get("reference_images") or []), "max_upload_count": mode.get("max_upload_count"), "allow_extra_images": mode.get("allow_extra_images"), "extra_image_limit": mode.get("extra_image_limit")},
+            "prompt_version_id": version["id"], "preset_prompt_snapshot": str(version.get("prompt") or ""),
+            "user_prompt": normalized_user_prompt, "final_prompt": final_prompt,
+            "inputs": inputs, "generation_settings": settings,
+            "submission_id": submission_id, "submission_ids": [submission_id],
+            "config_fingerprint": fingerprint, "status": "queued", "candidates": candidates,
+            "candidate_count": len(candidates), "successful_candidate_count": 0,
+            "runtime_id": CANVAS_TASK_RUNTIME_ID, "cancel_requested": False,
+            "error_summary": "", "created_at": now, "updated_at": now,
+        }
+        # The complete task and every queued candidate must be durable before
+        # any coroutine can reach a model/provider.
+        IMAGE_GENERATION_STORE.save_task(task)
+        IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(task)
+        for candidate in candidates:
+            image_generation_schedule_candidate(task_id, candidate["id"])
+    return {
+        "task_id": task_id, "group_no": group_no, "status": "queued",
+        "runtime_id": CANVAS_TASK_RUNTIME_ID, "reused": False, "reuse_reason": "",
+    }
+
+
+@app.get("/api/image-generation-tasks")
+async def list_image_generation_tasks(mode_id: str = "", status: str = "", offset: int = 0, limit: int = 100):
+    try:
+        items = IMAGE_GENERATION_STORE.list_task_summaries(mode_id=mode_id, status=status, offset=offset, limit=limit)
+        items = [
+            image_generation_redact_sensitive_value(
+                item,
+                image_generation_provider_secret_values(
+                    IMAGE_GENERATION_STORE.load_task(str(item.get("id") or ""), include_admin=True) or {}
+                ),
+            )
+            for item in items
+        ]
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"items": items, "offset": offset, "limit": limit, "runtime_id": CANVAS_TASK_RUNTIME_ID}
+
+
+@app.post("/api/image-generation-tasks/cleanup-terminal", status_code=202)
+async def cleanup_terminal_image_generation_tasks(
+    payload: ImageGenerationTerminalCleanupRequest,
+):
+    """Delete failed/deleted image-generation records and queue media cleanup.
+
+    The browser sends the IDs it displayed, but the server re-checks the
+    current persisted state under the task lock.  This keeps the operation
+    safe when another tab finishes a task or when the list was stale.
+    """
+
+    global IMAGE_GENERATION_HISTORY_CLEARING
+    with IMAGE_GENERATION_TASK_LOCK:
+        if IMAGE_GENERATION_HISTORY_CLEARING:
+            raise HTTPException(status_code=409, detail="正在清理图片生成数据，请稍后重试")
+        IMAGE_GENERATION_HISTORY_CLEARING = True
+
+    requested_ids = [str(item).strip() for item in payload.task_ids if str(item).strip()]
+    originals: Dict[str, Dict[str, Any]] = {}
+    history_existed = os.path.isfile(HISTORY_FILE)
+    history_backup: list[Dict[str, Any]] = []
+    history_deleted = 0
+    cleanup_job: Dict[str, Any] | None = None
+    jobs: list[Any] = []
+    target_ids: list[str] = []
+    targets: list[Dict[str, Any]] = []
+
+    try:
+        with IMAGE_GENERATION_TASK_LOCK:
+            with HISTORY_LOCK:
+                history_backup = history_read_records_strict_locked()
+            targets = image_generation_terminal_cleanup_targets(
+                image_generation_all_tasks_locked(), requested_ids
+            )
+            target_ids = [str(item["id"]) for item in targets]
+            if not targets:
+                return {
+                    "deleted": True,
+                    "deleted_task_count": 0,
+                    "deleted_task_ids": [],
+                    "failed_count": 0,
+                    "deleted_count": 0,
+                    "cleanup_job_id": "",
+                    "cleanup_status": "not_needed",
+                    "history_deleted": 0,
+                    "media_candidates": 0,
+                }
+            originals = {str(item["id"]): copy.deepcopy(item) for item in targets}
+            for task in targets:
+                task_id = str(task["id"])
+                prefix = f"{task_id}:"
+                jobs.extend(
+                    job
+                    for registry in (IMAGE_GENERATION_CANDIDATE_TASKS, IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS)
+                    for key, job in list(registry.items())
+                    if key.startswith(prefix) and not job.done()
+                )
+
+        for job in jobs:
+            image_generation_cancel_job_threadsafe(job)
+        await image_generation_wait_for_registered_jobs(jobs)
+
+        with IMAGE_GENERATION_TASK_LOCK:
+            for task_id in target_ids:
+                current = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+                original = originals.get(task_id) or {}
+                if (
+                    not current
+                    or image_generation_terminal_cleanup_status(current)
+                    != image_generation_terminal_cleanup_status(original)
+                ):
+                    raise HTTPException(status_code=409, detail="终态记录发生变化，未删除任何数据")
+                if any(
+                    isinstance(candidate, dict)
+                    and str(candidate.get("status") or "") in IMAGE_GENERATION_ACTIVE_STATUSES
+                    for candidate in current.get("candidates") or []
+                ):
+                    raise HTTPException(status_code=409, detail="本地生成任务尚未安全停止，未删除任何数据")
+
+            media_ids: set[str] = set()
+            media_paths: set[Path] = set()
+            for task in targets:
+                media_ids.update(image_generation_task_media_ids(task, outputs=False))
+                media_ids.update(image_generation_task_media_ids(task, outputs=True))
+                media_paths.update(image_generation_task_media_paths(task, outputs=False))
+                media_paths.update(image_generation_task_media_paths(task, outputs=True))
+                for record in history_backup:
+                    if image_generation_history_record_matches_task(record, task):
+                        media_paths.update(
+                            image_generation_history_record_media_paths(record, outputs=True)
+                        )
+                        media_paths.update(
+                            image_generation_history_record_media_paths(record, outputs=False)
+                        )
+
+            try:
+                for task_id in target_ids:
+                    IMAGE_GENERATION_STORE.delete_task(task_id)
+                history_deleted = delete_image_generation_history_rows_locked(
+                    target_ids, tasks=originals
+                )
+                cleanup_job = image_generation_cleanup_create_job(
+                    task_ids=target_ids,
+                    media_ids=media_ids,
+                    media_paths=media_paths,
+                )
+            except Exception:
+                if cleanup_job is not None:
+                    one_click_cleanup_remove_job(str(cleanup_job.get("job_id") or ""))
+                image_generation_cleanup_restore_tasks(originals)
+                if history_deleted:
+                    with HISTORY_LOCK:
+                        if history_existed:
+                            history_write_records_locked(history_backup)
+                        elif os.path.isfile(HISTORY_FILE):
+                            try:
+                                os.remove(HISTORY_FILE)
+                            except OSError:
+                                pass
+                raise
+
+            for task_id in target_ids:
+                IMAGE_GENERATION_RUNTIME_TASKS.pop(task_id, None)
+                prefix = f"{task_id}:"
+                for key in [
+                    item for item in IMAGE_GENERATION_RECOVERY_CANDIDATES
+                    if item.startswith(prefix)
+                ]:
+                    IMAGE_GENERATION_RECOVERY_CANDIDATES.pop(key, None)
+
+        event = ONE_CLICK_CLEANUP_WAKE_EVENT
+        if event is not None:
+            event.set()
+        status_by_task = {
+            task_id: image_generation_terminal_cleanup_status(task)
+            for task_id, task in originals.items()
+        }
+        return {
+            "deleted": True,
+            "deleted_task_count": len(target_ids),
+            "deleted_task_ids": target_ids,
+            "failed_count": sum(value == "failed" for value in status_by_task.values()),
+            "deleted_count": sum(value == "deleted" for value in status_by_task.values()),
+            "cleanup_job_id": str((cleanup_job or {}).get("job_id") or ""),
+            "cleanup_status": "queued",
+            "history_deleted": history_deleted,
+            "media_candidates": len(media_ids | {str(path) for path in media_paths}),
+        }
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        if originals:
+            try:
+                image_generation_cleanup_restore_tasks(originals)
+            except Exception:
+                pass
+        if history_deleted:
+            with HISTORY_LOCK:
+                if history_existed:
+                    history_write_records_locked(history_backup)
+                elif os.path.isfile(HISTORY_FILE):
+                    try:
+                        os.remove(HISTORY_FILE)
+                    except OSError:
+                        pass
+        raise HTTPException(status_code=500, detail="终态记录清理未完成，原数据已保留") from exc
+    finally:
+        with IMAGE_GENERATION_TASK_LOCK:
+            IMAGE_GENERATION_HISTORY_CLEARING = False
+
+
+_IMAGE_GENERATION_CLEANUP_RETENTION_SECONDS = {
+    "24h": 24 * 60 * 60,
+    "7d": 7 * 24 * 60 * 60,
+    "30d": 30 * 24 * 60 * 60,
+}
+
+
+def image_generation_cleanup_cutoff(retention: str, *, now: float | None = None) -> float | None:
+    if retention == "all":
+        return None
+    seconds = _IMAGE_GENERATION_CLEANUP_RETENTION_SECONDS.get(retention)
+    if seconds is None:
+        raise ValueError("不支持的数据清理时间范围")
+    return float(now if now is not None else time.time()) - seconds
+
+
+def image_generation_task_activity_time(task: Mapping[str, Any]) -> float:
+    for field in ("updated_at", "created_at"):
+        value = ImageGenerationStore._updated_at_sort_value(task.get(field))
+        if value > 0:
+            return value
+    return 0.0
+
+
+def image_generation_cleanup_target_tasks(
+    tasks: List[Dict[str, Any]], cutoff: float | None
+) -> List[Dict[str, Any]]:
+    if cutoff is None:
+        return [task for task in tasks if str(task.get("id") or "")]
+    return [
+        task for task in tasks
+        if str(task.get("id") or "")
+        and (activity := image_generation_task_activity_time(task)) > 0
+        and activity < cutoff
+    ]
+
+
+def image_generation_terminal_cleanup_status(task: Mapping[str, Any]) -> str:
+    """Return the user-visible terminal status eligible for bulk cleanup.
+
+    ``results_deleted`` and the old zero-candidate failed shape are rendered
+    as ``deleted`` by the page even when the persisted task status predates
+    that marker.  Keep the server-side selection in lockstep with that
+    compatibility rule, while deliberately excluding cancelled tasks.
+    """
+
+    if not isinstance(task, Mapping):
+        return ""
+    status = str(task.get("status") or "")
+    if status in IMAGE_GENERATION_ACTIVE_STATUSES or task.get("deleting"):
+        return ""
+    if any(
+        isinstance(candidate, Mapping)
+        and str(candidate.get("status") or "") in IMAGE_GENERATION_ACTIVE_STATUSES
+        for candidate in task.get("candidates") or []
+    ):
+        return ""
+    if status == "deleted" or task.get("results_deleted"):
+        return "deleted"
+    if status == "failed":
+        try:
+            candidate_count = int(task.get("candidate_count") or 0)
+        except (TypeError, ValueError):
+            candidate_count = 0
+        if candidate_count <= 0 and isinstance(task.get("candidates"), list):
+            candidate_count = len(task.get("candidates") or [])
+        return "deleted" if candidate_count == 0 else "failed"
+    return ""
+
+
+def image_generation_terminal_cleanup_targets(
+    tasks: Iterable[Mapping[str, Any]], requested_ids: Iterable[str] = ()
+) -> list[Dict[str, Any]]:
+    """Select only failed/deleted tasks from a caller's optional ID snapshot."""
+
+    requested = {str(item).strip() for item in requested_ids or () if str(item).strip()}
+    selected: list[Dict[str, Any]] = []
+    for raw in tasks:
+        if not isinstance(raw, Mapping):
+            continue
+        task_id = str(raw.get("id") or "").strip()
+        if not task_id or (requested and task_id not in requested):
+            continue
+        if image_generation_terminal_cleanup_status(raw):
+            selected.append(copy.deepcopy(dict(raw)))
+    selected.sort(key=lambda item: (image_generation_task_activity_time(item), str(item.get("id") or "")))
+    return selected
+
+
+def image_generation_cleanup_orphan_media_ids(cutoff: float | None) -> set[str]:
+    protected = IMAGE_GENERATION_MEDIA_STORE.referenced_media_ids()
+    deletable: set[str] = set()
+    for media_id in IMAGE_GENERATION_MEDIA_STORE.list_media_ids():
+        if media_id in protected:
+            continue
+        activity = IMAGE_GENERATION_MEDIA_STORE.media_activity_time(media_id)
+        if cutoff is None or (activity is not None and activity.timestamp() < cutoff):
+            deletable.add(media_id)
+    return deletable
+
+
+def image_generation_cleanup_orphan_media_paths(cutoff: float | None) -> set[Path]:
+    """Find unreferenced legacy `online_` output files for data management.
+
+    This intentionally scopes the migration scan to the filename prefix used
+    by the old image-generation writer.  Other generated files remain under
+    the general storage manager and are never swept by this endpoint merely
+    because they happen to be in the same directory.
+    """
+    storage_cleanup_validate_scope("generated")
+    referenced = storage_cleanup_referenced_paths()
+    candidates: set[Path] = set()
+    seen: set[str] = set()
+    for root in storage_cleanup_target_roots("generated"):
+        root = Path(os.path.abspath(root))
+        if not root.exists():
+            continue
+        if storage_cleanup_is_link_or_reparse(root):
+            raise ValueError("清理目录不能是链接或重解析点")
+        for current, dirs, files in os.walk(root, followlinks=False):
+            current_path = Path(current)
+            if storage_cleanup_is_link_or_reparse(current_path):
+                raise ValueError("清理路径不能包含链接或重解析点")
+            safe_dirs: list[str] = []
+            for name in dirs:
+                child = current_path / name
+                if name.startswith("."):
+                    continue
+                if storage_cleanup_is_link_or_reparse(child):
+                    raise ValueError("清理路径不能包含链接或重解析点")
+                safe_dirs.append(name)
+            dirs[:] = safe_dirs
+            for name in files:
+                if name.startswith(".") or not name.lower().startswith("online_"):
+                    continue
+                if Path(name).suffix.lower() not in STORAGE_IMAGE_EXTS:
+                    continue
+                path = current_path / name
+                if storage_cleanup_is_link_or_reparse(path):
+                    raise ValueError("清理文件不能是链接或重解析点")
+                key = storage_cleanup_path_key(path)
+                if key in seen or key in referenced:
+                    continue
+                try:
+                    details = path.stat()
+                except OSError as exc:
+                    raise ValueError("无法核对待清理文件") from exc
+                if cutoff is not None and float(details.st_mtime) >= float(cutoff):
+                    continue
+                seen.add(key)
+                candidates.add(Path(os.path.abspath(path)))
+    return candidates
+
+
+def image_generation_cleanup_quarantine_pair(
+    sidecar: Path,
+    *,
+    cutoff: float | None = None,
+) -> tuple[str, Path, Path] | None:
+    """Validate one legacy trash sidecar and its adjacent image as a pair."""
+    root = Path(IMAGE_GENERATION_MEDIA_STORE.trash_root)
+    try:
+        sidecar = IMAGE_GENERATION_MEDIA_STORE._safe_file(sidecar, root)
+        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+        media_id = str(metadata.get("media_id") or "").strip().lower()
+        filename = metadata.get("filename")
+        deleted_at = metadata.get("deleted_at")
+        if (
+            not IMAGE_GENERATION_MEDIA_STORE._is_media_id(media_id)
+            or not isinstance(filename, str)
+            or Path(filename).name != filename
+            or Path(filename).stem != media_id
+            or Path(filename).suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        ):
+            return None
+        deleted_time = datetime.datetime.fromisoformat(
+            str(deleted_at).replace("Z", "+00:00")
+        )
+        if deleted_time.tzinfo is None:
+            deleted_time = deleted_time.replace(tzinfo=datetime.timezone.utc)
+        if cutoff is not None and deleted_time.timestamp() >= float(cutoff):
+            return None
+        image_path = IMAGE_GENERATION_MEDIA_STORE._safe_file(sidecar.parent / filename, root)
+        content = image_path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != media_id:
+            return None
+        # Validate the image itself before it can be restored or recycled.
+        IMAGE_GENERATION_MEDIA_STORE._image_details(content)
+        return media_id, image_path, sidecar
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def image_generation_cleanup_orphan_quarantine(cutoff: float | None) -> dict[str, Any]:
+    """Inventory valid legacy quarantine pairs; references are checked at execution time."""
+    root = Path(IMAGE_GENERATION_MEDIA_STORE.trash_root)
+    result: dict[str, Any] = {
+        "media_ids": set(), "paths": set(), "invalid_count": 0,
+    }
+    if not root.exists():
+        return result
+    try:
+        root = IMAGE_GENERATION_MEDIA_STORE._safe_directory(root, root)
+    except ValueError as exc:
+        raise ValueError("图片生成隔离区不安全") from exc
+    for date_dir in IMAGE_GENERATION_MEDIA_STORE._safe_children(root, root):
+        if not date_dir.is_dir():
+            continue
+        date_dir = IMAGE_GENERATION_MEDIA_STORE._safe_directory(date_dir, root)
+        for sidecar in IMAGE_GENERATION_MEDIA_STORE._safe_children(date_dir, root):
+            if sidecar.suffix.lower() != ".json":
+                continue
+            pair = image_generation_cleanup_quarantine_pair(sidecar, cutoff=cutoff)
+            if pair is None:
+                result["invalid_count"] += 1
+                continue
+            media_id, image_path, sidecar = pair
+            result["media_ids"].add(media_id)
+            result["paths"].update({image_path, sidecar})
+    return result
+
+
+def image_generation_cleanup_prune_confirmations(now: float) -> None:
+    expired = [
+        token for token, item in IMAGE_GENERATION_CLEANUP_CONFIRMATIONS.items()
+        if float(item.get("expires_at") or 0) <= now
+    ]
+    for token in expired:
+        IMAGE_GENERATION_CLEANUP_CONFIRMATIONS.pop(token, None)
+
+
+@app.post("/api/image-generation-tasks/cleanup-preview")
+async def preview_image_generation_cleanup(payload: ImageGenerationCleanupPreviewRequest):
+    now = time.time()
+    cutoff = image_generation_cleanup_cutoff(payload.retention, now=now)
+    with IMAGE_GENERATION_TASK_LOCK:
+        tasks = image_generation_all_tasks_locked()
+        has_tasks = bool(image_generation_cleanup_target_tasks(tasks, cutoff))
+    try:
+        orphan_media_ids = await asyncio.to_thread(
+            image_generation_cleanup_orphan_media_ids, cutoff
+        )
+        orphan_media_paths = await asyncio.to_thread(
+            image_generation_cleanup_orphan_media_paths, cutoff
+        )
+        orphan_quarantine = await asyncio.to_thread(
+            image_generation_cleanup_orphan_quarantine, cutoff
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="本机引用记录无法安全核对，未执行清理") from exc
+    confirmation_id = secrets.token_urlsafe(32)
+    expires_at = now + IMAGE_GENERATION_CLEANUP_CONFIRMATION_TTL_SECONDS
+    with IMAGE_GENERATION_CLEANUP_CONFIRMATION_LOCK:
+        image_generation_cleanup_prune_confirmations(now)
+        IMAGE_GENERATION_CLEANUP_CONFIRMATIONS[confirmation_id] = {
+            "retention": payload.retention,
+            "cutoff": cutoff,
+            "orphan_media_ids": sorted(orphan_media_ids),
+            "orphan_media_paths": sorted(
+                str(path) for path in orphan_media_paths
+            ),
+            "quarantine_media_ids": sorted(orphan_quarantine["media_ids"]),
+            "quarantine_paths": sorted(
+                str(path) for path in orphan_quarantine["paths"]
+            ),
+            "quarantine_invalid_count": int(orphan_quarantine.get("invalid_count") or 0),
+            "expires_at": expires_at,
+        }
+    return {
+        "confirmation_id": confirmation_id,
+        "retention": payload.retention,
+        "cutoff_at": (
+            datetime.datetime.fromtimestamp(cutoff, datetime.timezone.utc).isoformat()
+            if cutoff is not None else None
+        ),
+        "expires_at": datetime.datetime.fromtimestamp(
+            expires_at, datetime.timezone.utc
+        ).isoformat(),
+        "has_targets": (
+            has_tasks
+            or bool(orphan_media_ids)
+            or bool(orphan_media_paths)
+            or bool(orphan_quarantine["media_ids"])
+            or bool(orphan_quarantine["paths"])
+        ),
+        "quarantine_invalid_count": int(orphan_quarantine.get("invalid_count") or 0),
+    }
+
+
+def image_generation_cleanup_consume_confirmation(confirmation_id: str) -> Dict[str, Any]:
+    now = time.time()
+    with IMAGE_GENERATION_CLEANUP_CONFIRMATION_LOCK:
+        image_generation_cleanup_prune_confirmations(now)
+        confirmation = IMAGE_GENERATION_CLEANUP_CONFIRMATIONS.pop(confirmation_id, None)
+    if not confirmation:
+        raise HTTPException(status_code=409, detail="删除确认已失效，请重新选择时间范围")
+    return confirmation
+
+
+def image_generation_cleanup_restore_tasks(originals: Mapping[str, Dict[str, Any]]) -> None:
+    restore_error: Exception | None = None
+    with IMAGE_GENERATION_TASK_LOCK:
+        for task_id, task in originals.items():
+            try:
+                IMAGE_GENERATION_STORE.save_task(task)
+                IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(task)
+            except Exception as exc:
+                restore_error = restore_error or exc
+    if restore_error is not None:
+        raise ValueError("图片生成清理回滚失败") from restore_error
+
+
+@app.post("/api/image-generation-tasks/cleanup", status_code=202)
+async def cleanup_image_generation_tasks(payload: ImageGenerationCleanupConfirmRequest):
+    confirmation = image_generation_cleanup_consume_confirmation(payload.confirmation_id)
+    cutoff = confirmation.get("cutoff")
+    retention = str(confirmation.get("retention") or "")
+    global IMAGE_GENERATION_HISTORY_CLEARING
+    with IMAGE_GENERATION_TASK_LOCK:
+        if IMAGE_GENERATION_HISTORY_CLEARING:
+            raise HTTPException(status_code=409, detail="正在清理图片生成数据，请稍后重试")
+        IMAGE_GENERATION_HISTORY_CLEARING = True
+    originals: Dict[str, Dict[str, Any]] = {}
+    job: Dict[str, Any] | None = None
+    history_existed = os.path.isfile(HISTORY_FILE)
+    history_backup: list[Dict[str, Any]] = []
+    history_deleted = 0
+    try:
+        with IMAGE_GENERATION_TASK_LOCK:
+            with HISTORY_LOCK:
+                history_backup = history_read_records_strict_locked()
+            tasks = image_generation_all_tasks_locked()
+            targets = image_generation_cleanup_target_tasks(tasks, cutoff)
+            target_ids = [str(task["id"]) for task in targets]
+            originals = {str(task["id"]): copy.deepcopy(task) for task in targets}
+            jobs = []
+            for task in targets:
+                task_id = str(task["id"])
+                task["deleting"] = True
+                task["cancel_requested"] = True
+                for candidate in task.get("candidates") or []:
+                    if isinstance(candidate, dict) and str(candidate.get("status") or "") in IMAGE_GENERATION_ACTIVE_STATUSES:
+                        candidate["status"] = "cancelled"
+                        candidate["error"] = "历史数据清理中；已停止本地等待，上游任务可能仍在运行"
+                        candidate["completed_at"] = time.time()
+                image_generation_refresh_summary(task)
+                IMAGE_GENERATION_STORE.save_task(task)
+                IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(task)
+                prefix = f"{task_id}:"
+                jobs.extend(
+                    job
+                    for registry in (IMAGE_GENERATION_CANDIDATE_TASKS, IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS)
+                    for key, job in list(registry.items())
+                    if key.startswith(prefix) and not job.done()
+                )
+        for job in jobs:
+            image_generation_cancel_job_threadsafe(job)
+        await image_generation_wait_for_registered_jobs(jobs)
+        with IMAGE_GENERATION_TASK_LOCK:
+            for task_id in target_ids:
+                remaining = [
+                    job
+                    for registry in (IMAGE_GENERATION_CANDIDATE_TASKS, IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS)
+                    for key, job in list(registry.items())
+                    if key.startswith(f"{task_id}:") and not job.done()
+                ]
+                if remaining:
+                    image_generation_cleanup_restore_tasks(originals)
+                    raise HTTPException(status_code=409, detail="本地生成任务尚未安全停止，未删除任何数据")
+            media_ids = {
+                str(item)
+                for item in confirmation.get("orphan_media_ids") or []
+                if IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(item))
+            }
+            media_paths = {
+                Path(item)
+                for item in image_generation_cleanup_normalize_paths(
+                    confirmation.get("orphan_media_paths") or []
+                )
+            }
+            quarantine_media_ids = {
+                str(item)
+                for item in confirmation.get("quarantine_media_ids") or []
+                if IMAGE_GENERATION_MEDIA_STORE._is_media_id(str(item))
+            }
+            quarantine_paths = {
+                Path(item)
+                for item in image_generation_cleanup_normalize_paths(
+                    confirmation.get("quarantine_paths") or [],
+                    field_name="图片生成隔离区路径",
+                )
+            }
+            for task in targets:
+                media_ids.update(image_generation_task_media_ids(task, outputs=False))
+                media_ids.update(image_generation_task_media_ids(task, outputs=True))
+                media_paths.update(image_generation_task_media_paths(task, outputs=False))
+                media_paths.update(image_generation_task_media_paths(task, outputs=True))
+            try:
+                for record in history_backup:
+                    for task_id in target_ids:
+                        task = originals.get(task_id)
+                        if task and image_generation_history_record_matches_task(record, task):
+                            media_paths.update(
+                                image_generation_history_record_media_paths(record, outputs=True)
+                            )
+                            media_paths.update(
+                                image_generation_history_record_media_paths(record, outputs=False)
+                            )
+                for task_id in target_ids:
+                    IMAGE_GENERATION_STORE.delete_task(task_id)
+                history_deleted = delete_image_generation_history_rows_locked(
+                    target_ids, tasks=originals
+                )
+                job = image_generation_cleanup_create_job(
+                    task_ids=target_ids,
+                    media_ids=media_ids,
+                    media_paths=media_paths,
+                    quarantine_media_ids=quarantine_media_ids,
+                    quarantine_paths=quarantine_paths,
+                    media_cutoff=cutoff,
+                )
+            except Exception:
+                if job is not None:
+                    one_click_cleanup_remove_job(str(job.get("job_id") or ""))
+                raise
+            for task_id in target_ids:
+                IMAGE_GENERATION_RUNTIME_TASKS.pop(task_id, None)
+                prefix = f"{task_id}:"
+                for key in [item for item in IMAGE_GENERATION_RECOVERY_CANDIDATES if item.startswith(prefix)]:
+                    IMAGE_GENERATION_RECOVERY_CANDIDATES.pop(key, None)
+        event = ONE_CLICK_CLEANUP_WAKE_EVENT
+        if event is not None:
+            event.set()
+        return {
+            "deleted": True,
+            "retention": retention,
+            "cutoff_at": (
+                datetime.datetime.fromtimestamp(cutoff, datetime.timezone.utc).isoformat()
+                if cutoff is not None else None
+            ),
+            "deleted_task_ids": target_ids,
+            "deleted_task_count": len(target_ids),
+            "cleanup_job_id": str((job or {}).get("job_id") or ""),
+            "cleanup_status": "queued",
+            "history_deleted": history_deleted,
+            "media_candidates": len(
+                media_ids
+                | {str(path) for path in media_paths}
+                | quarantine_media_ids
+                | {str(path) for path in quarantine_paths}
+            ),
+        }
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        if originals:
+            image_generation_cleanup_restore_tasks(originals)
+        if history_deleted:
+            with HISTORY_LOCK:
+                if history_existed:
+                    history_write_records_locked(history_backup)
+                elif os.path.isfile(HISTORY_FILE):
+                    try:
+                        os.remove(HISTORY_FILE)
+                    except OSError:
+                        pass
+        raise HTTPException(status_code=500, detail="删除记录未完成，原数据已保留") from exc
+    finally:
+        with IMAGE_GENERATION_TASK_LOCK:
+            IMAGE_GENERATION_HISTORY_CLEARING = False
+
+
+@app.delete("/api/image-generation-tasks")
+async def clear_image_generation_tasks():
+    raise HTTPException(status_code=410, detail="旧版清理入口已停用，请刷新页面后使用数据管理")
+
+
+@app.get("/api/image-generation/admin/tasks/{task_id}")
+async def get_image_generation_admin_task(task_id: str, request: Request):
+    require_image_generation_admin(request)
+    task = image_generation_task_snapshot(task_id, include_admin=True)
+    if not task:
+        raise HTTPException(status_code=404, detail="图片生成任务不存在")
+    return task
+
+
+@app.get("/api/image-generation-tasks/{task_id}")
+async def get_image_generation_task(task_id: str):
+    return image_generation_public_response(task_id)
+
+
+@app.patch("/api/image-generation-tasks/{task_id}")
+async def rename_image_generation_task(task_id: str, payload: ImageGenerationTaskRenameRequest):
+    current = image_generation_task_snapshot(task_id, include_admin=True)
+    if current and current.get("deleting"):
+        raise HTTPException(status_code=409, detail="任务正在删除，不能改名")
+    name = re.sub(r"[\\/\x00-\x1f]+", " ", str(payload.name or ""))
+    name = re.sub(r"\.{2,}", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()[:80]
+    task = image_generation_mutate_task(task_id, lambda item: item.update({"name": name}))
+    if not task:
+        raise HTTPException(status_code=404, detail="图片生成任务不存在")
+    return image_generation_public_response(task_id)
+
+
+@app.post("/api/image-generation-tasks/{task_id}/cancel")
+async def cancel_image_generation_task(task_id: str):
+    task = image_generation_task_snapshot(task_id, include_admin=True)
+    if not task:
+        raise HTTPException(status_code=404, detail="图片生成任务不存在")
+    if task.get("deleting"):
+        raise HTTPException(status_code=409, detail="任务正在删除")
+    if str(task.get("status") or "") in IMAGE_GENERATION_TERMINAL_STATUSES:
+        return image_generation_public_response(task_id)
+    return image_generation_cancel_local(task_id)
+
+
+@app.post("/api/image-generation-tasks/{task_id}/candidates/{candidate_id}/recover")
+async def recover_image_generation_candidate(task_id: str, candidate_id: str):
+    with IMAGE_GENERATION_TASK_LOCK:
+        task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+        candidate = image_generation_get_candidate(task, candidate_id)
+        if not task or not candidate:
+            raise HTTPException(status_code=404, detail="图片生成候选不存在")
+        if task.get("deleting"):
+            raise HTTPException(status_code=409, detail="任务正在删除，不能回补")
+        key = image_generation_candidate_key(task_id, candidate_id)
+        current = IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS.get(key)
+        if current and not current.done():
+            return {"task": image_generation_public_response(task_id), "reused": True}
+        if str(candidate.get("status") or "") not in {"unknown", "recovering"} or not candidate.get("upstream_task_id"):
+            raise HTTPException(status_code=409, detail="只有带上游任务编号的未知/恢复中候选可以回补")
+        candidate["status"] = "recovering"
+        candidate["error"] = "正在回补，只查询原任务，不会重新生图"
+        task["cancel_requested"] = False
+        image_generation_refresh_summary(task)
+        IMAGE_GENERATION_STORE.save_task(task)
+        IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(task)
+        job = asyncio.create_task(run_image_generation_candidate_recovery(task_id, candidate_id))
+        IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS[key] = job
+        job.add_done_callback(lambda finished, recovery_key=key: image_generation_recovery_done(recovery_key, finished))
+    return {"task": image_generation_public_response(task_id), "reused": False}
+
+
+@app.post("/api/image-generation-tasks/{task_id}/candidates/{candidate_id}/regenerate")
+async def regenerate_image_generation_candidate(task_id: str, candidate_id: str, payload: ImageGenerationCandidateRegenerateRequest):
+    if not payload.confirm_cost:
+        raise HTTPException(status_code=409, detail="重新生成会产生新的上游请求，请确认费用")
+    regeneration_submission_id = normalize_image_generation_submission_id(payload.submission_id)
+    with IMAGE_GENERATION_TASK_LOCK:
+        task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+        source = image_generation_get_candidate(task, candidate_id)
+        if not task or not source:
+            raise HTTPException(status_code=404, detail="图片生成候选不存在")
+        if task.get("deleting"):
+            raise HTTPException(status_code=409, detail="任务正在删除，不能重新生成")
+        existing = next((
+            item for item in task.get("candidates") or []
+            if str(item.get("regeneration_submission_id") or "") == regeneration_submission_id
+        ), None)
+        if existing:
+            return {
+                "task": image_generation_public_response(task_id),
+                "candidate_id": existing["id"], "reused": True,
+            }
+        if str(source.get("status") or "") in IMAGE_GENERATION_ACTIVE_STATUSES:
+            raise HTTPException(status_code=409, detail="候选仍在运行，请勿重复生成")
+        candidate = {
+            "id": f"candidate_{uuid.uuid4().hex}",
+            "candidate_no": max([int(item.get("candidate_no") or 0) for item in task.get("candidates") or []] or [0]) + 1,
+            "status": "queued", "generation_params": copy.deepcopy(source.get("generation_params") or task.get("generation_settings") or {}),
+            "provider_snapshot": copy.deepcopy(source.get("provider_snapshot") or {}),
+            "upstream_task_id": "", "query_attempts": 0, "last_query_at": 0, "last_error": "", "error": "",
+            "image": None, "result": None, "regenerated_from": candidate_id,
+            "regeneration_submission_id": regeneration_submission_id,
+            "created_at": time.time(), "updated_at": time.time(),
+        }
+        task.setdefault("candidates", []).append(candidate)
+        task.pop("results_deleted", None)
+        task["cancel_requested"] = False
+        image_generation_refresh_summary(task)
+        IMAGE_GENERATION_STORE.save_task(task)
+        IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(task)
+        image_generation_schedule_candidate(task_id, candidate["id"])
+    return {"task": image_generation_public_response(task_id), "candidate_id": candidate["id"], "reused": False}
+
+
+async def image_generation_delete_candidate_batch(items):
+    """Delete candidate records quickly and enqueue one durable media cleanup."""
+    pairs = []
+    seen = set()
+    for item in items or []:
+        task_id = str(item.task_id or "")
+        candidate_id = str(item.candidate_id or "")
+        key = image_generation_candidate_key(task_id, candidate_id)
+        if key not in seen:
+            seen.add(key)
+            pairs.append((task_id, candidate_id, key))
+    if not pairs:
+        raise HTTPException(status_code=422, detail="至少选择一张图片")
+
+    task_order = []
+    selected_ids_by_task = {}
+    output_media_ids = set()
+    input_media_ids = set()
+    output_media_paths: set[Path] = set()
+    input_media_paths: set[Path] = set()
+    jobs = []
+    cleanup_job: Dict[str, Any] | None = None
+    deleted_task_ids: list[str] = []
+    surviving_task_ids: list[str] = []
+    history_existed = os.path.isfile(HISTORY_FILE)
+    history_backup: list[Dict[str, Any]] = []
+    history_deleted = 0
+    with IMAGE_GENERATION_TASK_LOCK:
+        if IMAGE_GENERATION_HISTORY_CLEARING:
+            raise HTTPException(status_code=409, detail="正在清除图片生成记录，请稍后重试")
+        with HISTORY_LOCK:
+            history_backup = history_read_records_strict_locked()
+        tasks = {}
+        for task_id, candidate_id, key in pairs:
+            if task_id not in tasks:
+                task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+                if not task:
+                    raise HTTPException(status_code=404, detail="图片生成候选不存在")
+                if task.get("deleting"):
+                    raise HTTPException(status_code=409, detail="任务正在删除")
+                tasks[task_id] = task
+                task_order.append(task_id)
+            candidate = image_generation_get_candidate(tasks[task_id], candidate_id)
+            if not candidate:
+                raise HTTPException(status_code=404, detail="图片生成候选不存在")
+            selected_ids_by_task.setdefault(task_id, set()).add(candidate_id)
+
+        selected_keys = {key for _task_id, _candidate_id, key in pairs}
+        jobs = [
+            job
+            for registry in (IMAGE_GENERATION_CANDIDATE_TASKS, IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS)
+            for registered_key, job in list(registry.items())
+            if registered_key in selected_keys and not job.done()
+        ]
+        for task_id in task_order:
+            task = tasks[task_id]
+            input_media_ids.update(image_generation_task_media_ids(task, outputs=False))
+            input_media_paths.update(image_generation_task_media_paths(task, outputs=False))
+            marker_changed = False
+            for candidate_id in selected_ids_by_task[task_id]:
+                candidate = image_generation_get_candidate(task, candidate_id)
+                output_media_ids.update(image_generation_task_media_ids({"candidates": [candidate]}, outputs=True))
+                output_media_paths.update(
+                    image_generation_task_media_paths({"candidates": [candidate]}, outputs=True)
+                )
+                if str(candidate.get("status") or "") in IMAGE_GENERATION_ACTIVE_STATUSES:
+                    candidate["status"] = "cancelled"
+                    candidate["error"] = "结果删除中；已停止本地等待，上游任务可能仍在运行"
+                    candidate["completed_at"] = time.time()
+                    marker_changed = True
+            if marker_changed:
+                image_generation_refresh_summary(task)
+                IMAGE_GENERATION_STORE.save_task(task)
+                IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(task)
+
+    for job in jobs:
+        image_generation_cancel_job_threadsafe(job)
+    await image_generation_wait_for_registered_jobs(jobs)
+
+    with IMAGE_GENERATION_TASK_LOCK:
+        remaining = [
+            job
+            for registry in (IMAGE_GENERATION_CANDIDATE_TASKS, IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS)
+            for registered_key, job in list(registry.items())
+            if registered_key in seen and not job.done()
+        ]
+        if remaining:
+            raise HTTPException(status_code=409, detail="本地生成任务尚未安全停止；删除标记已保留，可稍后重试")
+
+        originals: Dict[str, Dict[str, Any]] = {}
+        updates: Dict[str, Dict[str, Any]] = {}
+        for task_id in task_order:
+            task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+            if not task or task.get("deleting"):
+                raise HTTPException(status_code=409, detail="任务正在删除或已不存在")
+            selected_ids = selected_ids_by_task[task_id]
+            selected_candidates = [
+                image_generation_get_candidate(task, candidate_id)
+                for candidate_id in selected_ids
+            ]
+            if any(candidate is None for candidate in selected_candidates):
+                raise HTTPException(status_code=404, detail="图片生成候选不存在")
+            originals[task_id] = copy.deepcopy(task)
+            task["candidates"] = [
+                candidate for candidate in task.get("candidates") or []
+                if str(candidate.get("id") or "") not in selected_ids
+            ]
+            if task["candidates"]:
+                image_generation_refresh_summary(task)
+                updates[task_id] = task
+                surviving_task_ids.append(task_id)
+            else:
+                deleted_task_ids.append(task_id)
+
+        try:
+            for record in history_backup:
+                for task_id in task_order:
+                    if image_generation_history_record_matches_task(
+                        record, originals[task_id], selected_ids_by_task[task_id]
+                    ):
+                        output_media_paths.update(
+                            image_generation_history_record_media_paths(record, outputs=True)
+                        )
+                        input_media_paths.update(
+                            image_generation_history_record_media_paths(record, outputs=False)
+                        )
+            for task_id in task_order:
+                if task_id in updates:
+                    IMAGE_GENERATION_STORE.save_task(updates[task_id])
+                else:
+                    IMAGE_GENERATION_STORE.delete_task(task_id)
+            history_deleted = delete_image_generation_history_rows_locked(
+                task_order, selected_ids_by_task, originals
+            )
+            cleanup_job = image_generation_cleanup_create_job(
+                task_ids=task_order,
+                media_ids=output_media_ids,
+                protected_media_ids=input_media_ids,
+                media_paths=output_media_paths,
+                protected_media_paths=input_media_paths,
+            )
+        except Exception:
+            if cleanup_job is not None:
+                one_click_cleanup_remove_job(str(cleanup_job.get("job_id") or ""))
+            for original_task_id, original in originals.items():
+                try:
+                    IMAGE_GENERATION_STORE.save_task(original)
+                except Exception:
+                    pass
+                IMAGE_GENERATION_RUNTIME_TASKS[original_task_id] = copy.deepcopy(original)
+            if history_deleted:
+                with HISTORY_LOCK:
+                    if history_existed:
+                        history_write_records_locked(history_backup)
+                    elif os.path.isfile(HISTORY_FILE):
+                        try:
+                            os.remove(HISTORY_FILE)
+                        except OSError:
+                            pass
+            raise
+        for task_id in task_order:
+            if task_id in updates:
+                IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(updates[task_id])
+            else:
+                IMAGE_GENERATION_RUNTIME_TASKS.pop(task_id, None)
+        for _task_id, _candidate_id, key in pairs:
+            IMAGE_GENERATION_RECOVERY_CANDIDATES.pop(key, None)
+    event = ONE_CLICK_CLEANUP_WAKE_EVENT
+    if event is not None:
+        event.set()
+    return {
+        "deleted": len(pairs),
+        "items": [{"task_id": task_id, "candidate_id": candidate_id} for task_id, candidate_id, _key in pairs],
+        "tasks": [image_generation_public_response(task_id) for task_id in surviving_task_ids],
+        "deleted_task_ids": deleted_task_ids,
+        "cleanup_job_id": str((cleanup_job or {}).get("job_id") or ""),
+        "cleanup_status": "queued",
+        "history_deleted": history_deleted,
+        "media_candidates": len(output_media_ids | {str(path) for path in output_media_paths}),
+    }
+
+
+@app.post("/api/image-generation-tasks/candidates/delete", status_code=202)
+async def batch_delete_image_generation_candidates(payload: ImageGenerationCandidateBatchDeleteRequest):
+    return await image_generation_delete_candidate_batch(payload.items)
+
+
+@app.delete("/api/image-generation-tasks/{task_id}/candidates/{candidate_id}", status_code=202)
+async def delete_image_generation_candidate(task_id: str, candidate_id: str):
+    """Delete one durable result without deleting the rest of its task."""
+    result = await image_generation_delete_candidate_batch([
+        ImageGenerationCandidateDeleteItem(task_id=task_id, candidate_id=candidate_id)
+    ])
+    return {
+        "deleted": True, "task_id": task_id, "candidate_id": candidate_id,
+        "task": result["tasks"][0] if result["tasks"] else None,
+        "deleted_task_ids": result["deleted_task_ids"],
+        "cleanup_job_id": result["cleanup_job_id"],
+        "cleanup_status": result["cleanup_status"],
+        "history_deleted": result["history_deleted"],
+        "media_candidates": result["media_candidates"],
+    }
+
+
+@app.get("/api/image-generation-tasks/{task_id}/download.zip")
+async def download_image_generation_task(task_id: str):
+    task = image_generation_task_snapshot(task_id, include_admin=True)
+    if not task:
+        raise HTTPException(status_code=404, detail="图片生成任务不存在")
+    candidates = [
+        item for item in task.get("candidates") or []
+        if isinstance(item, dict)
+        and item.get("status") == "succeeded"
+        and isinstance(item.get("image"), dict)
+    ]
+    if not candidates:
+        raise HTTPException(status_code=409, detail="当前没有可下载结果")
+    buffer = BytesIO()
+    errors = []
+    known_secrets = image_generation_provider_secret_values(task)
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for index, candidate in enumerate(candidates, 1):
+            try:
+                media_id = str(candidate["image"].get("id") or "")
+                data, extension, _media_type = await asyncio.to_thread(
+                    IMAGE_GENERATION_MEDIA_STORE.read_bytes, media_id
+                )
+                archive.writestr(f"candidate-{index:02d}{extension}", data)
+            except Exception as exc:
+                errors.append(image_generation_redact_sensitive_text(
+                    f"候选 {index}: {exc}", known_secrets
+                ))
+        if errors:
+            archive.writestr("download-errors.txt", "\n".join(errors).encode("utf-8"))
+    if len(errors) == len(candidates):
+        raise HTTPException(status_code=409, detail="当前没有可下载结果")
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "-", str(task.get("name") or task_id))[:60].strip("-") or "image-generation"
+    return Response(
+        content=buffer.getvalue(), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.zip"'},
+    )
+
+
+@app.delete("/api/image-generation-tasks/{task_id}", status_code=202)
+async def delete_image_generation_task(task_id: str):
+    cleanup_job: Dict[str, Any] | None = None
+    history_existed = os.path.isfile(HISTORY_FILE)
+    history_backup: list[Dict[str, Any]] = []
+    history_deleted = 0
+    with IMAGE_GENERATION_TASK_LOCK:
+        task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+        if not task:
+            raise HTTPException(status_code=404, detail="图片生成任务不存在")
+        with HISTORY_LOCK:
+            history_backup = history_read_records_strict_locked()
+        original_task = copy.deepcopy(task)
+        output_media_ids = image_generation_task_media_ids(task, outputs=True)
+        input_media_ids = image_generation_task_media_ids(task, outputs=False)
+        output_media_paths = image_generation_task_media_paths(task, outputs=True)
+        input_media_paths = image_generation_task_media_paths(task, outputs=False)
+        task["deleting"] = True
+        task["cancel_requested"] = True
+        for candidate in task.get("candidates") or []:
+            if str(candidate.get("status") or "") in IMAGE_GENERATION_ACTIVE_STATUSES:
+                candidate["status"] = "cancelled"
+                candidate["error"] = "任务删除中；已停止本地等待，上游任务可能仍在运行"
+                candidate["completed_at"] = time.time()
+        image_generation_refresh_summary(task)
+        IMAGE_GENERATION_STORE.save_task(task)
+        IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(task)
+        prefix = f"{task_id}:"
+        jobs = [
+            job
+            for registry in (IMAGE_GENERATION_CANDIDATE_TASKS, IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS)
+            for key, job in list(registry.items())
+            if key.startswith(prefix) and not job.done()
+        ]
+    for job in jobs:
+        image_generation_cancel_job_threadsafe(job)
+    await image_generation_wait_for_registered_jobs(jobs)
+    with IMAGE_GENERATION_TASK_LOCK:
+        task = IMAGE_GENERATION_STORE.load_task(task_id, include_admin=True)
+        if not task:
+            raise HTTPException(status_code=404, detail="图片生成任务不存在")
+        if not task.get("deleting"):
+            raise HTTPException(status_code=409, detail="任务删除标记已改变，请重试")
+        remaining = [
+            job
+            for registry in (IMAGE_GENERATION_CANDIDATE_TASKS, IMAGE_GENERATION_CANDIDATE_RECOVERY_TASKS)
+            for key, job in list(registry.items())
+            if key.startswith(prefix) and not job.done()
+        ]
+        if remaining:
+            raise HTTPException(status_code=409, detail="本地生成任务尚未安全停止；删除标记已保留")
+        try:
+            IMAGE_GENERATION_STORE.delete_task(task_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="图片生成任务不存在") from exc
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=f"删除任务记录失败：{exc}") from exc
+        try:
+            for record in history_backup:
+                if image_generation_history_record_matches_task(record, original_task):
+                    output_media_paths.update(
+                        image_generation_history_record_media_paths(record, outputs=True)
+                    )
+                    input_media_paths.update(
+                        image_generation_history_record_media_paths(record, outputs=False)
+                    )
+            history_deleted = delete_image_generation_history_rows_locked(
+                [task_id], tasks={task_id: original_task}
+            )
+            cleanup_job = image_generation_cleanup_create_job(
+                task_ids=[task_id],
+                media_ids=input_media_ids | output_media_ids,
+                media_paths=input_media_paths | output_media_paths,
+            )
+        except Exception as exc:
+            if history_deleted:
+                with HISTORY_LOCK:
+                    if history_existed:
+                        history_write_records_locked(history_backup)
+                    elif os.path.isfile(HISTORY_FILE):
+                        try:
+                            os.remove(HISTORY_FILE)
+                        except OSError:
+                            pass
+            try:
+                IMAGE_GENERATION_STORE.save_task(original_task)
+                IMAGE_GENERATION_RUNTIME_TASKS[task_id] = copy.deepcopy(original_task)
+            except Exception as restore_exc:
+                raise HTTPException(status_code=500, detail="删除任务记录失败，且自动回滚未完成") from restore_exc
+            raise HTTPException(status_code=500, detail="删除任务记录失败，原数据已保留") from exc
+        IMAGE_GENERATION_RUNTIME_TASKS.pop(task_id, None)
+        for key in [item for item in IMAGE_GENERATION_RECOVERY_CANDIDATES if item.startswith(prefix)]:
+            IMAGE_GENERATION_RECOVERY_CANDIDATES.pop(key, None)
+    event = ONE_CLICK_CLEANUP_WAKE_EVENT
+    if event is not None:
+        event.set()
+    return {
+        "deleted": True,
+        "task_id": task_id,
+        "cleanup_job_id": str((cleanup_job or {}).get("job_id") or ""),
+        "cleanup_status": "queued",
+        "history_deleted": history_deleted,
+        "media_candidates": len(
+            input_media_ids
+            | output_media_ids
+            | {str(path) for path in input_media_paths | output_media_paths}
+        ),
+    }
+
 
 def get_preferred_lan_ipv4() -> Optional[str]:
     """Return a likely user-facing LAN IPv4 address without network traffic."""

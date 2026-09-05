@@ -134,7 +134,8 @@ test('classic canvas Alt-drag preserves incoming links while clipboard copy rema
     assert.ok(dragSource.indexOf('pushUndo();') < dragSource.indexOf('duplicateNodesForAltDrag'));
     assert.match(dragSource, /duplicateNodesForAltDrag\(node, true\)/);
     assert.match(dragSource, /\(duplicated\.rootCopyIds \|\| duplicated\.selectedCopyIds\)\.forEach/);
-    assert.match(dragSource, /historyCaptured:Boolean\(e\.altKey\)/);
+    assert.match(dragSource, /historyCaptured:Boolean\(e\.altKey && !bypassGridSnap\)/);
+    assert.match(dragSource, /const bypassGridSnap = Boolean\(e\.altKey/);
     assert.match(source, /connections \|\| \[\]\)\.filter\(c => ids\.has\(c\.from\) && ids\.has\(c\.to\)\)/);
 });
 

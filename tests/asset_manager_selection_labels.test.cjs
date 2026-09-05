@@ -24,3 +24,20 @@ test('all bulk selectors use the new toggle labels and shared toggle helper', ()
     assert.doesNotMatch(SOURCE, /data-prompt-clear-selection[\s\S]*?<span>清空<\/span>/);
     assert.doesNotMatch(SOURCE, /data-canvas-asset-clear-selection[\s\S]*?<span>清空<\/span>/);
 });
+
+test('storage cleanup uses one unified scan action and shows file and space summaries', () => {
+    assert.match(SOURCE, /data-storage-cleanup-scan/);
+    assert.doesNotMatch(SOURCE, /data-storage-cleanup-kind=/);
+    assert.match(SOURCE, /全部文件/);
+    assert.match(SOURCE, /可清理/);
+    assert.match(SOURCE, /summary\.total_files/);
+    assert.match(SOURCE, /summary\.candidate_bytes/);
+    assert.match(SOURCE, /旧版来源未标记文件/);
+    assert.match(SOURCE, /legacy_unmarked_history/);
+    assert.match(SOURCE, /旧案例残留/);
+    assert.match(SOURCE, /fixed-example/);
+    assert.match(SOURCE, /fixed_example_orphan/);
+    assert.match(SOURCE, /canvas_log_only/);
+    assert.match(SOURCE, /画布日志仅作为历史记录保留，不代表当前仍占用图片/);
+    assert.match(SOURCE, /确认后台清理/);
+});

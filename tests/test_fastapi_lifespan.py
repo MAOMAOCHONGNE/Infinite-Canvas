@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import main
 
@@ -76,6 +76,22 @@ class FastApiLifespanTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("app = FastAPI(lifespan=lifespan)", source)
         self.assertNotIn('@app.on_event("startup")', source)
+
+    async def test_lifespan_clears_global_loop_after_shutdown(self):
+        async def fake_startup():
+            main.GLOBAL_LOOP = asyncio.get_running_loop()
+
+        previous_loop = main.GLOBAL_LOOP
+        try:
+            with (
+                patch.object(main, "run_startup_initialization", new=fake_startup),
+                patch.object(main, "stop_one_click_cleanup_worker", new=AsyncMock()),
+            ):
+                async with main.app.router.lifespan_context(main.app):
+                    self.assertIs(main.GLOBAL_LOOP, asyncio.get_running_loop())
+                self.assertIsNone(main.GLOBAL_LOOP)
+        finally:
+            main.GLOBAL_LOOP = previous_loop
 
 
 if __name__ == "__main__":

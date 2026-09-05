@@ -139,20 +139,6 @@ html[data-studio-scale="off"].studio-scale-managed .workspace {
 .theme-dark .ws-paste-btn:hover { background:#1d4ed8; }
 
 /* ===== Global backup menu ===== */
-.backup-menu-wrap { position:relative; }
-.ws-backup-btn { height:36px; padding:0 11px; border-radius:8px; display:inline-flex; align-items:center; justify-content:center; gap:7px; color:var(--muted); background:var(--card-solid); border:1px solid var(--line); cursor:pointer; font-size:12px; font-weight:800; transition:all .15s var(--ease); }
-.ws-backup-btn:hover,.ws-backup-btn[aria-expanded="true"] { color:var(--text); border-color:var(--line-2); background:var(--soft); box-shadow:0 6px 14px var(--shadow); }
-.ws-backup-btn svg { width:16px; height:16px; }
-.ws-backup-btn .backup-menu-chevron { width:13px; height:13px; color:var(--faint); transition:transform .15s var(--ease); }
-.ws-backup-btn[aria-expanded="true"] .backup-menu-chevron { transform:rotate(180deg); }
-.backup-menu { position:absolute; z-index:260; top:calc(100% + 8px); right:0; width:270px; padding:7px; display:none; flex-direction:column; gap:3px; border:1px solid var(--line); border-radius:10px; background:var(--card-solid); box-shadow:0 20px 55px var(--shadow-strong); }
-.backup-menu.open { display:flex; }
-.backup-menu button { width:100%; display:flex; align-items:flex-start; gap:10px; padding:10px; border:0; border-radius:8px; background:transparent; color:var(--text); text-align:left; cursor:pointer; }
-.backup-menu button:hover { background:var(--soft); }
-.backup-menu button > svg { width:17px; height:17px; margin-top:2px; flex:0 0 auto; color:var(--muted); }
-.backup-menu button span { min-width:0; display:flex; flex-direction:column; gap:2px; }
-.backup-menu button strong { font-size:12.5px; font-weight:850; }
-.backup-menu button small { color:var(--faint); font-size:10.5px; line-height:1.4; font-weight:600; }
 
 /* ===== Backup export / import modal ===== */
 body.backup-modal-open { overflow:hidden; }
@@ -430,8 +416,6 @@ body.backup-modal-open { overflow:hidden; }
     .ws-board-empty .ws-primary-btn span { display:inline; }
     .ws-primary-btn { padding:0 12px; }
     .ws-paste-btn span { display:none; }
-    .ws-backup-btn { width:36px; padding:0; }
-    .ws-backup-btn > span,.ws-backup-btn .backup-menu-chevron { display:none; }
     .backup-modal-overlay { padding:8px; align-items:stretch; }
     .backup-modal { width:100%; max-height:none; height:100%; border-radius:12px; }
     .backup-modal-head { min-height:64px; padding:13px 14px; }

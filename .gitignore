@@ -7,6 +7,15 @@ API/.env
 
 # User data, generated media, and local archives
 data/
+# The image-generation seed is a bundled, immutable distribution asset rather
+# than local user data. Keep this exception narrowly scoped to this one file.
+!static/data/
+static/data/*
+!static/data/image-generation-presets.v1.json
+# Official fixed-case media is local content distributed through backups, not
+# part of the public GitHub program release. Keep an optional directory marker.
+static/image-generation-examples/*
+!static/image-generation-examples/.gitkeep
 assets/
 output/
 outputs/
@@ -23,6 +32,7 @@ __pycache__/
 # Local process files and logs
 _self_restart.*
 *.log
+tests/fixtures/image-generation-presets-test.json
 
 # Codex working-memory files
 task_plan.md

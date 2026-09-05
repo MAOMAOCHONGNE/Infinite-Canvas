@@ -322,7 +322,7 @@ class DetailPageTaskLifecycleTests(unittest.TestCase):
         starts = []
         all_started = asyncio.Event()
 
-        async def fake_image(request):
+        async def fake_image(request, **_kwargs):
             starts.append(request.prompt)
             if len(starts) == 3:
                 all_started.set()
@@ -379,7 +379,7 @@ class DetailPageTaskLifecycleTests(unittest.TestCase):
         llm = AsyncMock(side_effect=[{"text": short}, {"text": repaired}])
         submitted = []
 
-        async def fake_image(request):
+        async def fake_image(request, **_kwargs):
             submitted.append(request.prompt)
             return {"images": ["/output/quality-repaired.png"]}
 
@@ -416,7 +416,7 @@ class DetailPageTaskLifecycleTests(unittest.TestCase):
         main.CANVAS_TASKS[task_id] = record
         counter = 0
 
-        async def fake_image(_request):
+        async def fake_image(_request, **_kwargs):
             nonlocal counter
             counter += 1
             return {"images": [f"/output/new-{counter}.png"]}
@@ -448,7 +448,7 @@ class DetailPageTaskLifecycleTests(unittest.TestCase):
             started = []
             both_started = asyncio.Event()
 
-            async def fake_image(request):
+            async def fake_image(request, **_kwargs):
                 started.append(request.prompt)
                 if len(started) == 2:
                     both_started.set()
@@ -497,8 +497,10 @@ class DetailPageTaskLifecycleTests(unittest.TestCase):
         self.assertEqual(patched["screens"][0]["generation_params"], {"resolution": "4k"})
         reordered = asyncio.run(main.reorder_detail_page_screens(task_id, main.DetailPageScreenReorderRequest(screen_order=[2, 1])))
         self.assertEqual([item["screen_no"] for item in reordered["screens"]], [2, 1])
-        deleted = asyncio.run(main.delete_detail_page_screen(task_id, 2))
-        self.assertEqual([item["screen_no"] for item in deleted["screens"]], [1])
+        deleted_response = asyncio.run(main.delete_detail_page_screen(task_id, 2))
+        self.assertEqual(deleted_response.status_code, 202)
+        deleted = json.loads(deleted_response.body)
+        self.assertEqual([item["screen_no"] for item in deleted["task"]["screens"]], [1])
 
     def test_persistence_marks_active_work_interrupted_after_restart(self):
         payload = detail_payload(screen_count=1, model_usage=1, reversal_screens=0)

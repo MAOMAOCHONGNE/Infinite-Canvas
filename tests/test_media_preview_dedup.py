@@ -51,6 +51,29 @@ class MediaPreviewDedupTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(Path(first.path).is_file())
             self.assertEqual(main.MEDIA_PREVIEW_BUILD_REGISTRY, {})
 
+    async def test_16_bit_png_builds_a_real_128_pixel_preview(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / 'source-16bit.png'
+            cache = root / 'previews'
+            cache.mkdir()
+            webp = cache / 'source-128.webp'
+            png = cache / 'source-128.png'
+            Image.new('I;16', (640, 360), 32768).save(source, 'PNG')
+
+            with (
+                patch.object(main, 'MEDIA_PREVIEW_DIR', str(cache)),
+                patch.object(main, 'output_file_from_url', return_value=str(source)),
+                patch.object(main, 'media_preview_cache_paths', return_value=(str(webp), str(png))),
+            ):
+                response = await main.media_preview('/fake/source-16bit.png', 128)
+
+            output = Path(response.path)
+            self.assertTrue(output.is_file())
+            with Image.open(output) as preview:
+                self.assertLessEqual(max(preview.size), 128)
+                self.assertIn(preview.mode, {'RGB', 'RGBA', 'L'})
+
 
 if __name__ == '__main__':
     unittest.main()

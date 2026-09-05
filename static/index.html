@@ -25,7 +25,7 @@
     </script>
     <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.08.22-custom.1.1785863220"></script>
     <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
-    <script src="/static/js/i18n.js?v=2026.08.22-custom.1.1786958929"></script>
+    <script src="/static/js/i18n.js?v=2026.08.22-custom.1.1788531529"></script>
     <style>
         @import url('/static/vendor/css/fonts.css?v=2026.08.22-custom.1.1785863213');
 
@@ -183,6 +183,12 @@
         }
 
         .sidebar.has-settings-popover {
+            width: var(--studio-sidebar-expanded-width);
+            min-width: var(--studio-sidebar-expanded-width);
+            transition-delay: 0s;
+            overflow: visible;
+        }
+        .sidebar.has-backup-popover {
             width: var(--studio-sidebar-expanded-width);
             min-width: var(--studio-sidebar-expanded-width);
             transition-delay: 0s;
@@ -467,6 +473,24 @@
             pointer-events: auto;
         }
 
+        body.image-generation-case-preview-active { overflow: hidden; }
+        .stage.image-generation-case-preview-stage { overflow: visible; }
+        body.image-generation-case-preview-active #frame-image-generation {
+            position: fixed;
+            inset: 0;
+            z-index: 100000;
+            width: 100vw;
+            height: 100vh;
+            opacity: 1;
+            transform: none;
+            filter: none;
+            pointer-events: auto;
+            transition: none;
+        }
+        body.image-generation-case-preview-restoring #frame-image-generation {
+            transition: none;
+        }
+
         /* 左下角监视器 */
         .nano-monitor {
             position: absolute;
@@ -747,9 +771,22 @@
             flex: 0 0 auto;
             transition: width 0.5s var(--fluid-ease) 0.5s;
         }
+        .backup-popover-anchor {
+            width: 44px;
+            display: flex;
+            justify-content: center;
+            flex: 0 0 auto;
+            transition: width 0.5s var(--fluid-ease) 0.5s;
+        }
         .sidebar:hover .settings-popover-anchor,
         .sidebar.is-pinned .settings-popover-anchor,
         .sidebar.has-settings-popover .settings-popover-anchor {
+            width: var(--studio-sidebar-footer-expanded-width);
+            transition-delay: 0s;
+        }
+        .sidebar:hover .backup-popover-anchor,
+        .sidebar.is-pinned .backup-popover-anchor,
+        .sidebar.has-backup-popover .backup-popover-anchor {
             width: var(--studio-sidebar-footer-expanded-width);
             transition-delay: 0s;
         }
@@ -862,6 +899,42 @@
             font-size: 12px;
             font-weight: 750;
         }
+        .backup-popover {
+            width: min(236px, calc(100vw - 16px));
+        }
+        .backup-popover-action {
+            min-height: 52px;
+            padding: 7px 9px;
+            align-items: flex-start;
+        }
+        .backup-popover-action > svg {
+            margin-top: 2px;
+            color: var(--muted);
+        }
+        .backup-popover-copy {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .backup-popover-copy strong {
+            color: currentColor;
+            font-size: 12px;
+            line-height: 1.35;
+            font-weight: 800;
+        }
+        .backup-popover-copy small {
+            color: var(--muted);
+            font-size: 10.5px;
+            line-height: 1.4;
+            font-weight: 600;
+            white-space: normal;
+        }
+        .backup-popover-action:focus-visible,
+        .backup-popover-toggle:focus-visible {
+            outline: 2px solid var(--settings-popover-border);
+            outline-offset: 2px;
+        }
         .side-pill-text {
             opacity:0;
             min-width:0;
@@ -884,6 +957,11 @@
         .sidebar:hover .side-pill { gap:8px; }
 
         .sidebar.has-settings-popover .settings-popover-toggle {
+            background: var(--settings-popover-open-bg);
+            color: var(--text);
+            border-color: var(--settings-popover-border);
+        }
+        .sidebar.has-backup-popover .backup-popover-toggle {
             background: var(--settings-popover-open-bg);
             color: var(--text);
             border-color: var(--settings-popover-border);
@@ -1672,12 +1750,27 @@
             border-radius: 50%;
             transition-delay: 0s;
         }
+        .sidebar.has-backup-popover > .logo-ring {
+            transform: rotate(90deg);
+            border-radius: 50%;
+            transition-delay: 0s;
+        }
         .sidebar.has-settings-popover .nav-item,
         .sidebar.has-settings-popover .nav-fold-toggle {
             width: var(--studio-sidebar-nav-expanded-width);
             transition-delay: 0s;
         }
+        .sidebar.has-backup-popover .nav-item,
+        .sidebar.has-backup-popover .nav-fold-toggle {
+            width: var(--studio-sidebar-nav-expanded-width);
+            transition-delay: 0s;
+        }
         .sidebar.has-settings-popover .nav-text {
+            opacity: 1;
+            max-width: var(--studio-sidebar-text-expanded-width);
+            transition-delay: .1s;
+        }
+        .sidebar.has-backup-popover .nav-text {
             opacity: 1;
             max-width: var(--studio-sidebar-text-expanded-width);
             transition-delay: .1s;
@@ -1687,7 +1780,17 @@
             opacity: 0;
             transition-delay: 0s;
         }
+        .sidebar.has-backup-popover .letter-d {
+            transform: translateX(calc(var(--studio-sidebar-author-exit-offset) * -1));
+            opacity: 0;
+            transition-delay: 0s;
+        }
         .sidebar.has-settings-popover .letter-x {
+            transform: translateX(var(--studio-sidebar-author-exit-offset));
+            opacity: 0;
+            transition-delay: 0s;
+        }
+        .sidebar.has-backup-popover .letter-x {
             transform: translateX(var(--studio-sidebar-author-exit-offset));
             opacity: 0;
             transition-delay: 0s;
@@ -1698,38 +1801,62 @@
             transition-delay: .2s;
             pointer-events: auto;
         }
-        .sidebar.has-settings-popover .settings-popover-anchor {
+        .sidebar.has-backup-popover .author-content-wrap {
+            opacity: 1;
+            transform: scale(1);
+            transition-delay: .2s;
+            pointer-events: auto;
+        }
+        .sidebar.has-settings-popover .settings-popover-anchor,
+        .sidebar.has-backup-popover .settings-popover-anchor {
             width: var(--studio-sidebar-footer-expanded-width);
             transition-delay: 0s;
         }
+        .sidebar.has-settings-popover .backup-popover-anchor,
         .sidebar.has-settings-popover .side-pill {
             width: var(--studio-sidebar-footer-expanded-width);
             gap: 8px;
             transition-delay: 0s;
         }
-        .sidebar.has-settings-popover .side-pill-text {
+        .sidebar.has-backup-popover .backup-popover-anchor,
+        .sidebar.has-backup-popover .side-pill {
+            width: var(--studio-sidebar-footer-expanded-width);
+            gap: 8px;
+            transition-delay: 0s;
+        }
+        .sidebar.has-settings-popover .side-pill-text,
+        .sidebar.has-backup-popover .side-pill-text {
             opacity: 1;
             max-width: var(--studio-sidebar-text-expanded-width);
             transition-delay: .15s;
         }
         .sidebar.has-settings-popover .project-version-badge,
-        .sidebar.has-settings-popover .update-now-btn {
+        .sidebar.has-settings-popover .update-now-btn,
+        .sidebar.has-backup-popover .project-version-badge,
+        .sidebar.has-backup-popover .update-now-btn {
             width: var(--studio-sidebar-footer-expanded-width);
             transition-delay: 0s;
         }
         .sidebar.has-settings-popover .project-version-compact,
-        .sidebar.has-settings-popover .update-version-compact {
+        .sidebar.has-settings-popover .update-version-compact,
+        .sidebar.has-backup-popover .project-version-compact,
+        .sidebar.has-backup-popover .update-version-compact {
             display: none;
         }
         .sidebar.has-settings-popover .project-version-full,
         .sidebar.has-settings-popover .update-version-full,
-        .sidebar.has-settings-popover .update-action-prefix {
+        .sidebar.has-settings-popover .update-action-prefix,
+        .sidebar.has-backup-popover .project-version-full,
+        .sidebar.has-backup-popover .update-version-full,
+        .sidebar.has-backup-popover .update-action-prefix {
             display: inline;
         }
-        .sidebar.has-settings-popover .update-now-btn svg {
+        .sidebar.has-settings-popover .update-now-btn svg,
+        .sidebar.has-backup-popover .update-now-btn svg {
             display: block;
         }
-        .sidebar.has-settings-popover .update-now-text {
+        .sidebar.has-settings-popover .update-now-text,
+        .sidebar.has-backup-popover .update-now-text {
             max-width: var(--studio-sidebar-update-text-width);
             transition-delay: .15s;
         }
@@ -1803,11 +1930,11 @@
             </button>
 
             <nav>
-                <button class="nav-fold-toggle" id="local-nav-toggle" type="button" onclick="toggleLocalNav()" aria-expanded="true" title="折叠本地功能">
+                <button class="nav-fold-toggle" id="local-nav-toggle" type="button" onclick="toggleLocalNav()" aria-expanded="true" title="折叠基础功能">
                     <svg class="nav-fold-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <polyline points="6 9 12 15 18 9"></polyline>
                     </svg>
-                    <span class="nav-text" data-i18n="nav.localTools">本地功能</span>
+                    <span class="nav-text" data-i18n="nav.basicTools">基础功能</span>
                 </button>
 
                 <div class="nav-fold-group" id="local-nav-group">
@@ -1837,17 +1964,31 @@
                         </svg>
                         <span class="nav-text" data-i18n="nav.angle">角度控制</span>
                     </div>
+                    <div class="nav-item" onclick="switchUI(this, 'online')">
+                        <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2z"></path>
+                            <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                        </svg>
+                        <span class="nav-text" data-i18n="nav.online">在线生图</span>
+                    </div>
+                    <div class="nav-item" onclick="switchUI(this, 'gpt-chat')">
+                        <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                        </svg>
+                        <span class="nav-text" data-i18n="nav.gpt">GPT 对话</span>
+                    </div>
                 </div>
 
                 <!-- 分隔线 -->
                 <div style="width:32px;height:1px;background:var(--border);margin:8px auto;transition:background 0.3s;"></div>
-
-                <div class="nav-item" onclick="switchUI(this, 'online')">
+                <div class="nav-item" onclick="switchUI(this, 'main-image')">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2z"></path>
-                        <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                        <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+                        <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                        <path d="m21 15-5-5L5 21"></path>
+                        <path d="M14 4v4M12 6h4"></path>
                     </svg>
-                    <span class="nav-text" data-i18n="nav.online">在线生图</span>
+                    <span class="nav-text" data-i18n="nav.mainImage">一键主图</span>
                 </div>
                 <div class="nav-item" onclick="switchUI(this, 'detail-page')">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1856,11 +1997,13 @@
                     </svg>
                     <span class="nav-text" data-i18n="nav.detailPage">一键详情页</span>
                 </div>
-                <div class="nav-item" onclick="switchUI(this, 'gpt-chat')">
+                <div class="nav-item" onclick="switchUI(this, 'image-generation')">
                     <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                        <path d="M12 3v18M3 12h18"></path>
+                        <path d="m5 5 2 2m10 10 2 2m0-14-2 2M7 17l-2 2"></path>
+                        <circle cx="12" cy="12" r="3"></circle>
                     </svg>
-                    <span class="nav-text" data-i18n="nav.gpt">GPT 对话</span>
+                    <span class="nav-text" data-i18n="nav.imageGeneration">图片生成</span>
                 </div>
                 <div class="nav-item canvas-nav-item" onclick="switchUI(this, 'canvas')">
                     <svg class="w-5 h-5 flex-shrink-0 canvas-nav-icon" fill="none" stroke="url(#canvas-nav-gradient)" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1899,6 +2042,17 @@
                         </svg>
                         <span class="side-pill-text" data-i18n="common.apiSettings">API 设置</span>
                     </button>
+                    <div class="backup-popover-anchor">
+                        <button class="side-pill backup-popover-toggle" id="global-backup-btn" onclick="toggleGlobalBackup(event)" type="button" title="备份与恢复" aria-haspopup="menu" aria-expanded="false" aria-controls="global-backup-popover">
+                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M4 7.5V5a2 2 0 0 1 2-2h8.5L20 8.5V19a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2.5"></path>
+                                <path d="M14 3v6h6"></path>
+                                <path d="M3 13h10"></path>
+                                <path d="m10 10 3 3-3 3"></path>
+                            </svg>
+                            <span class="side-pill-text" data-i18n="nav.backupRestore">备份与恢复</span>
+                        </button>
+                    </div>
                     <div class="settings-popover-anchor">
                         <button class="side-pill settings-popover-toggle" id="settings-popover-toggle" onclick="toggleSidebarSettings(event)" type="button" title="更多设置" aria-expanded="false" aria-controls="settings-popover">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1987,6 +2141,29 @@
                 </button>
         </div>
         <div class="settings-popover-scrim" id="settings-popover-scrim" aria-hidden="true" hidden></div>
+        <div class="backup-popover settings-popover" id="global-backup-popover" role="menu" aria-labelledby="global-backup-btn" hidden>
+                <div class="settings-popover-header">
+                    <span class="settings-popover-title" data-i18n="backup.title">备份与恢复</span>
+                    <button class="settings-popover-close" type="button" onclick="closeGlobalBackup({ returnFocus:true })" title="关闭" aria-label="关闭备份与恢复">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
+                </div>
+                <button class="settings-popover-action backup-popover-action" type="button" role="menuitem" data-backup-action="export" title="导出备份">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M12 3v12"></path><path d="m7 10 5 5 5-5"></path><path d="M5 21h14"></path>
+                    </svg>
+                    <span class="backup-popover-copy"><strong data-i18n="backup.export">导出备份</strong><small data-i18n="backup.exportHint">选择画布、历史和配置</small></span>
+                </button>
+                <button class="settings-popover-action backup-popover-action" type="button" role="menuitem" data-backup-action="import" title="导入备份">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M12 15V3"></path><path d="m7 8 5-5 5 5"></path><path d="M5 21h14"></path>
+                    </svg>
+                    <span class="backup-popover-copy"><strong data-i18n="backup.import">导入备份</strong><small data-i18n="backup.importHint">检查备份内容后恢复</small></span>
+                </button>
+        </div>
         <script>
             /* 在侧栏 DOM 解析完后立即把 active 类移到当前页对应的入口，避免首屏先在文生图上闪一下 */
             (function(){
@@ -2005,17 +2182,19 @@
         </script>
 
         <main class="stage">
-            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.08.22-custom.1.1787287526" class="active" scrolling="yes"></iframe>
-            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.08.22-custom.1.1787287526" scrolling="yes"></iframe>
-            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.08.22-custom.1.1787287526" scrolling="yes"></iframe>
-            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.08.22-custom.1.1787287526" scrolling="yes"></iframe>
-            <iframe id="frame-online" data-src="/static/online.html?v=2026.08.22-custom.1.1787287526" scrolling="yes"></iframe>
-            <iframe id="frame-detail-page" data-src="/static/detail-page.html?v=2026.08.22-custom.1.1787387846" scrolling="yes"></iframe>
-            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.08.22-custom.1.1787326486" scrolling="yes"></iframe>
-            <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.08.22-custom.1.1787287526" scrolling="yes"></iframe>
-            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.22-custom.1.1787387846" scrolling="yes"></iframe>
-            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.22-custom.1.1787287526" scrolling="yes"></iframe>
-        <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.22-custom.1.1787387846" scrolling="yes"></iframe>
+            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.08.22-custom.1.1788532849" class="active" scrolling="yes"></iframe>
+            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.08.22-custom.1.1788532849" scrolling="yes"></iframe>
+            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.08.22-custom.1.1788532849" scrolling="yes"></iframe>
+            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.08.22-custom.1.1788532849" scrolling="yes"></iframe>
+            <iframe id="frame-online" data-src="/static/online.html?v=2026.08.22-custom.1.1788532849" scrolling="yes"></iframe>
+            <iframe id="frame-main-image" data-src="/static/main-image.html?v=2026.08.22-custom.1.1788547090" scrolling="yes"></iframe>
+                <iframe id="frame-image-generation" data-src="/static/image-generation.html?v=2026.08.22-custom.1.1788511734" scrolling="yes"></iframe>
+            <iframe id="frame-detail-page" data-src="/static/detail-page.html?v=2026.08.22-custom.1.1788547090" scrolling="yes"></iframe>
+            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.08.22-custom.1.1788532849" scrolling="yes"></iframe>
+            <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.08.22-custom.1.1788581545" scrolling="yes"></iframe>
+            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.22-custom.1.1788532849" scrolling="yes"></iframe>
+            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.22-custom.1.1788532849" scrolling="yes"></iframe>
+        <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.22-custom.1.1788532849" scrolling="yes"></iframe>
 
         </main>
     </div>
@@ -2155,8 +2334,8 @@
         const LOCAL_NAV_COLLAPSED_KEY = 'studio_local_nav_collapsed';
         const SIDEBAR_PINNED_KEY = 'studio_sidebar_pinned';
         const DEFAULT_PAGE_ID = 'zimage';
-        const PAGE_IDS = ['zimage','enhance','klein','angle','online','detail-page','gpt-chat','canvas','asset-manager','api-settings','comfyui-settings'];
-        const LOCAL_PAGE_IDS = ['zimage','enhance','klein','angle'];
+        const PAGE_IDS = ['zimage','enhance','klein','angle','online','main-image','image-generation','detail-page','gpt-chat','canvas','asset-manager','api-settings','comfyui-settings'];
+        const LOCAL_PAGE_IDS = ['zimage','enhance','klein','angle','online','gpt-chat'];
         const PROJECT_URL = 'https://github.com/MAOMAOCHONGNE/Infinite-Canvas';
         let appInfo = { version:'', edition:'qianse70', update_channel:'my-custom', repo_url:PROJECT_URL, version_url:'https://raw.githubusercontent.com/MAOMAOCHONGNE/Infinite-Canvas/my-custom/VERSION' };
         let updateConnectivityResult = null;
@@ -2177,7 +2356,10 @@
             const logo = document.getElementById('sidebarLogoToggle');
             if(!sidebar) return;
             pauseScaleInFrames();
-            if(!pinned) closeSidebarSettings({ returnFocus:false });
+            if(!pinned) {
+                closeSidebarSettings({ returnFocus:false });
+                closeGlobalBackup({ returnFocus:false });
+            }
             sidebar.classList.toggle('is-pinned', pinned);
             if(!pinned) {
                 sidebar.classList.add('is-collapsing');
@@ -2209,7 +2391,7 @@
             if(group) group.classList.toggle('is-collapsed', collapsed);
             if(toggle) {
                 toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-                toggle.title = collapsed ? '展开本地功能' : '折叠本地功能';
+                toggle.title = collapsed ? '展开基础功能' : '折叠基础功能';
             }
             if(!options.skipRemember) localStorage.setItem(LOCAL_NAV_COLLAPSED_KEY, collapsed ? '1' : '0');
         }
@@ -2223,6 +2405,8 @@
             const savedCollapsed = localStorage.getItem(LOCAL_NAV_COLLAPSED_KEY) === '1';
             setLocalNavCollapsed(savedCollapsed && !LOCAL_PAGE_IDS.includes(id), { skipRemember:true });
         }
+
+        let pendingGlobalBackupAction = null;
 
         function positionSidebarSettingsPanel() {
             const sidebar = document.getElementById('studioSidebar');
@@ -2254,6 +2438,7 @@
             const toggle = document.getElementById('settings-popover-toggle');
             if(!sidebar || !panel || !toggle) return;
             if(open) {
+                closeGlobalBackup({ returnFocus:false });
                 sidebar.classList.remove('is-collapsing');
                 panel.style.visibility = 'hidden';
             }
@@ -2285,6 +2470,92 @@
             setSidebarSettingsOpen(false, options);
         }
 
+        function positionGlobalBackupPanel() {
+            const sidebar = document.getElementById('studioSidebar');
+            const panel = document.getElementById('global-backup-popover');
+            const toggle = document.getElementById('global-backup-btn');
+            if(!sidebar || !panel || !toggle || panel.hidden) return;
+
+            const viewportPadding = 8;
+            const gap = 8;
+            const sidebarRect = sidebar.getBoundingClientRect();
+            const toggleRect = toggle.getBoundingClientRect();
+            const panelRect = panel.getBoundingClientRect();
+            const desiredTop = toggleRect.top + toggleRect.height / 2 - panelRect.height / 2;
+            const maxTop = Math.max(viewportPadding, window.innerHeight - panelRect.height - viewportPadding);
+            const maxLeft = Math.max(viewportPadding, window.innerWidth - panelRect.width - viewportPadding);
+
+            panel.style.top = `${Math.min(Math.max(desiredTop, viewportPadding), maxTop)}px`;
+            panel.style.left = `${Math.min(sidebarRect.right + gap, maxLeft)}px`;
+            panel.style.visibility = 'visible';
+        }
+
+        function setGlobalBackupOpen(open, options = {}) {
+            const sidebar = document.getElementById('studioSidebar');
+            const panel = document.getElementById('global-backup-popover');
+            const scrim = document.getElementById('settings-popover-scrim');
+            const toggle = document.getElementById('global-backup-btn');
+            if(!sidebar || !panel || !toggle) return;
+            if(open) {
+                closeSidebarSettings({ returnFocus:false });
+                sidebar.classList.remove('is-collapsing');
+                panel.style.visibility = 'hidden';
+            }
+            panel.hidden = !open;
+            if(scrim) scrim.hidden = !open;
+            sidebar.classList.toggle('has-backup-popover', open);
+            toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+            toggle.title = open ? '关闭备份与恢复' : '打开备份与恢复';
+            if(open) {
+                pauseScaleInFrames();
+                window.requestAnimationFrame(() => {
+                    if(panel.hidden) return;
+                    positionGlobalBackupPanel();
+                    panel.querySelector('[data-backup-action]')?.focus({ preventScroll:true });
+                });
+            } else if(options.returnFocus) {
+                toggle.focus({ preventScroll:true });
+            }
+        }
+
+        function toggleGlobalBackup(event) {
+            event?.preventDefault?.();
+            event?.stopPropagation?.();
+            const panel = document.getElementById('global-backup-popover');
+            setGlobalBackupOpen(Boolean(panel?.hidden));
+        }
+
+        function closeGlobalBackup(options = {}) {
+            setGlobalBackupOpen(false, options);
+        }
+
+        function flushPendingBackupAction(frame) {
+            if(!pendingGlobalBackupAction || !frame || frame.id !== 'frame-canvas' || !frame.classList.contains('active') || !frame.contentWindow || !frame.contentDocument || frame.contentDocument.readyState !== 'complete') return false;
+            const action = pendingGlobalBackupAction;
+            pendingGlobalBackupAction = null;
+            try {
+                frame.contentWindow.postMessage({ type:'studio-backup-action', action }, window.location.origin);
+                return true;
+            } catch(error) {
+                pendingGlobalBackupAction = action;
+                return false;
+            }
+        }
+
+        function handleGlobalBackupAction(action) {
+            if(action !== 'export' && action !== 'import') return;
+            pendingGlobalBackupAction = action;
+            closeGlobalBackup({ returnFocus:false });
+            const trigger = document.querySelector('.canvas-nav-item');
+            if(!trigger) {
+                pendingGlobalBackupAction = null;
+                return;
+            }
+            switchUI(trigger, 'canvas');
+            const frame = document.getElementById('frame-canvas');
+            if(frame?.src) window.requestAnimationFrame(() => flushPendingBackupAction(frame));
+        }
+
         function syncSidebarSettingsRoute(id) {
             const toggle = document.getElementById('settings-popover-toggle');
             const workflowAction = document.querySelector('.settings-popover-action[onclick*="comfyui-settings"]');
@@ -2301,20 +2572,42 @@
         document.addEventListener('pointerdown', event => {
             const panel = document.getElementById('settings-popover');
             const toggle = document.getElementById('settings-popover-toggle');
-            if(panel?.hidden || panel?.contains(event.target) || toggle?.contains(event.target)) return;
-            closeSidebarSettings({ returnFocus:false });
+            const backupPanel = document.getElementById('global-backup-popover');
+            const backupToggle = document.getElementById('global-backup-btn');
+            if(!panel?.hidden && !panel?.contains(event.target) && !toggle?.contains(event.target)) {
+                closeSidebarSettings({ returnFocus:false });
+            }
+            if(!backupPanel?.hidden && !backupPanel?.contains(event.target) && !backupToggle?.contains(event.target)) {
+                closeGlobalBackup({ returnFocus:false });
+            }
+        });
+
+        document.addEventListener('click', event => {
+            const action = event.target.closest('#global-backup-popover [data-backup-action]')?.dataset.backupAction;
+            if(!action) return;
+            event.preventDefault();
+            event.stopPropagation();
+            handleGlobalBackupAction(action);
         });
 
         document.addEventListener('keydown', event => {
             if(event.key !== 'Escape') return;
+            const backupPanel = document.getElementById('global-backup-popover');
+            if(!backupPanel?.hidden) {
+                event.preventDefault();
+                closeGlobalBackup({ returnFocus:true });
+                return;
+            }
             const panel = document.getElementById('settings-popover');
-            if(panel?.hidden) return;
-            event.preventDefault();
-            closeSidebarSettings({ returnFocus:true });
+            if(!panel?.hidden) {
+                event.preventDefault();
+                closeSidebarSettings({ returnFocus:true });
+            }
         });
 
         window.addEventListener('resize', () => {
             window.requestAnimationFrame(positionSidebarSettingsPanel);
+            window.requestAnimationFrame(positionGlobalBackupPanel);
         });
 
         function resetStudioRootScroll() {
@@ -2338,7 +2631,27 @@
             stage?.classList.toggle('canvas-editor-stage', isClassicEditor);
         }
 
+        function setImageGenerationCasePreviewActive(active) {
+            const enabled = Boolean(active);
+            const body = document.body;
+            const stage = document.querySelector('.stage');
+            if(enabled) {
+                body.classList.remove('image-generation-case-preview-restoring');
+                body.classList.add('image-generation-case-preview-active');
+                stage?.classList.add('image-generation-case-preview-stage');
+                return;
+            }
+            if(!body.classList.contains('image-generation-case-preview-active')) return;
+            body.classList.add('image-generation-case-preview-restoring');
+            body.classList.remove('image-generation-case-preview-active');
+            stage?.classList.remove('image-generation-case-preview-stage');
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                body.classList.remove('image-generation-case-preview-restoring');
+            }));
+        }
+
         function switchUI(el, id, options = {}) {
+            setImageGenerationCasePreviewActive(false);
             resetStudioRootScroll();
             if(!PAGE_IDS.includes(id)) id = DEFAULT_PAGE_ID;
             document.querySelectorAll('.nav-item,.side-pill,.settings-popover-action').forEach(n => n.classList.remove('active'));
@@ -2360,6 +2673,7 @@
             }
             syncSidebarSettingsRoute(id);
             if(id !== 'comfyui-settings') closeSidebarSettings({ returnFocus:false });
+            closeGlobalBackup({ returnFocus:false });
             // 切换到画布时通知刷新工作流列表（防止在 comfyui-settings 修改后画布未及时更新）
             if (id === 'canvas' && target.src) {
                 try { target.contentWindow?.postMessage({ type: 'canvas-focus' }, '*'); } catch(e) {}
@@ -2368,7 +2682,7 @@
         }
 
         function forwardStudioApiChange(data) {
-            if(!data || !['providers-changed','workflows-changed','comfy-instances-changed','detail-pages-changed'].includes(data.type)) return;
+            if(!data || !['providers-changed','workflows-changed','comfy-instances-changed','detail-pages-changed','main-images-changed'].includes(data.type)) return;
             document.querySelectorAll('iframe').forEach(iframe => {
                 try {
                     if (iframe && iframe.contentWindow) iframe.contentWindow.postMessage(data, '*');
@@ -2378,6 +2692,12 @@
 
         window.addEventListener('message', event => {
             if (event.origin && event.origin !== location.origin) return;
+            if(event.data?.type === 'image-generation-case-preview-state') {
+                const frame = document.getElementById('frame-image-generation');
+                if(!frame || event.source !== frame.contentWindow) return;
+                setImageGenerationCasePreviewActive(event.data.active === true);
+                return;
+            }
             if(event.data?.type === 'studio-navigate' && PAGE_IDS.includes(event.data.page)) {
                 const id = event.data.page;
                 const trigger = document.querySelector(`[onclick*="'${id}'"],[onclick*='"${id}"']`);
@@ -2577,6 +2897,7 @@
                 syncLanguageToFrame(f);
                 syncScaleToFrame(f);
                 if(f.id === 'frame-canvas') syncCanvasEditorStage();
+                if(f.id === 'frame-canvas') flushPendingBackupAction(f);
             });
         });
 

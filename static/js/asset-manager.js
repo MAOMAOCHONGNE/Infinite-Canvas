@@ -2,6 +2,7 @@ const root = document.getElementById('assetManagerRoot');
 const statusEl = document.getElementById('assetStatus');
 const refreshBtn = document.getElementById('refreshBtn');
 const storageSettingsBtn = document.getElementById('storageSettingsBtn');
+const storageCleanupBtn = document.getElementById('storageCleanupBtn');
 const uploadInput = document.getElementById('assetUploadInput');
 
 const LOCAL_CAPTION_SETTINGS_KEY = 'asset_manager_local_caption_settings_v1';
@@ -105,6 +106,8 @@ let assetClassifyBusy = false;
 let localClassifyBusy = false;
 let lightboxPanState = null;
 let canvasAssetsData = {categories:[], canvases:[], items:[], orphanItems:[]};
+let canvasAssetsLoading = true;
+let canvasAssetsLoadError = '';
 let activeCanvasAssetCategory = 'smart';
 let activeCanvasAssetCanvasId = '';
 let selectedCanvasAssetId = '';
@@ -116,12 +119,13 @@ let searchCompositionActive = false;
 let searchRenderTimer = null;
 let lastSearchCompositionEndAt = 0;
 let storageSettingsState = {open:false, tab:'prefs', editor:'', dirs:{}, defaults:{}, kind:'generated', items:[], selected:new Set(), loading:false, loadingMore:false, offset:0, total:0, hasMore:false, pageSize:80, restoreScrollTop:null, classificationPrompt:'', defaultClassificationPrompt:''};
+let storageCleanupState = {open:false, step:'choose', kind:'all', pending:false, confirmationId:'', summary:null, samples:[], error:'', returnFocus:null};
 
 const LOCAL_MEDIA_EXTS = /\.(png|jpe?g|webp|gif|bmp|avif|svg|mp4|webm|mov|m4v|mp3|wav|flac|ogg|m4a|aac)(\?|#|$)/i;
 const SEARCH_INPUT_IDS = new Set(['assetSearch','workflowSearch','promptSearch','localSearch','localUploadSearch','canvasAssetSearch']);
 
 function refreshIcons(){ if(window.lucide) lucide.createIcons(); }
-function setStatus(text='准备就绪'){ if(statusEl) statusEl.textContent = text || '准备就绪'; }
+function setStatus(text='已就绪'){ if(statusEl) statusEl.textContent = text || '已就绪'; }
 function escapeHtml(value=''){
     return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
@@ -176,6 +180,240 @@ async function openStorageSettings(){
 function closeStorageSettings(){
     storageSettingsState.open = false;
     document.getElementById('storageSettingsOverlay')?.remove();
+}
+function openStorageCleanupDialog(){
+    closeStorageSettings();
+    storageCleanupState = {
+        open:true,
+        step:'choose',
+        kind:'all',
+        pending:false,
+        confirmationId:'',
+        summary:null,
+        samples:[],
+        error:'',
+        returnFocus:document.activeElement
+    };
+    renderStorageCleanupDialog();
+}
+function closeStorageCleanupDialog(options={}){
+    const returnFocus = storageCleanupState.returnFocus;
+    storageCleanupState.open = false;
+    document.getElementById('storageCleanupOverlay')?.remove();
+    if(options.restoreFocus !== false) requestAnimationFrame(() => returnFocus?.focus?.());
+}
+function renderStorageCleanupDialog(){
+    if(!storageCleanupState.open) return;
+    let overlay = document.getElementById('storageCleanupOverlay');
+    if(!overlay){
+        overlay = document.createElement('div');
+        overlay.id = 'storageCleanupOverlay';
+        overlay.className = 'storage-cleanup-overlay';
+        document.body.appendChild(overlay);
+    }
+    const confirming = storageCleanupState.step === 'confirm';
+    const empty = storageCleanupState.step === 'empty';
+    const summary = storageCleanupState.summary || {};
+    const legacyHistoryCandidates = Number(summary.candidate_by?.legacy_unmarked_history || 0);
+    const legacyHistoryRecords = Number(summary.legacy_unmarked_history_records || 0);
+    const generatedTotal = Number(summary.breakdown?.generated?.total_files || 0);
+    const uploadTotal = Number(summary.breakdown?.['temporary-upload']?.total_files || 0);
+    const fixedExampleTotal = Number(summary.breakdown?.['fixed-example']?.total_files || 0);
+    const fixedExampleCandidates = Number(summary.candidate_by?.fixed_example_orphan || 0);
+    const canvasLogCandidates = Number(summary.candidate_by?.canvas_log_only || 0);
+    const legacyGenerated = Number(summary.breakdown?.generated?.legacy_history_candidate_files || 0);
+    const legacyUploads = Number(summary.breakdown?.['temporary-upload']?.legacy_history_candidate_files || 0);
+    const samples = Array.isArray(storageCleanupState.samples) ? storageCleanupState.samples : [];
+    const sampleBody = samples.length ? `
+        <div class="storage-cleanup-samples">
+            <div class="storage-cleanup-samples-head"><strong>候选文件示例</strong><span>仅展示前 ${samples.length} 个</span></div>
+            <div class="storage-cleanup-samples-list">
+                ${samples.map(item => `
+                    <div><span title="${escapeHtml(item.name || '')}">${escapeHtml(item.name || '未命名图片')}</span><small>${item.candidate_source === 'fixed_example_orphan' ? '旧案例残留' : (item.candidate_source === 'canvas_log_only' ? '画布日志历史' : (item.kind === 'temporary-upload' ? '上传参考图' : '生成图'))} · ${escapeHtml(formatFileSize(item.size || 0))}</small></div>
+                `).join('')}
+            </div>
+        </div>
+    ` : '';
+    const summaryBody = storageCleanupState.summary ? `
+        <div class="storage-cleanup-summary" aria-label="存储扫描统计">
+            <article class="storage-cleanup-stat is-total">
+                <span>全部文件</span>
+                <strong>${Number(summary.total_files || 0)} 个</strong>
+                <small>占用 ${escapeHtml(formatFileSize(summary.total_bytes || 0))}</small>
+            </article>
+            <article class="storage-cleanup-stat is-candidate">
+                <span>可清理</span>
+                <strong>${Number(summary.candidate_files || 0)} 个</strong>
+                <small>可释放 ${escapeHtml(formatFileSize(summary.candidate_bytes || 0))}</small>
+            </article>
+        </div>
+        <div class="storage-cleanup-breakdown">生成图 ${generatedTotal} 个 · 临时上传图 ${uploadTotal} 个 · 案例文件 ${fixedExampleTotal} 个${fixedExampleCandidates > 0 ? `（旧案例残留 ${fixedExampleCandidates} 个）` : ''}</div>
+        ${legacyHistoryCandidates > 0 ? `
+            <div class="storage-cleanup-protected-note is-migration">
+                <i data-lucide="history"></i>
+                <span>发现 <strong>${legacyHistoryCandidates} 个旧版来源未标记文件</strong>（生成图 ${legacyGenerated} 个、上传参考图 ${legacyUploads} 个），关联 ${legacyHistoryRecords} 条旧历史。它们没有画布、案例、收藏、主图、详情页、图片生成任务或运行中任务等有效引用，可在确认后一起清理。</span>
+            </div>
+        ` : ''}
+        ${fixedExampleCandidates > 0 ? `
+            <div class="storage-cleanup-protected-note is-migration">
+                <i data-lucide="images"></i>
+                <span>发现 <strong>${fixedExampleCandidates} 个旧案例残留</strong>。它们已不被当前案例、其它模式、发布预设、任务、草稿、画布或收藏引用；确认后只会移入 Windows 回收站。</span>
+            </div>
+        ` : ''}
+        ${canvasLogCandidates > 0 ? `
+            <div class="storage-cleanup-protected-note is-history-only">
+                <i data-lucide="history"></i>
+                <span>发现 <strong>${canvasLogCandidates} 个仅被画布日志记录的候选文件</strong>。画布日志仅作为历史记录保留，不代表当前仍占用图片；确认后原图会移入 Windows 回收站，日志记录继续保留。</span>
+            </div>
+        ` : ''}
+        ${sampleBody}
+    ` : '';
+    const chooseBody = `
+        <div class="storage-cleanup-intro">
+            <i data-lucide="shield-check"></i>
+            <div><strong>一次扫描生成图、临时上传图和案例残留</strong><span>系统会重新核对任务、历史、草稿、画布、收藏、当前案例和发布预设；仍有任何引用的图片都会保留。</span></div>
+        </div>
+        <div class="storage-cleanup-actions">
+            <button class="storage-cleanup-action" type="button" data-storage-cleanup-scan ${storageCleanupState.pending ? 'disabled' : ''}>
+                <span class="storage-cleanup-action-icon"><i data-lucide="scan-search"></i></span>
+                <span><strong>${storageCleanupState.pending ? '正在扫描...' : '扫描可清理文件'}</strong><small>扫描完成后显示全部文件占用，以及真正可以安全释放的空间。</small></span>
+                <i data-lucide="chevron-right"></i>
+            </button>
+        </div>
+        <p class="storage-cleanup-footnote">这里只扫描生成目录、临时上传目录和固定案例目录中的无引用旧文件，不包含角色库、本地素材；确认后只移入 Windows 回收站。</p>
+    `;
+    const confirmBody = `
+        ${summaryBody}
+        <div class="storage-cleanup-confirm" role="alert">
+            <span class="storage-cleanup-confirm-icon"><i data-lucide="triangle-alert"></i></span>
+            <div>
+                <strong>确认清理 ${Number(summary.candidate_files || 0)} 个文件？</strong>
+                <p>预计可释放 ${escapeHtml(formatFileSize(summary.candidate_bytes || 0))}。其中旧版来源未标记的历史只会移除对应图片引用；仍有有效引用的图片不会进入清理任务。</p>
+                <p>确认后记录立即修整，图片在后台再次扫描并移入 Windows 回收站。当前案例及期间新出现引用的图片仍会保留，失败会恢复文件并自动重试。</p>
+            </div>
+        </div>
+    `;
+    const emptyBody = `
+        ${summaryBody}
+        <div class="storage-cleanup-empty">
+            <i data-lucide="badge-check"></i>
+            <strong>当前没有可清理的未引用文件</strong>
+            <span>所有仍有有效引用的图片都已保留。</span>
+        </div>
+    `;
+    overlay.innerHTML = `
+        <section class="storage-cleanup-modal" role="dialog" aria-modal="true" aria-labelledby="storageCleanupTitle">
+            <header class="storage-cleanup-head">
+                <div><strong id="storageCleanupTitle">存储清理</strong><span>安全整理生成、临时上传和固定案例目录中的无引用图片。</span></div>
+                <button type="button" data-storage-cleanup-close aria-label="关闭存储清理"><i data-lucide="x"></i></button>
+            </header>
+            <div class="storage-cleanup-body">
+                ${storageCleanupState.pending ? '<div class="storage-cleanup-progress"><i data-lucide="loader-2"></i><span>正在安全扫描本机引用...</span></div>' : ''}
+                ${storageCleanupState.error ? `<div class="storage-cleanup-error" role="alert">${escapeHtml(storageCleanupState.error)}</div>` : ''}
+                ${confirming ? confirmBody : empty ? emptyBody : chooseBody}
+            </div>
+            <footer class="storage-cleanup-footer">
+                ${confirming ? `
+                    <button class="asset-btn" type="button" data-storage-cleanup-back ${storageCleanupState.pending ? 'disabled' : ''}>取消</button>
+                    <button class="asset-btn storage-cleanup-delete" type="button" data-storage-cleanup-confirm ${storageCleanupState.pending ? 'disabled' : ''}><i data-lucide="trash-2"></i><span>${storageCleanupState.pending ? '正在提交...' : '确认后台清理'}</span></button>
+                ` : empty ? `
+                    <button class="asset-btn" type="button" data-storage-cleanup-back>返回</button>
+                    <button class="asset-btn primary" type="button" data-storage-cleanup-close>完成</button>
+                ` : '<button class="asset-btn" type="button" data-storage-cleanup-close>关闭</button>'}
+            </footer>
+        </section>
+    `;
+    refreshIcons();
+    requestAnimationFrame(() => {
+        if(confirming) overlay.querySelector('[data-storage-cleanup-back]')?.focus();
+        else if(empty) overlay.querySelector('[data-storage-cleanup-close]')?.focus();
+        else overlay.querySelector('[data-storage-cleanup-scan]')?.focus();
+    });
+}
+async function previewStorageCleanup(){
+    if(storageCleanupState.pending) return;
+    storageCleanupState.kind = 'all';
+    storageCleanupState.pending = true;
+    storageCleanupState.summary = null;
+    storageCleanupState.samples = [];
+    storageCleanupState.error = '';
+    renderStorageCleanupDialog();
+    try {
+        const data = await apiJson('/api/storage-cleanup/preview', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({kind:'all'})
+        });
+        storageCleanupState.confirmationId = data.confirmation_id || '';
+        storageCleanupState.summary = data.summary || null;
+        storageCleanupState.samples = Array.isArray(data.samples) ? data.samples : [];
+        storageCleanupState.step = data.has_targets ? 'confirm' : 'empty';
+    } catch(err){
+        storageCleanupState.step = 'choose';
+        storageCleanupState.error = err.message || '无法安全扫描存储目录';
+    } finally {
+        storageCleanupState.pending = false;
+        renderStorageCleanupDialog();
+    }
+}
+async function confirmStorageCleanup(){
+    if(storageCleanupState.pending || !storageCleanupState.confirmationId) return;
+    storageCleanupState.pending = true;
+    storageCleanupState.error = '';
+    renderStorageCleanupDialog();
+    try {
+        const data = await apiJson('/api/storage-cleanup/confirm', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({confirmation_id:storageCleanupState.confirmationId})
+        });
+        closeStorageCleanupDialog();
+        const queued = Number(data.queued || 0);
+        const queuedBytes = Number(data.queued_bytes || 0);
+        if(queued > 0){
+            setStatus(`已提交 ${queued} 个文件（${formatFileSize(queuedBytes)}），后台正在移入 Windows 回收站`);
+            trackStorageCleanupJob(data.cleanup_job_id, queued, queuedBytes);
+        }else{
+            setStatus('扫描结果已变化，没有提交任何文件');
+        }
+    } catch(err){
+        storageCleanupState.pending = false;
+        storageCleanupState.confirmationId = '';
+        storageCleanupState.summary = null;
+        storageCleanupState.samples = [];
+        storageCleanupState.step = 'choose';
+        storageCleanupState.error = err.message || '存储清理失败';
+        renderStorageCleanupDialog();
+    }
+}
+function trackStorageCleanupJob(jobId, fileCount, byteCount){
+    const id = String(jobId || '').trim();
+    if(!id) return;
+    const poll = async () => {
+        try {
+            const response = await fetch(`/api/storage-cleanup/jobs/${encodeURIComponent(id)}`);
+            if(response.status === 404){
+                setStatus(`后台清理完成：${Number(fileCount || 0)} 个文件已处理，可释放约 ${formatFileSize(byteCount || 0)}`);
+                return;
+            }
+            const job = await response.json().catch(() => ({}));
+            if(!response.ok) throw new Error(job.detail || '无法查询后台清理状态');
+            if(job.status === 'failed'){
+                setStatus('记录已清理，图片暂时保留，系统将在后台自动重试移入 Windows 回收站');
+                setTimeout(poll, 5000);
+                return;
+            }
+            if(job.status === 'succeeded'){
+                setStatus(`后台清理完成：已处理 ${Number(job.media_deleted || fileCount || 0)} 个文件`);
+                return;
+            }
+            setTimeout(poll, 1200);
+        } catch(err){
+            setStatus(err.message || '后台清理仍在继续，可稍后重新扫描确认');
+            setTimeout(poll, 5000);
+        }
+    };
+    setTimeout(poll, 700);
 }
 function syncStorageSettingsInputsToState(){
     storageSettingsState.dirs = storageSettingsState.dirs || {};
@@ -948,19 +1186,22 @@ function currentWorkflowItems(){
 }
 function canvasAssetCategories(){
     const cats = Array.isArray(canvasAssetsData.categories) && canvasAssetsData.categories.length
-        ? canvasAssetsData.categories.filter(cat => ['smart','classic'].includes(cat.id))
+        ? canvasAssetsData.categories.filter(cat => ['smart','classic','orphan'].includes(cat.id))
         : [
             {id:'smart', name:'智能画布', count:(canvasAssetsData.items || []).filter(item => item.canvas_kind === 'smart').length, canvas_count:(canvasAssetsData.canvases || []).filter(item => item.kind === 'smart').length},
-            {id:'classic', name:'普通画布', count:(canvasAssetsData.items || []).filter(item => item.canvas_kind !== 'smart').length, canvas_count:(canvasAssetsData.canvases || []).filter(item => item.kind !== 'smart').length}
+            {id:'classic', name:'普通画布', count:(canvasAssetsData.items || []).filter(item => item.canvas_kind !== 'smart').length, canvas_count:(canvasAssetsData.canvases || []).filter(item => item.kind !== 'smart').length},
+            {id:'orphan', name:'孤立素材', count:(canvasAssetsData.orphanItems || []).length, canvas_count:0}
         ];
-    return [...cats, {id:'orphans', name:'孤立素材', count:(canvasAssetsData.orphanItems || []).length, canvas_count:0}];
+    return cats;
 }
 function activeCanvasAssetCategoryInfo(){
     return canvasAssetCategories().find(cat => cat.id === activeCanvasAssetCategory) || canvasAssetCategories()[0] || {id:'smart', name:'智能画布', count:0, canvas_count:0};
 }
 function defaultCanvasAssetCategory(){
     const cats = canvasAssetCategories();
-    return cats.find(cat => Number(cat.canvas_count || 0) > 0)?.id || cats[0]?.id || 'smart';
+    return cats.find(cat => ['smart','classic'].includes(cat.id) && Number(cat.canvas_count || 0) > 0)?.id
+        || cats.find(cat => Number(cat.count || 0) > 0)?.id
+        || cats[0]?.id || 'smart';
 }
 function uniqueCanvasAssets(items){
     const seen = new Set();
@@ -977,7 +1218,7 @@ function canvasAssetCountForCanvas(canvasId){
     return uniqueCanvasAssets(canvasAssetsData.items || []).filter(item => item.canvas_id === canvasId).length;
 }
 function canvasAssetsForCategory(categoryId=activeCanvasAssetCategory){
-    if(categoryId === 'orphans') return [];
+    if(categoryId === 'orphan') return [];
     let list = Array.isArray(canvasAssetsData.canvases) ? canvasAssetsData.canvases.slice() : [];
     list = list.filter(canvas => (canvas.kind || 'classic') === categoryId);
     return list.sort((a, b) => String(a.title || '').localeCompare(String(b.title || ''), 'zh-Hans-CN', {numeric:true, sensitivity:'base'}));
@@ -988,15 +1229,17 @@ function canvasAssetOpenUrl(canvas){
     return canvas.kind === 'smart' ? `/static/smart-canvas.html?id=${id}` : `/static/canvas.html?id=${id}`;
 }
 function activeCanvasAssetCanvas(){
-    if(!activeCanvasAssetCanvasId) return null;
+    if(!activeCanvasAssetCanvasId || activeCanvasAssetCategory === 'orphan') return null;
     return (canvasAssetsData.canvases || []).find(canvas => canvas.id === activeCanvasAssetCanvasId) || null;
 }
 function canvasAssetViewTitle(){
-    if(activeCanvasAssetCategory === 'orphans') return '孤立素材';
+    if(activeCanvasAssetCategory === 'orphan') return '孤立素材';
     return activeCanvasAssetCanvas()?.title || activeCanvasAssetCategoryInfo().name || '画布资产';
 }
 function canvasAssetViewSubtitle(items){
-    if(activeCanvasAssetCategory === 'orphans') return `${items.length} 个未被画布引用的本地素材`;
+    if(canvasAssetsLoading) return '正在读取画布资产...';
+    if(canvasAssetsLoadError) return '画布资产读取失败，可点击刷新资源重试';
+    if(activeCanvasAssetCategory === 'orphan') return `未属于当前画布 / ${items.length} 个资产 / ${escapeHtml(canvasAssetSortLabel())}`;
     const canvas = activeCanvasAssetCanvas();
     if(canvas) return `${canvasKindLabel(canvas.kind)} / ${items.length} 个资产 / ${escapeHtml(canvasAssetSortLabel())}`;
     const activeCat = activeCanvasAssetCategoryInfo();
@@ -1010,6 +1253,7 @@ function canvasAssetKindLabel(item){
     return '图片';
 }
 function canvasKindLabel(kind){
+    if(kind === 'orphan') return '未属于当前画布';
     return kind === 'smart' ? '智能画布' : '普通画布';
 }
 function canvasAssetSortLabel(){
@@ -1017,18 +1261,13 @@ function canvasAssetSortLabel(){
     return map[canvasAssetSort] || map.canvas_asc;
 }
 function currentCanvasAssetItems(){
-    if(activeCanvasAssetCategory === 'orphans'){
-        const q = String(canvasAssetQuery || '').trim().toLowerCase();
-        let list = (canvasAssetsData.orphanItems || []).slice();
-        if(q) list = list.filter(item => [item.name, item.url, item.kind].join(' ').toLowerCase().includes(q));
-        if(canvasAssetSort === 'name_asc') list.sort((a,b) => String(a.name||'').localeCompare(String(b.name||''), 'zh-Hans-CN', {numeric:true}));
-        else list.sort((a,b) => Number(b.created_at||0) - Number(a.created_at||0));
-        return list;
-    }
     const q = String(canvasAssetQuery || '').trim().toLowerCase();
-    let list = uniqueCanvasAssets(canvasAssetsData.items || []).filter(item => {
-        if((item.canvas_kind || 'classic') !== activeCanvasAssetCategory) return false;
-        if(activeCanvasAssetCanvasId && item.canvas_id !== activeCanvasAssetCanvasId) return false;
+    const sourceItems = activeCanvasAssetCategory === 'orphan'
+        ? (canvasAssetsData.orphanItems || [])
+        : (canvasAssetsData.items || []);
+    let list = uniqueCanvasAssets(sourceItems).filter(item => {
+        if(activeCanvasAssetCategory !== 'orphan' && (item.canvas_kind || 'classic') !== activeCanvasAssetCategory) return false;
+        if(activeCanvasAssetCategory !== 'orphan' && activeCanvasAssetCanvasId && item.canvas_id !== activeCanvasAssetCanvasId) return false;
         if(!q) return true;
         return [
             item.name,
@@ -1036,8 +1275,12 @@ function currentCanvasAssetItems(){
             item.canvas_title,
             item.node_title,
             item.node_type,
+            item.source_type,
+            item.source_path,
             canvasAssetKindLabel(item),
-            canvasKindLabel(item.canvas_kind)
+            canvasKindLabel(item.canvas_kind),
+            '孤立素材',
+            '未属于当前画布'
         ].join(' ').toLowerCase().includes(q);
     });
     list = list.slice();
@@ -1390,7 +1633,8 @@ function normalizeCanvasAssetState(){
     if(
         activeCanvasAssetCanvasId
         && (
-            !activeCanvas
+            activeCanvasAssetCategory === 'orphan'
+            || !activeCanvas
             || (activeCanvas.kind || 'classic') !== activeCanvasAssetCategory
         )
     ) activeCanvasAssetCanvasId = '';
@@ -1399,46 +1643,48 @@ function normalizeCanvasAssetState(){
     if(!selectedCanvasAssetId && items.length) selectedCanvasAssetId = items[0].id;
     selectedCanvasAssetIds = new Set([...selectedCanvasAssetIds].filter(id => findCanvasAssetItem(id)));
 }
-async function refreshCanvasAssets(){
+function applyCanvasAssetsData(data){
+    canvasAssetsData = {
+        categories:Array.isArray(data?.categories) ? data.categories : [],
+        canvases:Array.isArray(data?.canvases) ? data.canvases : [],
+        items:Array.isArray(data?.items) ? data.items : [],
+        orphanItems:Array.isArray(data?.orphan_items) ? data.orphan_items : []
+    };
+    canvasAssetsLoading = false;
+    canvasAssetsLoadError = '';
+    normalizeCanvasAssetState();
+}
+async function refreshCanvasAssets({announce=true}={}){
+    canvasAssetsLoading = true;
+    canvasAssetsLoadError = '';
+    if(announce) setStatus('正在刷新画布资产...');
+    if(activeTab === 'canvas-assets') render();
     try {
-        setStatus('正在刷新画布资产...');
-        const [data, orphanData] = await Promise.all([
-            apiJson('/api/canvas-assets'),
-            apiJson('/api/canvas-assets/orphans').catch(() => ({items:[]}))
-        ]);
-        canvasAssetsData = {
-            categories:Array.isArray(data.categories) ? data.categories : [],
-            canvases:Array.isArray(data.canvases) ? data.canvases : [],
-            items:Array.isArray(data.items) ? data.items : [],
-            orphanItems:Array.isArray(orphanData.items) ? orphanData.items : []
-        };
-        normalizeCanvasAssetState();
+        const data = await apiJson('/api/canvas-assets');
+        applyCanvasAssetsData(data);
         render();
-        setStatus('画布资产已刷新');
+        if(announce) setStatus('画布资产已刷新');
     } catch(err) {
-        setStatus(err.message || '刷新画布资产失败');
+        canvasAssetsLoading = false;
+        canvasAssetsLoadError = err.message || '刷新画布资产失败';
+        if(activeTab === 'canvas-assets') render();
+        if(announce || activeTab === 'canvas-assets') setStatus(canvasAssetsLoadError);
     }
 }
 async function loadAll(){
     setStatus('加载中...');
-    const [assetData, promptData, providerData, canvasAssetData, orphanAssetData] = await Promise.all([
+    const [assetData, promptData, providerData] = await Promise.all([
         apiJson('/api/asset-library'),
         apiJson('/api/prompt-libraries'),
         apiJson('/api/providers').catch(() => ({providers:[]})),
-        apiJson('/api/canvas-assets').catch(() => ({categories:[], canvases:[], items:[]})),
-        apiJson('/api/canvas-assets/orphans').catch(() => ({items:[]})),
         loadSharedFolders(),
         loadLocalAssets()
     ]);
     assetLibrary = assetData.library || {libraries:[], categories:[]};
     promptLibrary = promptData.library || {libraries:[]};
     apiProviders = Array.isArray(providerData.providers) ? providerData.providers : [];
-    canvasAssetsData = {
-        categories:Array.isArray(canvasAssetData.categories) ? canvasAssetData.categories : [],
-        canvases:Array.isArray(canvasAssetData.canvases) ? canvasAssetData.canvases : [],
-        items:Array.isArray(canvasAssetData.items) ? canvasAssetData.items : [],
-        orphanItems:Array.isArray(orphanAssetData.items) ? orphanAssetData.items : []
-    };
+    canvasAssetsLoading = true;
+    canvasAssetsLoadError = '';
     // 刷新时默认回到「角色素材库」
     const libs = assetLibraries();
     activeAssetLibraryId = (libs.find(lib => lib.id === 'default') || libs[0])?.id || '';
@@ -1452,7 +1698,8 @@ async function loadAll(){
     selectedPromptIds.clear();
     selectedCanvasAssetIds.clear();
     render();
-    setStatus('准备就绪');
+    setStatus('已就绪');
+    void refreshCanvasAssets({announce:false});
 }
 function render(){
     const scrollState = [...document.querySelectorAll('.nav-scroll,.content-scroll,.detail-scroll')]
@@ -1507,8 +1754,9 @@ function renderCanvasAssetsManager(){
     normalizeCanvasAssetState();
     const items = currentCanvasAssetItems();
     const groups = groupCanvasAssetItems(items);
-    const total = uniqueCanvasAssets(canvasAssetsData.items || []).length + (canvasAssetsData.orphanItems || []).length;
-    const isOrphans = activeCanvasAssetCategory === 'orphans';
+    const showCanvasOrphanDelete = activeCanvasAssetCategory === 'orphan';
+    const total = uniqueCanvasAssets(canvasAssetsData.items || []).length
+        + uniqueCanvasAssets(canvasAssetsData.orphanItems || []).length;
     const detail = selectedCanvasAsset();
     root.innerHTML = `
         <aside class="asset-panel asset-nav">
@@ -1536,13 +1784,13 @@ function renderCanvasAssetsManager(){
                         <option value="name_asc" ${canvasAssetSort === 'name_asc' ? 'selected' : ''}>资产名称</option>
                         <option value="kind" ${canvasAssetSort === 'kind' ? 'selected' : ''}>类型</option>
                     </select>
-                    <button class="asset-btn ${canvasAssetManageMode ? 'primary' : ''}" type="button" data-canvas-asset-manage ${total ? '' : 'disabled'}><i data-lucide="list-checks"></i><span>${canvasAssetManageMode ? '完成管理' : '批量管理'}</span></button>
+                    <button class="asset-btn ${canvasAssetManageMode ? 'primary' : ''}" type="button" data-canvas-asset-manage ${total && !canvasAssetsLoading ? '' : 'disabled'}><i data-lucide="list-checks"></i><span>${canvasAssetManageMode ? '完成管理' : '批量管理'}</span></button>
                 </div>
             </div>
             <div class="manage-tools">
-                ${isOrphans ? `<button class="asset-btn danger" type="button" data-canvas-orphan-delete-selected ${selectedCanvasAssetIds.size ? '' : 'disabled'}><i data-lucide="trash-2"></i><span>删除所选孤立素材</span></button>` : ''}
                 <span>已选择 ${selectedCanvasAssetIds.size} 个画布资产，支持拖拽框选或逐个勾选。</span>
                 <div class="asset-tools">
+                    ${showCanvasOrphanDelete ? `<button class="asset-btn danger" type="button" data-canvas-asset-delete-selected ${selectedCanvasAssetIds.size ? '' : 'disabled'} title="删除所选（移入 Windows 回收站）"><i data-lucide="trash-2"></i><span>删除所选</span></button>` : ''}
                     <button class="asset-btn" type="button" data-canvas-asset-select-all ${items.length ? '' : 'disabled'}><i data-lucide="check-square"></i><span>${selectionToggleLabel(items, selectedCanvasAssetIds)}</span></button>
                     <button class="asset-btn primary" type="button" data-canvas-asset-download-selected ${selectedCanvasAssetIds.size ? '' : 'disabled'}><i data-lucide="download"></i><span>下载所选</span></button>
                 </div>
@@ -1550,7 +1798,11 @@ function renderCanvasAssetsManager(){
             <div class="content-scroll">
                 <div class="asset-grid">
                     ${groups.map(group => renderCanvasAssetGroup(group)).join('')}
-                    ${items.length ? '' : '<div class="empty-state">当前分类没有可下载的画布资产。可以点击“刷新资源”，或在画布中生成/导入图片、视频、音频后再查看。</div>'}
+                    ${canvasAssetsLoading
+                        ? '<div class="empty-state"><i data-lucide="loader-2"></i><span>正在读取画布资产…</span></div>'
+                        : canvasAssetsLoadError
+                            ? `<div class="empty-state"><i data-lucide="circle-alert"></i><span>${escapeHtml(canvasAssetsLoadError)}<br>可以点击“刷新资源”重试。</span></div>`
+                            : items.length ? '' : '<div class="empty-state">当前分类没有可下载的画布资产。可以点击“刷新资源”，或在画布中生成/导入图片、视频、音频后再查看。</div>'}
                 </div>
             </div>
         </section>
@@ -1560,11 +1812,11 @@ function renderCanvasAssetsManager(){
     `;
 }
 function renderCanvasAssetTreeBranch(cat){
-    if(cat.id === 'orphans'){
-        const active = cat.id === activeCanvasAssetCategory && !activeCanvasAssetCanvasId;
-        return `<div class="tree-branch orphan-branch">
-            <button class="tree-row tree-parent ${active ? 'active' : ''}" type="button" data-canvas-asset-cat="orphans">
-                <span class="tree-row-icon"><i data-lucide="trash-2"></i></span>
+    if(cat.id === 'orphan'){
+        const active = cat.id === activeCanvasAssetCategory;
+        return `<div class="tree-branch ${active ? 'expanded' : ''}">
+            <button class="tree-row tree-parent ${active ? 'active' : ''}" type="button" data-canvas-asset-cat="orphan">
+                <span class="tree-row-icon"><i data-lucide="archive"></i></span>
                 <span class="tree-row-name">${escapeHtml(cat.name || '孤立素材')}</span>
                 <span class="tree-row-count">${Number(cat.count || 0)}</span>
             </button>
@@ -1609,13 +1861,12 @@ function renderCanvasAssetGroup(group){
     </section>`;
 }
 function renderCanvasAssetCard(item){
-    const orphan = !item.canvas_id;
     return `<article class="asset-card canvas-asset-card ${item.id === selectedCanvasAssetId ? 'active' : ''}" data-canvas-asset-card="${escapeAttr(item.id)}">
         <input class="asset-card-check" type="checkbox" data-canvas-asset-check="${escapeAttr(item.id)}" ${selectedCanvasAssetIds.has(item.id) ? 'checked' : ''}>
         <div class="asset-thumb canvas-asset-thumb">${assetThumb(item)}${renderCanvasAssetKindBadge(item)}</div>
         <div class="asset-card-body">
             <div class="asset-card-name" title="${escapeAttr(item.name || '')}">${escapeHtml(item.name || 'canvas asset')}</div>
-            <div class="asset-card-meta">${escapeHtml(canvasAssetKindLabel(item))} · ${escapeHtml(orphan ? '未被画布引用' : (item.canvas_title || '未命名画布'))}</div>
+            <div class="asset-card-meta">${escapeHtml(canvasAssetKindLabel(item))} · ${escapeHtml(item.canvas_title || '未命名画布')}</div>
         </div>
     </article>`;
 }
@@ -1628,15 +1879,14 @@ function renderCanvasAssetDetail(item){
     if(!item) return `<div class="panel-head"><div class="panel-title"><strong>画布资产详情</strong><span>选择一个画布资产查看详情</span></div></div><div class="detail-scroll"><div class="detail-empty"><i data-lucide="layout-dashboard"></i><span>暂无画布资产</span></div></div>`;
     const kind = assetKind(item);
     const canPreview = ['image','video'].includes(kind);
-    const orphan = !item.canvas_id;
+    const isOrphan = item.canvas_kind === 'orphan';
     return `
         <div class="panel-head">
-            <div class="panel-title"><strong>画布资产详情</strong><span>${escapeHtml(canvasAssetKindLabel(item))}</span></div>
+            <div class="panel-title"><strong>画布资产详情</strong><span>${escapeHtml(isOrphan ? '未属于当前画布' : canvasAssetKindLabel(item))}</span></div>
             <div class="panel-actions">
                 ${canPreview ? `<button class="asset-icon-btn" type="button" data-canvas-asset-preview="${escapeAttr(item.id)}" title="${kind === 'video' ? '预览视频' : '放大预览'}"><i data-lucide="${kind === 'video' ? 'play' : 'maximize-2'}"></i></button>` : ''}
                 <button class="asset-icon-btn" type="button" data-canvas-asset-open="${escapeAttr(item.id)}" title="打开链接"><i data-lucide="external-link"></i></button>
                 <button class="asset-icon-btn" type="button" data-canvas-asset-copy="${escapeAttr(item.id)}" title="复制链接"><i data-lucide="copy"></i></button>
-                ${orphan ? `<button class="asset-icon-btn danger" type="button" data-canvas-orphan-delete-one="${escapeAttr(item.id)}" title="删除本地文件"><i data-lucide="trash-2"></i></button>` : ''}
                 <button class="asset-btn primary" type="button" data-canvas-asset-download="${escapeAttr(item.id)}"><i data-lucide="download"></i><span>下载</span></button>
             </div>
         </div>
@@ -1650,11 +1900,11 @@ function renderCanvasAssetDetail(item){
                 <div class="detail-name">${escapeHtml(item.name || '画布资产')}</div>
                 <div class="detail-meta-grid">
                     <div class="detail-meta"><span>类型</span><strong>${escapeHtml(canvasAssetKindLabel(item))}</strong></div>
-                    <div class="detail-meta"><span>画布分类</span><strong>${escapeHtml(orphan ? '孤立素材' : canvasKindLabel(item.canvas_kind))}</strong></div>
-                    <div class="detail-meta"><span>来源画布</span><strong title="${escapeAttr(item.canvas_title || '')}">${escapeHtml(orphan ? '未被任何画布引用' : (item.canvas_title || '未命名画布'))}</strong></div>
+                    <div class="detail-meta"><span>${isOrphan ? '素材归属' : '画布分类'}</span><strong>${escapeHtml(isOrphan ? '未属于当前画布' : canvasKindLabel(item.canvas_kind))}</strong></div>
+                    <div class="detail-meta"><span>${isOrphan ? '来源证据' : '来源画布'}</span><strong title="${escapeAttr(isOrphan ? (item.source_path || '') : (item.canvas_title || ''))}">${escapeHtml(isOrphan ? (item.source_type === 'canvas-log' ? '画布日志' : '画布历史') : (item.canvas_title || '未命名画布'))}</strong></div>
                     <div class="detail-meta"><span>更新时间</span><strong>${escapeHtml(formatDate(item.canvas_updated_at || item.created_at))}</strong></div>
-                    <div class="detail-meta"><span>来源节点</span><strong title="${escapeAttr(item.node_title || item.node_type || '')}">${escapeHtml(item.node_title || item.node_type || '节点')}</strong></div>
-                    <div class="detail-meta"><span>节点类型</span><strong>${escapeHtml(item.node_type || '-')}</strong></div>
+                    <div class="detail-meta"><span>${isOrphan ? '说明' : '来源节点'}</span><strong title="${escapeAttr(item.node_title || item.node_type || '')}">${escapeHtml(isOrphan ? '可批量移入 Windows 回收站' : (item.node_title || item.node_type || '节点'))}</strong></div>
+                    <div class="detail-meta"><span>${isOrphan ? '节点类型' : '节点类型'}</span><strong>${escapeHtml(item.node_type || (isOrphan ? '—' : '-'))}</strong></div>
                 </div>
                 <div class="detail-url">${escapeHtml(item.url || '')}</div>
             </div>
@@ -2783,6 +3033,34 @@ async function downloadCanvasAssetItems(ids){
     setTimeout(() => URL.revokeObjectURL(link.href), 1200);
     setStatus(`已下载 ${items.length} 个画布资产`);
 }
+async function deleteSelectedCanvasAssetsToRecycleBin(){
+    if(activeCanvasAssetCategory !== 'orphan' || !selectedCanvasAssetIds.size) return;
+    const items = [...selectedCanvasAssetIds]
+        .map(id => findCanvasAssetItem(id))
+        .filter(item => item?.canvas_kind === 'orphan' && item.url);
+    if(!items.length) return;
+    const urls = items.map(item => item.url);
+    const data = await apiJson('/api/canvas-assets/orphans/delete', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({urls})
+    });
+    const deletedUrls = new Set((data.deleted || []).map(url => String(url || '')));
+    canvasAssetsData.orphanItems = (canvasAssetsData.orphanItems || [])
+        .filter(item => !deletedUrls.has(String(item?.url || '')));
+    canvasAssetsData.categories = (canvasAssetsData.categories || []).map(category => (
+        category?.id === 'orphan'
+            ? {...category, count:canvasAssetsData.orphanItems.length, canvas_count:0}
+            : category
+    ));
+    selectedCanvasAssetIds.clear();
+    selectedCanvasAssetId = '';
+    normalizeCanvasAssetState();
+    render();
+    const deleted = Number(data.deleted?.length || 0);
+    const skipped = Number(data.skipped?.length || 0);
+    setStatus(skipped ? `已移入回收站 ${deleted} 个，跳过 ${skipped} 个` : `已将 ${deleted} 个素材移入 Windows 回收站`);
+}
 function assetDownloadName(item){
     let name = String(item?.name || 'asset');
     const urlPath = String(item?.url || '').split('?')[0];
@@ -3294,6 +3572,19 @@ async function saveLocalUploadCaption(id){
 }
 async function handleClick(event){
     const target = event.target;
+    if(target.closest?.('[data-storage-cleanup-close]')){ closeStorageCleanupDialog(); return; }
+    if(target.closest?.('[data-storage-cleanup-back]')){
+        storageCleanupState.step = 'choose';
+        storageCleanupState.kind = 'all';
+        storageCleanupState.confirmationId = '';
+        storageCleanupState.summary = null;
+        storageCleanupState.samples = [];
+        storageCleanupState.error = '';
+        renderStorageCleanupDialog();
+        return;
+    }
+    if(target.closest?.('[data-storage-cleanup-scan]')){ await previewStorageCleanup(); return; }
+    if(target.closest?.('[data-storage-cleanup-confirm]')){ await confirmStorageCleanup(); return; }
     if(target.closest?.('[data-storage-close]')){ closeStorageSettings(); return; }
     const prefTabBtn = target.closest?.('[data-pref-tab]');
     if(prefTabBtn){
@@ -3555,6 +3846,7 @@ async function handleClick(event){
         activeCanvasAssetCanvasId = '';
         selectedCanvasAssetId = '';
         selectedCanvasAssetIds.clear();
+        pendingBatchDelete = '';
         render();
         return;
     }
@@ -3564,53 +3856,21 @@ async function handleClick(event){
         activeCanvasAssetCanvasId = canvasAssetCanvas.dataset.canvasAssetCanvas || '';
         selectedCanvasAssetId = '';
         selectedCanvasAssetIds.clear();
+        pendingBatchDelete = '';
         render();
         return;
     }
     if(target.closest?.('[data-canvas-asset-manage]')){
         canvasAssetManageMode = !canvasAssetManageMode;
         if(!canvasAssetManageMode) selectedCanvasAssetIds.clear();
+        pendingBatchDelete = '';
         render();
         return;
     }
     if(target.closest?.('[data-canvas-asset-refresh]')){ await refreshCanvasAssets(); return; }
-    if(target.closest?.('[data-canvas-asset-select-all]')){ toggleSelectionAll(currentCanvasAssetItems(), selectedCanvasAssetIds); render(); return; }
+    if(target.closest?.('[data-canvas-asset-delete-selected]')){ await deleteSelectedCanvasAssetsToRecycleBin(); return; }
+    if(target.closest?.('[data-canvas-asset-select-all]')){ toggleSelectionAll(currentCanvasAssetItems(), selectedCanvasAssetIds); pendingBatchDelete = ''; render(); return; }
     if(target.closest?.('[data-canvas-asset-download-selected]')){ await downloadCanvasAssetItems([...selectedCanvasAssetIds]); return; }
-    if(target.closest?.('[data-canvas-orphan-delete-selected]')){
-        const selected = [...selectedCanvasAssetIds]
-            .map(id => findCanvasAssetItem(id))
-            .filter(item => item && !item.canvas_id);
-        if(!selected.length) return;
-        if(!confirm(`确定删除选中的 ${selected.length} 个孤立素材？文件将从本地磁盘删除。`)) return;
-        try {
-            await apiJson('/api/canvas-assets/orphans/delete', {
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({urls:selected.map(item => item.url)})
-            });
-            selectedCanvasAssetIds.clear();
-            selectedCanvasAssetId = '';
-            await refreshCanvasAssets();
-        } catch(err){ setStatus(err.message || '删除孤立素材失败'); }
-        return;
-    }
-    const orphanDeleteOne = target.closest?.('[data-canvas-orphan-delete-one]');
-    if(orphanDeleteOne){
-        const item = findCanvasAssetItem(orphanDeleteOne.dataset.canvasOrphanDeleteOne || '');
-        if(!item || item.canvas_id) return;
-        if(!confirm(`确定删除“${item.name || '此素材'}”？文件将从本地磁盘删除。`)) return;
-        try {
-            await apiJson('/api/canvas-assets/orphans/delete', {
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({urls:[item.url]})
-            });
-            selectedCanvasAssetIds.delete(item.id);
-            selectedCanvasAssetId = '';
-            await refreshCanvasAssets();
-        } catch(err){ setStatus(err.message || '删除孤立素材失败'); }
-        return;
-    }
     const canvasAssetDownload = target.closest?.('[data-canvas-asset-download]');
     if(canvasAssetDownload){ await downloadCanvasAssetItems([canvasAssetDownload.dataset.canvasAssetDownload || '']); return; }
     const canvasAssetOpen = target.closest?.('[data-canvas-asset-open]');
@@ -3625,6 +3885,7 @@ async function handleClick(event){
             const id = canvasAssetCheck.dataset.canvasAssetCheck || '';
             const selected = toggleSelectionSet(selectedCanvasAssetIds, id);
             selectedCanvasAssetId = selected ? id : (selectedCanvasAssetId === id ? '' : selectedCanvasAssetId);
+            pendingBatchDelete = '';
             refreshCanvasAssetSelectionOnly();
         }
         return;
@@ -3635,6 +3896,7 @@ async function handleClick(event){
         if(canvasAssetManageMode){
             const selected = toggleSelectionSet(selectedCanvasAssetIds, id);
             selectedCanvasAssetId = selected ? id : (selectedCanvasAssetId === id ? '' : selectedCanvasAssetId);
+            pendingBatchDelete = '';
         } else {
             selectedCanvasAssetId = id;
         }
@@ -4791,7 +5053,7 @@ root.addEventListener('click', event => {
     handleClick(event).catch(err => setStatus(err.message || '操作失败'));
 });
 document.addEventListener('click', event => {
-    if(event.target.closest?.('#storageSettingsOverlay')){
+    if(event.target.closest?.('#storageSettingsOverlay,#storageCleanupOverlay')){
         handleClick(event).catch(err => setStatus(err.message || '操作失败'));
         return;
     }
@@ -4813,7 +5075,13 @@ window.PromptTemplateThumbnails?.mount({
     onSuccess:message => setStatus(message || '缩略图已保存')
 });
 document.addEventListener('keydown', event => {
-    if(event.key === 'Escape') closeDetailPreview();
+    if(event.key === 'Escape'){
+        closeDetailPreview();
+        if(storageCleanupState.open && !storageCleanupState.pending){
+            event.preventDefault();
+            closeStorageCleanupDialog();
+        }
+    }
     if(event.target?.id === 'assetTreeEditInput'){
         if(event.key === 'Enter'){ event.preventDefault(); saveAssetTreeEdit().catch(err => setStatus(err.message || '保存失败')); }
         if(event.key === 'Escape'){ event.preventDefault(); assetTreeEdit = null; render(); }
@@ -5088,6 +5356,7 @@ document.querySelectorAll('[data-tab]').forEach(btn => {
 });
 refreshBtn?.addEventListener('click', () => loadAll().catch(err => setStatus(err.message || '加载失败')));
 storageSettingsBtn?.addEventListener('click', () => openStorageSettings().catch(err => setStatus(err.message || '打开偏好设置失败')));
+storageCleanupBtn?.addEventListener('click', openStorageCleanupDialog);
 window.addEventListener('message', event => {
     if(event.data?.type === 'studio-theme') window.StudioTheme?.apply?.(event.data.theme);
 });

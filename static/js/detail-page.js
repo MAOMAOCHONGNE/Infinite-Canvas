@@ -88,6 +88,10 @@ const detailRuntime = {
     draftBaseline:'',
     pendingSubmission:null,
     renamingTaskId:'',
+    deletingTaskId:'',
+    deletingScreenNo:0,
+    cleanupJobs:new Map(),
+    deleteDialogTaskId:'',
     promptEditorScreenNo:0,
     screenDragNo:0,
     viewer:{items:[], screenIndex:0, candidateIndex:0, scale:1, x:0, y:0, dragging:false, startX:0, startY:0, startOffsetX:0, startOffsetY:0, pointers:new Map(), pinchDistance:0},
@@ -920,6 +924,8 @@ function detailScreenCard(screen, locked){
     const imageUrl = detailResultImage(screen);
     const candidates = detailScreenCandidates(screen);
     const selectedCandidate = detailSelectedCandidateIndex(screen);
+    const deletingScreen = detailRuntime.deletingScreenNo === Number(screen.screen_no);
+    const cardLocked = locked || deletingScreen;
     const flags = [
         screen.use_model ? `<span class="screen-flag model">${screen.pose_mode === 'specific' ? '特定姿态' : '模特'}</span>` : '',
         screen.is_reversal ? '<span class="screen-flag reversal">反转屏</span>' : '',
@@ -932,20 +938,20 @@ function detailScreenCard(screen, locked){
         const classes = [status, index === selectedCandidate ? 'active' : ''].filter(Boolean).join(' ');
         const title = status === 'succeeded' ? `选择候选 ${index + 1}` : detailEscapeHtml(candidate?.error || (status === 'failed' ? '候选失败' : status === 'unknown' ? '结果未知' : '候选生成中'));
         const stateLabel = status === 'succeeded' ? '生成成功' : status === 'failed' ? '生成失败' : status === 'unknown' ? '待回补' : '生成中';
-        const selector = `<button type="button" data-select-candidate="${index}" data-screen="${screen.screen_no}" class="${classes}" ${status !== 'succeeded' || locked ? 'disabled' : ''} title="${title}" aria-label="候选 ${index + 1}，${stateLabel}">${index + 1}</button>`;
+        const selector = `<button type="button" data-select-candidate="${index}" data-screen="${screen.screen_no}" class="${classes}" ${status !== 'succeeded' || cardLocked ? 'disabled' : ''} title="${title}" aria-label="候选 ${index + 1}，${stateLabel}">${index + 1}</button>`;
         const recover = status === 'unknown' && candidate?.upstream_task_id
-            ? `<button type="button" class="candidate-recover-action" data-recover-candidate="${detailEscapeHtml(candidate.id || '')}" data-screen="${screen.screen_no}" ${locked ? 'disabled' : ''} title="只查询原上游任务，不会重新生图">回补</button>`
+            ? `<button type="button" class="candidate-recover-action" data-recover-candidate="${detailEscapeHtml(candidate.id || '')}" data-screen="${screen.screen_no}" ${cardLocked ? 'disabled' : ''} title="只查询原上游任务，不会重新生图">回补</button>`
             : '';
         return selector + recover;
     }).join('')}</div>` : '';
     const error = screen.error ? `<p class="screen-error">${detailEscapeHtml(screen.error)}</p>` : '';
-    const regenerationLocked = detailScreenRegenerationLocked(screen);
-    return `<article class="result-card" data-screen-no="${screen.screen_no}" draggable="${locked ? 'false' : 'true'}">
+    const regenerationLocked = detailScreenRegenerationLocked(screen) || deletingScreen;
+    return `<article class="result-card" data-screen-no="${screen.screen_no}" draggable="${cardLocked ? 'false' : 'true'}">
         <header class="screen-card-head"><div class="screen-card-title"><span class="screen-number">第 ${screen.screen_no} 屏 · ${detailEscapeHtml(screen.screen_type || '详情页')}</span><strong>${detailEscapeHtml(screen.title)}</strong></div><div class="screen-card-meta"><span class="screen-state ${detailEscapeHtml(screen.status)}">${detailEscapeHtml(detailScreenStatusLabel(screen.status))}</span>${flags ? `<div class="screen-flags">${flags}</div>` : ''}</div></header>
         ${preview}
         ${candidateStrip}
         ${error}
-        <footer class="screen-card-actions"><button type="button" data-open-prompt="${screen.screen_no}"><i data-lucide="file-text"></i><span>提示词</span></button><button type="button" data-screen-params="${screen.screen_no}" ${locked ? 'disabled' : ''} title="单屏参数"><i data-lucide="sliders-horizontal"></i></button><button type="button" data-regenerate-screen="${screen.screen_no}" data-count="1" ${regenerationLocked ? 'disabled' : ''}><i data-lucide="refresh-cw"></i><span>重刷</span></button><button type="button" data-delete-screen="${screen.screen_no}" ${locked ? 'disabled' : ''} title="删除分屏"><i data-lucide="trash-2"></i></button></footer>
+        <footer class="screen-card-actions"><button type="button" data-open-prompt="${screen.screen_no}" ${deletingScreen ? 'disabled' : ''}><i data-lucide="file-text"></i><span>提示词</span></button><button type="button" data-screen-params="${screen.screen_no}" ${cardLocked ? 'disabled' : ''} title="单屏参数"><i data-lucide="sliders-horizontal"></i></button><button type="button" data-regenerate-screen="${screen.screen_no}" data-count="1" ${regenerationLocked ? 'disabled' : ''}><i data-lucide="refresh-cw"></i><span>重刷</span></button><button type="button" data-delete-screen="${screen.screen_no}" ${cardLocked ? 'disabled' : ''} aria-busy="${deletingScreen ? 'true' : 'false'}" title="${deletingScreen ? '删除中…' : '删除分屏'}"><i data-lucide="${deletingScreen ? 'loader-circle' : 'trash-2'}"></i>${deletingScreen ? '<span>删除中…</span>' : ''}</button></footer>
     </article>`;
 }
 
@@ -979,7 +985,7 @@ function detailRenderTask(){
     const completed = screens.filter(screen => ['succeeded', 'failed', 'unknown', 'cancelled', 'interrupted'].includes(screen.status)).length;
     document.getElementById('resultCount').textContent = screens.length ? `${completed}/${screens.length} 屏` : '0 屏';
     const resultStatus = document.getElementById('resultStatus');
-    resultStatus.textContent = detailTaskStatusLabel(status);
+    resultStatus.textContent = detailRuntime.deletingTaskId === String(task?.id || '') ? '删除中…' : detailTaskStatusLabel(status);
     resultStatus.dataset.status = status;
     const llmTrace = document.getElementById('llmTrace');
     const llmTraceText = detailLlmTraceLabel(task);
@@ -993,7 +999,12 @@ function detailRenderTask(){
     cancelButton.hidden = !active;
     const resumable = screens.some(screen => ['failed', 'cancelled', 'interrupted', 'queued'].includes(screen.status));
     document.getElementById('resumeTaskBtn').hidden = active || !resumable;
-    document.getElementById('deleteTaskBtn').disabled = !task || active;
+    const deleting = Boolean(task && detailRuntime.deletingTaskId === String(task.id || ''));
+    const deleteButton = document.getElementById('deleteTaskBtn');
+    deleteButton.disabled = !task || active || Boolean(detailRuntime.deletingTaskId) || Boolean(detailRuntime.deletingScreenNo);
+    deleteButton.setAttribute('aria-busy', deleting ? 'true' : 'false');
+    deleteButton.title = deleting ? '删除中…' : '删除当前分组';
+    deleteButton.setAttribute('aria-label', deleting ? '删除中…' : '删除当前分组');
     const hasImages = screens.some(screen => detailResultImage(screen));
     document.getElementById('collageBtn').disabled = !hasImages;
     document.getElementById('downloadAllBtn').disabled = !hasImages;
@@ -1085,6 +1096,9 @@ function detailForgetTask(taskId){
     detailRuntime.activeTaskIds.delete(id);
     detailRuntime.taskCache.delete(id);
     detailRuntime.history = detailRuntime.history.filter(task => String(task?.id) !== id);
+    if(detailRuntime.deletingTaskId === id) detailRuntime.deletingTaskId = '';
+    detailRuntime.deletingScreenNo = 0;
+    if(!detailRuntime.activeTaskIds.size) detailStopPolling();
 }
 
 function detailStopPolling(){
@@ -1106,6 +1120,7 @@ async function detailPollTasks(immediate=false){
         })));
         results.forEach((result, index) => {
             const taskId = taskIds[index];
+            if(!detailRuntime.activeTaskIds.has(taskId) && detailRuntime.deletingTaskId !== taskId) return;
             if(result.status === 'fulfilled'){
                 detailRememberTask(result.value.task);
                 if(taskId === detailRuntime.viewTaskId) viewedChanged = true;
@@ -1420,13 +1435,43 @@ async function detailRegenerateScreen(screenNo, count=1){
 }
 
 async function detailDeleteScreen(screenNo){
-    if(!window.confirm(`删除第 ${screenNo} 屏及其候选结果？`)) return;
+    const deletedId = String(detailRuntime.viewTaskId || '');
+    const targetNo = Number(screenNo);
+    if(!deletedId || !targetNo || detailTaskIsActive() || detailRuntime.deletingTaskId || detailRuntime.deletingScreenNo) return;
+    if(!window.confirm(`删除第 ${targetNo} 屏及其候选结果？`)) return;
+    detailRuntime.deletingScreenNo = targetNo;
+    detailRenderTask();
     try {
-        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(detailRuntime.viewTaskId)}/screens/${screenNo}`, {method:'DELETE'});
-        detailRememberTask(task);
-        detailRuntime.promptDrafts.delete(screenNo);
-        detailRenderTask();
+        const result = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(deletedId)}/screens/${targetNo}`, {method:'DELETE'});
+        detailRuntime.promptDrafts.delete(targetNo);
+        detailRuntime.deletingScreenNo = 0;
+        const deletedLabel = result?.task_deleted ? '分组' : '分屏';
+        if(result?.task_deleted){
+            detailForgetTask(deletedId);
+            detailRuntime.viewTaskId = '';
+            detailRuntime.task = null;
+            detailRuntime.promptDrafts.clear();
+            detailRenderHistory();
+            detailRenderTask();
+            const nextId = detailRuntime.history[0]?.id;
+            if(nextId) void detailOpenHistoryTask(nextId, {skipConfirm:true});
+        } else {
+            if(!result?.task) throw new Error('删除响应缺少更新后的详情页任务');
+            detailRememberTask(result.task, {select:true});
+            detailRenderHistory();
+            detailRenderTask();
+        }
+        if(result?.cleanup_job_id){
+            detailShowToast(`${deletedLabel}已删除，图片正在后台清理`);
+            detailTrackCleanupJob(result.cleanup_job_id, deletedLabel);
+        } else detailShowToast(`${deletedLabel}已删除`);
     } catch(error) { detailShowToast(error.message || '删除分屏失败', 'error'); }
+    finally {
+        if(detailRuntime.deletingScreenNo === targetNo){
+            detailRuntime.deletingScreenNo = 0;
+            detailRenderTask();
+        }
+    }
 }
 
 function detailBindScreenReorder(){
@@ -1540,7 +1585,8 @@ async function detailOpenHistoryTask(taskId, options={}){
         return;
     }
     try {
-        const task = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(taskId)}`);
+        const cached = detailRuntime.taskCache.get(String(taskId));
+        const task = cached || await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(taskId)}`);
         detailRuntime.renamingTaskId = '';
         detailRememberTask(task, {select:true});
         detailRuntime.promptDrafts.clear();
@@ -1560,17 +1606,94 @@ async function detailResumeTask(){
     } catch(error) { detailShowToast(error.message || '恢复失败', 'error'); }
 }
 
-async function detailDeleteTask(){
-    if(!detailRuntime.viewTaskId || detailTaskIsActive() || !window.confirm('删除当前详情页分组？')) return;
+function detailDeleteTask(){
+    if(!detailRuntime.viewTaskId || detailTaskIsActive() || detailRuntime.deletingTaskId || detailRuntime.deletingScreenNo) return;
+    const dialog = document.getElementById('deleteTaskDialog');
+    const cancelButton = document.getElementById('deleteTaskCancelBtn');
+    if(!dialog?.showModal) return;
+    detailRuntime.deleteDialogTaskId = detailRuntime.viewTaskId;
+    dialog.showModal();
+    requestAnimationFrame(() => cancelButton?.focus());
+}
+
+async function detailConfirmDeleteTask(){
+    const deletedId = String(detailRuntime.deleteDialogTaskId || detailRuntime.viewTaskId || '');
+    const dialog = document.getElementById('deleteTaskDialog');
+    if(!deletedId || !dialog || detailRuntime.deletingTaskId || detailRuntime.deletingScreenNo) return;
+    dialog.close('confirm');
+    detailRuntime.deleteDialogTaskId = '';
+    const deleteButton = document.getElementById('deleteTaskBtn');
+    detailRuntime.deletingTaskId = deletedId;
+    if(deleteButton){
+        deleteButton.disabled = true;
+        deleteButton.setAttribute('aria-busy', 'true');
+        deleteButton.title = '删除中…';
+        deleteButton.setAttribute('aria-label', '删除中…');
+    }
+    detailRenderTask();
     try {
-        const deletedId = detailRuntime.viewTaskId;
-        await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(deletedId)}`, {method:'DELETE'});
+        const result = await detailFetchJson(`/api/detail-page-tasks/${encodeURIComponent(deletedId)}`, {method:'DELETE'});
         detailForgetTask(deletedId);
         detailRuntime.viewTaskId = ''; detailRuntime.task = null; detailRuntime.promptDrafts.clear();
+        detailRuntime.deletingTaskId = '';
+        detailRenderHistory(); detailRenderTask();
+        if(result?.cleanup_job_id){
+            detailShowToast('分组已删除，图片正在后台清理');
+            detailTrackCleanupJob(result.cleanup_job_id);
+        } else detailShowToast('分组已删除');
         const nextId = detailRuntime.history[0]?.id;
-        if(nextId) await detailOpenHistoryTask(nextId, {skipConfirm:true});
-        else { detailRenderHistory(); detailRenderTask(); }
+        if(nextId) void detailOpenHistoryTask(nextId, {skipConfirm:true});
     } catch(error) { detailShowToast(error.message || '删除分组失败', 'error'); }
+    finally {
+        if(detailRuntime.deletingTaskId === deletedId){
+            detailRuntime.deletingTaskId = '';
+            detailRenderTask();
+        }
+    }
+}
+
+function detailCancelDeleteTask(){
+    detailRuntime.deleteDialogTaskId = '';
+    const dialog = document.getElementById('deleteTaskDialog');
+    if(dialog?.open) dialog.close('cancel');
+    document.getElementById('deleteTaskBtn')?.focus();
+}
+
+function detailTrackCleanupJob(jobId, deletedLabel='分组'){
+    const id = String(jobId || '').trim();
+    if(!id || detailRuntime.cleanupJobs.has(id)) return;
+    const state = {failedNotified:false, timer:0, deletedLabel:String(deletedLabel || '记录')};
+    detailRuntime.cleanupJobs.set(id, state);
+    void detailPollCleanupJob(id, state);
+}
+
+async function detailPollCleanupJob(jobId, state){
+    if(detailRuntime.cleanupJobs.get(jobId) !== state) return;
+    try {
+        const job = await detailFetchJson(`/api/storage-cleanup/jobs/${encodeURIComponent(jobId)}`);
+        if(job?.status === 'failed' && !state.failedNotified){
+            state.failedNotified = true;
+            detailShowToast(`${state.deletedLabel}已删除，图片将在后台重试清理`, 'error');
+        }
+        if(job?.status === 'review_required'){
+            detailRuntime.cleanupJobs.delete(jobId);
+            detailShowToast(`${state.deletedLabel}已删除，旧图片需重新审计确认后清理`, 'error');
+            return;
+        }
+        if(job?.status === 'succeeded'){
+            detailRuntime.cleanupJobs.delete(jobId);
+            detailShowToast(`${state.deletedLabel}已删除，图片清理完成`);
+            return;
+        }
+        state.timer = window.setTimeout(() => void detailPollCleanupJob(jobId, state), job?.status === 'failed' ? 5000 : 1500);
+    } catch(error){
+        if(Number(error?.status) === 404){
+            detailRuntime.cleanupJobs.delete(jobId);
+            detailShowToast(`${state.deletedLabel}已删除，图片清理完成`);
+            return;
+        }
+        state.timer = window.setTimeout(() => void detailPollCleanupJob(jobId, state), 5000);
+    }
 }
 
 function detailDownloadAll(){
@@ -1679,6 +1802,10 @@ function detailBindControls(){
     document.getElementById('cancelTaskBtn').addEventListener('click', detailCancelTask);
     document.getElementById('resumeTaskBtn').addEventListener('click', detailResumeTask);
     document.getElementById('deleteTaskBtn').addEventListener('click', detailDeleteTask);
+    document.getElementById('deleteTaskCancelBtn').addEventListener('click', detailCancelDeleteTask);
+    document.getElementById('deleteTaskConfirmBtn').addEventListener('click', detailConfirmDeleteTask);
+    document.getElementById('deleteTaskDialog').addEventListener('cancel', () => { detailRuntime.deleteDialogTaskId = ''; });
+    document.getElementById('deleteTaskDialog').addEventListener('close', () => { if(!detailRuntime.deletingTaskId) document.getElementById('deleteTaskBtn')?.focus(); });
     document.getElementById('collageBtn').addEventListener('click', detailCollage);
     document.getElementById('downloadAllBtn').addEventListener('click', detailDownloadAll);
     document.getElementById('requestPreviewBtn').addEventListener('click', () => { const panel = document.getElementById('requestPreview'); if(!panel.hidden) panel.open = !panel.open; });

@@ -11,6 +11,12 @@
 
     function asArray(value){ return Array.isArray(value) ? value : []; }
     function itemId(item){ return String(item?.id || ''); }
+    function imageGenerationModesAvailable(options={}){
+        const value = options.image_generation_modes;
+        return value === true || Boolean(value && typeof value === 'object' && (
+            value.available === true || Number(value.mode_count || value.count || 0) > 0 || Number(value.example_count || 0) > 0
+        ));
+    }
     function storageRef(){
         try { return globalThis.localStorage || null; } catch(_error){ return null; }
     }
@@ -57,6 +63,8 @@
         const workflows = asArray(options.runninghub?.workflows);
         const promptLibraries = asArray(options.prompt_libraries);
         const detailPages = asArray(options.detail_pages);
+        const mainImages = asArray(options.main_images);
+        const imageGenerations = asArray(options.image_generations);
         const projectCanvases = new Map();
         projects.forEach(project => projectCanvases.set(itemId(project), asArray(project.canvases).map(itemId).filter(Boolean)));
         return {
@@ -69,6 +77,9 @@
             runninghubWorkflowIds:new Set(workflows.map(itemId).filter(Boolean)),
             promptLibraryIds:new Set(promptLibraries.map(itemId).filter(Boolean)),
             detailPageTaskIds:new Set(detailPages.map(itemId).filter(Boolean)),
+            mainImageTaskIds:new Set(mainImages.map(itemId).filter(Boolean)),
+            imageGenerationTaskIds:new Set(imageGenerations.map(itemId).filter(Boolean)),
+            includeImageGenerationModes:imageGenerationModesAvailable(options),
             includeAssets:true,
             includePreferences:Boolean(options.preferences?.available),
         };
@@ -99,6 +110,12 @@
     function setDetailPageSelected(state, taskId, selected){
         setIdsSelected(state.detailPageTaskIds, [taskId], selected);
     }
+    function setMainImageSelected(state, taskId, selected){
+        setIdsSelected(state.mainImageTaskIds, [taskId], selected);
+    }
+    function setImageGenerationSelected(state, taskId, selected){
+        setIdsSelected(state.imageGenerationTaskIds, [taskId], selected);
+    }
     function setIdsSelected(target, ids, selected){
         ids.forEach(id => selected ? target.add(String(id)) : target.delete(String(id)));
     }
@@ -116,6 +133,9 @@
         setIdsSelected(state.runninghubWorkflowIds, asArray(state.options.runninghub?.workflows).map(itemId), selected);
         setIdsSelected(state.promptLibraryIds, asArray(state.options.prompt_libraries).map(itemId), selected);
         setIdsSelected(state.detailPageTaskIds, asArray(state.options.detail_pages).map(itemId), selected);
+        setIdsSelected(state.mainImageTaskIds, asArray(state.options.main_images).map(itemId), selected);
+        setIdsSelected(state.imageGenerationTaskIds, asArray(state.options.image_generations).map(itemId), selected);
+        state.includeImageGenerationModes = selected && imageGenerationModesAvailable(state.options);
         state.includeAssets = selected;
         state.includePreferences = selected && Boolean(state.options.preferences?.available);
     }
@@ -127,6 +147,9 @@
         if(asArray(state.options.runninghub?.workflows).length) flags.push(idsSelectionState(state.runninghubWorkflowIds, asArray(state.options.runninghub.workflows).map(itemId)));
         if(asArray(state.options.prompt_libraries).length) flags.push(idsSelectionState(state.promptLibraryIds, asArray(state.options.prompt_libraries).map(itemId)));
         if(asArray(state.options.detail_pages).length) flags.push(idsSelectionState(state.detailPageTaskIds, asArray(state.options.detail_pages).map(itemId)));
+        if(asArray(state.options.main_images).length) flags.push(idsSelectionState(state.mainImageTaskIds, asArray(state.options.main_images).map(itemId)));
+        if(asArray(state.options.image_generations).length) flags.push(idsSelectionState(state.imageGenerationTaskIds, asArray(state.options.image_generations).map(itemId)));
+        if(imageGenerationModesAvailable(state.options)) flags.push(state.includeImageGenerationModes ? 'checked' : 'unchecked');
         if(state.options.preferences?.available) flags.push(state.includePreferences ? 'checked' : 'unchecked');
         if(flags.length && state.includeAssets) flags.push('checked');
         if(flags.length && flags.every(value => value === 'checked')) return 'checked';
@@ -144,6 +167,9 @@
             runninghub_workflow_ids:[...state.runninghubWorkflowIds],
             prompt_library_ids:[...state.promptLibraryIds],
             detail_page_task_ids:[...state.detailPageTaskIds],
+            main_image_task_ids:[...state.mainImageTaskIds],
+            image_generation_task_ids:[...state.imageGenerationTaskIds],
+            include_image_generation_modes:Boolean(state.includeImageGenerationModes),
             include_preferences:Boolean(state.includePreferences),
             preferences:state.includePreferences ? readPortablePreferences() : {},
         };
@@ -152,8 +178,8 @@
         const payload = buildBackupExportRequest(state);
         return payload.project_ids.length > 0 || payload.canvas_ids.length > 0 || payload.provider_ids.length > 0
             || payload.runninghub_app_ids.length > 0 || payload.runninghub_workflow_ids.length > 0
-            || payload.prompt_library_ids.length > 0 || payload.detail_page_task_ids.length > 0
-            || payload.include_preferences;
+            || payload.prompt_library_ids.length > 0 || payload.detail_page_task_ids.length > 0 || payload.main_image_task_ids.length > 0
+            || payload.image_generation_task_ids.length > 0 || payload.include_image_generation_modes || payload.include_preferences;
     }
     function formatBytes(value){
         const bytes = Math.max(0, Number(value) || 0);
@@ -162,10 +188,18 @@
         if(bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
         return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
     }
+    function formatBackupDate(value, locale){
+        const numeric = typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim()))
+            ? Number(value)
+            : NaN;
+        const date = Number.isFinite(numeric) && numeric > 0
+            ? new Date(numeric < 100000000000 ? numeric * 1000 : numeric)
+            : new Date(String(value || ''));
+        if(Number.isNaN(date.getTime())) return '';
+        return date.toLocaleString(locale || undefined, {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+    }
 
     function initBackupManager(){
-        const menuButton = document.getElementById('backupMenuBtn');
-        const menu = document.getElementById('backupMenu');
         const modal = document.getElementById('backupModal');
         const modalTitle = document.getElementById('backupModalTitle');
         const modalSub = document.getElementById('backupModalSub');
@@ -174,8 +208,8 @@
         const modalCancel = document.getElementById('backupModalCancel');
         const modalPrimary = document.getElementById('backupModalPrimary');
         const fileInput = document.getElementById('backupFileInput');
-        if(!menuButton || !menu || !modal || !modalBody || menuButton.dataset.backupBound === '1') return;
-        menuButton.dataset.backupBound = '1';
+        if(!modal || !modalBody || modal.dataset.backupBound === '1') return;
+        modal.dataset.backupBound = '1';
 
         const zh = (cn, en) => window.StudioI18n?.lang?.() === 'en' ? en : cn;
         const esc = value => String(value == null ? '' : value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -285,12 +319,7 @@
                 cancelled:zh('已取消','Cancelled'), interrupted:zh('已中断','Interrupted'), generating:zh('生成中','Generating'),
                 planning:zh('规划中','Planning'), pending:zh('等待中','Pending'), unknown:zh('结果未知','Unknown result'),
             }[String(value || '').toLowerCase()] || String(value || zh('未知状态','Unknown')));
-            const dateLabel = value => {
-                const raw = Number(value || 0);
-                if(!raw) return '';
-                const date = new Date(raw < 100000000000 ? raw * 1000 : raw);
-                return Number.isNaN(date.getTime()) ? '' : date.toLocaleString([], {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
-            };
+            const dateLabel = value => formatBackupDate(value);
             return `<div class="backup-tree-branch detail-page-group">
                 ${collapsibleCheckbox(groupState, 'detail-page-group', '', collapseKey, zh('详情页历史','Detail-page history'), zh(`${ids.length} 组`, `${ids.length} groups`), 'panels-top-left')}
                 <div class="backup-tree-children${collapsed ? ' is-collapsed' : ''}">${tasks.map(task => {
@@ -300,6 +329,57 @@
                     const name = `${groupNo > 0 ? `${zh('分组','Group')} #${groupNo}` : zh('详情页历史','Detail-page history')}${title ? ` · ${title}` : ''}`;
                     const meta = [statusLabel(task.status), dateLabel(task.updated_at || task.created_at), zh(`${Number(task.screen_count || 0)} 屏`, `${Number(task.screen_count || 0)} screens`)].filter(Boolean).join(' · ');
                     return checkbox(state.detailPageTaskIds.has(taskId) ? 'checked' : 'unchecked', 'detail-page', taskId, name, meta);
+                }).join('')}</div>
+            </div>`;
+        }
+        function renderMainImageTree(){
+            const tasks = asArray(options?.main_images);
+            if(!tasks.length) return `<div class="backup-tree-empty">${zh('没有可备份的一键主图历史','No main-image history available')}</div>`;
+            const ids = tasks.map(itemId).filter(Boolean);
+            const groupState = idsSelectionState(state.mainImageTaskIds, ids);
+            const collapseKey = 'group:main-images';
+            const collapsed = collapsedGroups.has(collapseKey);
+            const statusLabel = value => ({
+                succeeded:zh('全部完成','Completed'), partial:zh('部分完成','Partially completed'), failed:zh('任务失败','Failed'),
+                cancelled:zh('已取消','Cancelled'), interrupted:zh('已中断','Interrupted'), generating:zh('生成中','Generating'),
+                planning:zh('规划中','Planning'), pending:zh('等待中','Pending'), unknown:zh('结果未知','Unknown result'),
+            }[String(value || '').toLowerCase()] || String(value || zh('未知状态','Unknown')));
+            const dateLabel = value => formatBackupDate(value);
+            return `<div class="backup-tree-branch main-image-group">
+                ${collapsibleCheckbox(groupState, 'main-image-group', '', collapseKey, zh('一键主图历史','Main-image history'), zh(`${ids.length} 组`, `${ids.length} groups`), 'images')}
+                <div class="backup-tree-children${collapsed ? ' is-collapsed' : ''}">${tasks.map(task => {
+                    const taskId = itemId(task);
+                    const groupNo = Number(task.group_no || 0);
+                    const title = String(task.title || '').trim();
+                    const name = `${groupNo > 0 ? `${zh('分组','Group')} #${groupNo}` : zh('一键主图历史','Main-image history')}${title ? ` · ${title}` : ''}`;
+                    const meta = [statusLabel(task.status), dateLabel(task.updated_at || task.created_at), zh(`${Number(task.screen_count || 0)} 张`, `${Number(task.screen_count || 0)} images`)].filter(Boolean).join(' · ');
+                    return checkbox(state.mainImageTaskIds.has(taskId) ? 'checked' : 'unchecked', 'main-image', taskId, name, meta);
+                }).join('')}</div>
+            </div>`;
+        }
+        function renderImageGenerationTree(){
+            const tasks = asArray(options?.image_generations);
+            if(!tasks.length) return `<div class="backup-tree-empty">${zh('没有可备份的图片生成历史','No image-generation history available')}</div>`;
+            const ids = tasks.map(itemId).filter(Boolean);
+            const groupState = idsSelectionState(state.imageGenerationTaskIds, ids);
+            const collapseKey = 'group:image-generations';
+            const collapsed = collapsedGroups.has(collapseKey);
+            const statusLabel = value => ({
+                succeeded:zh('已完成','Completed'), partial:zh('部分完成','Partially completed'), failed:zh('生成失败','Failed'),
+                cancelled:zh('已取消','Cancelled'), interrupted:zh('已中断','Interrupted'), generating:zh('生成中','Generating'),
+                submitting:zh('正在提交','Submitting'), queued:zh('排队中','Queued'), recovering:zh('恢复查询中','Recovering'), unknown:zh('结果未知','Unknown result'),
+            }[String(value || '').toLowerCase()] || String(value || zh('未知状态','Unknown')));
+            const dateLabel = value => formatBackupDate(value);
+            return `<div class="backup-tree-branch image-generation-group">
+                ${collapsibleCheckbox(groupState, 'image-generation-group', '', collapseKey, zh('图片生成历史','Image-generation history'), zh(`${ids.length} 组`, `${ids.length} groups`), 'wand-sparkles')}
+                <div class="backup-tree-children${collapsed ? ' is-collapsed' : ''}">${tasks.map(task => {
+                    const taskId = itemId(task);
+                    const groupNo = Number(task.group_no || 0);
+                    const title = String(task.title || task.mode_name || task.display_name || '').trim();
+                    const name = `${groupNo > 0 ? `${zh('分组','Group')} #${groupNo}` : zh('图片生成历史','Image-generation history')}${title ? ` · ${title}` : ''}`;
+                    const count = Number(task.candidate_count || task.image_count || 0);
+                    const meta = [statusLabel(task.status), dateLabel(task.updated_at || task.created_at), zh(`${count} 张`, `${count} images`)].filter(Boolean).join(' · ');
+                    return checkbox(state.imageGenerationTaskIds.has(taskId) ? 'checked' : 'unchecked', 'image-generation', taskId, name, meta);
                 }).join('')}</div>
             </div>`;
         }
@@ -345,30 +425,41 @@
             const workflows = asArray(options?.runninghub?.workflows);
             const libraries = asArray(options?.prompt_libraries);
             const detailPages = asArray(options?.detail_pages);
+            const mainImages = asArray(options?.main_images);
+            const imageGenerations = asArray(options?.image_generations);
+            const imageGenerationModes = options?.image_generation_modes;
+            const hasImageGenerationModes = imageGenerationModesAvailable(options || {});
+            const imageGenerationModesMeta = hasImageGenerationModes && typeof imageGenerationModes === 'object'
+                ? zh(`${Number(imageGenerationModes.mode_count || imageGenerationModes.count || 0)} 个模式、${Number(imageGenerationModes.example_count || 0)} 个示范`, `${Number(imageGenerationModes.mode_count || imageGenerationModes.count || 0)} modes, ${Number(imageGenerationModes.example_count || 0)} examples`)
+                : '';
             const resourceCount = Number(options?.resource_count || 0);
             const resourceBytes = Number(options?.resource_bytes || 0);
             const assetsDisabled = mode === 'import' && resourceCount <= 0;
             const assetsMeta = mode === 'import'
                 ? zh(`${resourceCount} 个文件，${formatBytes(resourceBytes)}`, `${resourceCount} files, ${formatBytes(resourceBytes)}`)
-                : zh('收集所选画布及详情页实际使用的文件', 'Collect files referenced by selected canvases and detail pages');
-            const detailAssetsWarning = mode === 'import' && detailPages.length && !state.includeAssets
-                ? `<div class="backup-warning"><i data-lucide="image-off"></i><span>${zh('未选择详情页素材：仅导入记录，缺失图片会在历史中标记为异常。','Detail-page media is disabled: records will import, but missing images will be marked unavailable.')}</span></div>`
+                : zh('收集所选画布、主图、详情页及图片生成任务使用的文件', 'Collect media referenced by selected canvases, main images, detail pages, and image-generation tasks');
+            const detailAssetsWarning = mode === 'import' && (detailPages.length || mainImages.length || imageGenerations.length) && !state.includeAssets
+                ? `<div class="backup-warning"><i data-lucide="image-off"></i><span>${zh('未选择历史素材：仅导入记录，缺失图片会在历史中标记为异常。','History media is disabled: records will import, but missing images will be marked unavailable.')}</span></div>`
                 : '';
+            // v2/v3 界面名称是“画布与详情页素材”；v4 扩展为下方的图片生成素材分类。
             modalBody.innerHTML = `
                 <div class="backup-privacy"><i data-lucide="shield-check"></i><span>${zh('API Key、Token、密码和密钥预览永远不会进入备份。','API keys, tokens, passwords, and secret previews are never included.')}</span></div>
                 ${mode === 'import' && asArray(options?.missing_resources).length ? `<div class="backup-warning"><i data-lucide="triangle-alert"></i><span>${zh(`备份记录了 ${options.missing_resources.length} 个缺失素材，相关节点会保留原路径。`, `${options.missing_resources.length} assets were missing when exported.`)}</span></div>` : ''}
                 <div class="backup-select-all">${checkbox(overallSelectionState(state), 'all', '', zh('全选','Select all'))}</div>
                 ${renderSection('section:projects', zh('项目与画布','Projects and canvases'), 'folders', renderProjectTree())}
+                ${renderSection('section:main-images', zh('一键主图历史','Main-image history'), 'images', renderMainImageTree())}
                 ${renderSection('section:detail-pages', zh('详情页历史','Detail-page history'), 'panels-top-left', renderDetailPageTree())}
-                ${renderSection('section:assets', zh('画布与详情页素材','Canvas and detail-page media'), 'images', checkbox(state.includeAssets && !assetsDisabled ? 'checked' : 'unchecked', 'assets', '', zh('包含所选画布与详情页使用的素材','Include media used by selected canvases and detail pages'), assetsMeta, assetsDisabled))}
+                ${renderSection('section:image-generations', zh('图片生成历史','Image-generation history'), 'wand-sparkles', renderImageGenerationTree())}
+                ${renderSection('section:assets', zh('画布、详情页与图片生成素材','Canvas, detail-page, and image-generation media'), 'images', checkbox(state.includeAssets && !assetsDisabled ? 'checked' : 'unchecked', 'assets', '', zh('包含所选画布、主图、详情页与图片生成任务使用的素材','Include media used by selected canvases, main images, detail pages, and image-generation tasks'), assetsMeta, assetsDisabled))}
                 ${detailAssetsWarning}
                 ${renderSection('section:config', zh('全局配置','Global configuration'), 'settings-2', `
                     ${renderFlatGroup(zh('API 配置平台','API providers'), 'server', 'group:providers', 'provider-group', 'provider', providers, state.providerIds)}
                     ${renderFlatGroup(zh('RunningHub 应用','RunningHub apps'), 'blocks', 'group:runninghub-apps', 'rh-app-group', 'rh-app', apps, state.runninghubAppIds)}
                     ${renderFlatGroup(zh('RunningHub 工作流','RunningHub workflows'), 'workflow', 'group:runninghub-workflows', 'rh-workflow-group', 'rh-workflow', workflows, state.runninghubWorkflowIds)}
                     ${renderFlatGroup(zh('提示词模板库','Prompt template libraries'), 'library', 'group:prompt-libraries', 'prompt-group', 'prompt-library', libraries, state.promptLibraryIds, 'item_count')}
+                    ${hasImageGenerationModes ? checkbox(state.includeImageGenerationModes ? 'checked' : 'unchecked', 'image-generation-modes', '', zh('图片生成模式与示范', 'Image-generation modes and examples'), imageGenerationModesMeta) : ''}
                     ${options?.preferences?.available ? checkbox(state.includePreferences ? 'checked' : 'unchecked', 'preferences', '', zh('界面与使用偏好', 'Interface and usage preferences'), zh('主题、UI 缩放、普通画布常用节点排序', 'Theme, UI scale, and classic-canvas favorite-node order')) : ''}
-                    ${(!providers.length && !apps.length && !workflows.length && !libraries.length && !options?.preferences?.available) ? `<div class="backup-tree-empty">${zh('没有可迁移的全局配置','No global configuration available')}</div>` : ''}
+                    ${(!providers.length && !apps.length && !workflows.length && !libraries.length && !hasImageGenerationModes && !options?.preferences?.available) ? `<div class="backup-tree-empty">${zh('没有可迁移的全局配置','No global configuration available')}</div>` : ''}
                 `, zh('不含密钥','No secrets'))}
                 ${conflictHtml()}
                 <div class="backup-inline-status" aria-live="polite"></div>`;
@@ -383,6 +474,8 @@
             const workflowIds = asArray(options.runninghub?.workflows).map(itemId);
             const promptIds = asArray(options.prompt_libraries).map(itemId);
             const detailPageIds = asArray(options.detail_pages).map(itemId);
+            const mainImageIds = asArray(options.main_images).map(itemId);
+            const imageGenerationIds = asArray(options.image_generations).map(itemId);
             if(kind === 'all') setAllSelected(state, checked);
             else if(kind === 'project') setProjectSelected(state, id, checked);
             else if(kind === 'canvas') setCanvasSelected(state, id, checked);
@@ -397,6 +490,11 @@
             else if(kind === 'prompt-library') setIdsSelected(state.promptLibraryIds, [id], checked);
             else if(kind === 'detail-page-group') setIdsSelected(state.detailPageTaskIds, detailPageIds, checked);
             else if(kind === 'detail-page') setDetailPageSelected(state, id, checked);
+            else if(kind === 'main-image-group') setIdsSelected(state.mainImageTaskIds, mainImageIds, checked);
+            else if(kind === 'main-image') setMainImageSelected(state, id, checked);
+            else if(kind === 'image-generation-group') setIdsSelected(state.imageGenerationTaskIds, imageGenerationIds, checked);
+            else if(kind === 'image-generation') setImageGenerationSelected(state, id, checked);
+            else if(kind === 'image-generation-modes') state.includeImageGenerationModes = checked;
             else if(kind === 'preferences') state.includePreferences = checked;
             renderTree();
         }
@@ -482,11 +580,17 @@
                 if(Number(result.runninghub_workflows_imported || 0)) importedParts.push(zh(`RunningHub 工作流 ${result.runninghub_workflows_imported} 个`, `${result.runninghub_workflows_imported} RunningHub workflows`));
                 if(Number(result.prompt_libraries_imported || 0)) importedParts.push(zh(`提示词模板库 ${result.prompt_libraries_imported} 个`, `${result.prompt_libraries_imported} prompt libraries`));
                 if(Number(result.detail_pages || 0)) importedParts.push(zh(`详情页历史 ${result.detail_pages} 组`, `${result.detail_pages} detail-page histories`));
+                if(Number(result.main_images || 0)) importedParts.push(zh(`一键主图历史 ${result.main_images} 组`, `${result.main_images} main-image histories`));
+                if(Number(result.image_generations || 0)) importedParts.push(zh(`图片生成历史 ${result.image_generations} 组`, `${result.image_generations} image-generation histories`));
+                if(Number(result.image_generation_modes_imported || 0)) importedParts.push(zh(`图片生成模式 ${result.image_generation_modes_imported} 个`, `${result.image_generation_modes_imported} image-generation modes`));
+                if(Number(result.image_generation_examples_imported || 0)) importedParts.push(zh(`图片生成示范 ${result.image_generation_examples_imported} 个`, `${result.image_generation_examples_imported} image-generation examples`));
                 if(result.preferences && Object.keys(result.preferences).length) importedParts.push(zh('界面与使用偏好 1 组', '1 interface preference set'));
                 if(Number(result.providers_skipped || 0)) skippedParts.push(zh(`API 平台 ${result.providers_skipped} 个`, `${result.providers_skipped} API providers`));
                 if(Number(result.runninghub_apps_skipped || 0)) skippedParts.push(zh(`RunningHub 应用 ${result.runninghub_apps_skipped} 个`, `${result.runninghub_apps_skipped} RunningHub apps`));
                 if(Number(result.runninghub_workflows_skipped || 0)) skippedParts.push(zh(`RunningHub 工作流 ${result.runninghub_workflows_skipped} 个`, `${result.runninghub_workflows_skipped} RunningHub workflows`));
                 if(Number(result.prompt_libraries_skipped || 0)) skippedParts.push(zh(`提示词模板库 ${result.prompt_libraries_skipped} 个`, `${result.prompt_libraries_skipped} prompt libraries`));
+                if(Number(result.image_generations_skipped || 0)) skippedParts.push(zh(`图片生成历史 ${result.image_generations_skipped} 组`, `${result.image_generations_skipped} image-generation histories`));
+                if(Number(result.image_generation_modes_skipped || 0)) skippedParts.push(zh(`图片生成模式 ${result.image_generation_modes_skipped} 个`, `${result.image_generation_modes_skipped} image-generation modes`));
                 if(!importedParts.length) importedParts.push(zh('没有写入新的内容', 'No new content was written'));
                 const endpointNote = result.runninghub_endpoint_changed
                     ? zh('RunningHub 地址已更新，本机密钥已清空，请重新填写。', 'RunningHub endpoint updated; local keys were cleared. Please enter them again.')
@@ -498,27 +602,41 @@
                 const missingMediaNote = Number(result.detail_page_missing_media || 0)
                     ? zh(`有 ${result.detail_page_missing_media} 个详情页素材缺失，已在对应历史中标记。`, `${result.detail_page_missing_media} detail-page media files are missing and were marked in history.`)
                     : '';
+                const mainImageMissingMediaNote = Number(result.main_image_missing_media || 0)
+                    ? zh(`有 ${result.main_image_missing_media} 个一键主图素材缺失，已在对应历史中标记。`, `${result.main_image_missing_media} main-image media files are missing and were marked in history.`)
+                    : '';
+                const imageGenerationMissingMediaNote = Number(result.image_generation_missing_media || 0)
+                    ? zh(`有 ${result.image_generation_missing_media} 个图片生成素材缺失，已在对应历史或示范中标记。`, `${result.image_generation_missing_media} image-generation media files are missing and were marked in histories or examples.`)
+                    : '';
                 // 直接重读当前页面数据，不依赖本地浏览器壳是否允许脚本导航。
                 // 这会立即刷新项目、画布和回收站；API 设置页下次打开时也会通过 no-store 读取新配置。
                 if(typeof window.loadAll === 'function') {
                     try { await window.loadAll(); } catch(_error) { /* 导入已经完成，导航兜底仍可用 */ }
                 }
-                const importMessage = zh(`导入完成：${importedParts.join('、')}。${skippedNote}${providerNote}${missingMediaNote}${endpointNote ? `\n${endpointNote}` : ''}`, `Import complete: ${importedParts.join(', ')}. ${skippedNote}${providerNote ? ` ${providerNote}` : ''}${missingMediaNote ? ` ${missingMediaNote}` : ''}${endpointNote ? ` ${endpointNote}` : ''}`);
+                const importMessage = zh(`导入完成：${importedParts.join('、')}。${skippedNote}${providerNote}${missingMediaNote}${mainImageMissingMediaNote}${imageGenerationMissingMediaNote}${endpointNote ? `\n${endpointNote}` : ''}`, `Import complete: ${importedParts.join(', ')}. ${skippedNote}${providerNote ? ` ${providerNote}` : ''}${missingMediaNote ? ` ${missingMediaNote}` : ''}${mainImageMissingMediaNote ? ` ${mainImageMissingMediaNote}` : ''}${imageGenerationMissingMediaNote ? ` ${imageGenerationMissingMediaNote}` : ''}${endpointNote ? ` ${endpointNote}` : ''}`);
                 if(typeof window.setStatus === 'function') window.setStatus(importMessage);
                 window.dispatchEvent(new CustomEvent('backup-imported', {detail:result}));
                 window.dispatchEvent(new CustomEvent('detail-pages-changed', {detail:result}));
+                window.dispatchEvent(new CustomEvent('main-images-changed', {detail:result}));
+                window.dispatchEvent(new CustomEvent('image-generations-changed', {detail:result}));
                 // Notify API settings and other open views that global providers/workflows changed.
                 const changeMessage = {type:'providers-changed', updated_at:Date.now(), source:'backup-import'};
                 const detailChangeMessage = {type:'detail-pages-changed', updated_at:changeMessage.updated_at, source:'backup-import'};
+                const mainImageChangeMessage = {type:'main-images-changed', updated_at:changeMessage.updated_at, source:'backup-import'};
+                const imageGenerationChangeMessage = {type:'image-generations-changed', updated_at:changeMessage.updated_at, source:'backup-import'};
                 try { localStorage.setItem('studio_api_updated_at', String(changeMessage.updated_at)); } catch(_error) {}
                 try {
                     const channel = new BroadcastChannel('studio-api');
                     channel.postMessage(changeMessage);
                     channel.postMessage(detailChangeMessage);
+                    channel.postMessage(mainImageChangeMessage);
+                    channel.postMessage(imageGenerationChangeMessage);
                     channel.close();
                 } catch(_error) {}
                 try { window.parent?.postMessage(changeMessage, '*'); } catch(_error) {}
                 try { window.parent?.postMessage(detailChangeMessage, location.origin); } catch(_error) {}
+                try { window.parent?.postMessage(mainImageChangeMessage, location.origin); } catch(_error) {}
+                try { window.parent?.postMessage(imageGenerationChangeMessage, location.origin); } catch(_error) {}
                 // The backup UI runs in an iframe in the main studio shell. Reload the
                 // top-level shell so every iframe rebuilds its in-memory provider/workflow state.
                 try {
@@ -531,20 +649,15 @@
             } catch(error){ setBusy(false); showError(error.message); }
         }
 
-        menuButton.addEventListener('click', event => {
-            event.stopPropagation();
-            menu.classList.toggle('open');
-            menuButton.setAttribute('aria-expanded', menu.classList.contains('open') ? 'true' : 'false');
-        });
-        menu.addEventListener('click', event => {
-            const action = event.target.closest('[data-backup-action]')?.dataset.backupAction;
-            if(!action) return;
-            menu.classList.remove('open'); menuButton.setAttribute('aria-expanded', 'false');
+        // The backup entry lives in the parent studio shell. Accept only the
+        // same-origin, parent-originated command so unrelated frames cannot
+        // open or mutate the backup workflow.
+        window.addEventListener('message', event => {
+            if(event.source !== window.parent) return;
+            if(event.origin !== location.origin) return;
+            const action = event.data?.type === 'studio-backup-action' ? event.data.action : '';
             if(action === 'export') openExport();
-            else showImportChooser();
-        });
-        document.addEventListener('click', event => {
-            if(!event.target.closest('.backup-menu-wrap')){ menu.classList.remove('open'); menuButton.setAttribute('aria-expanded', 'false'); }
+            else if(action === 'import') showImportChooser();
         });
         modalBody.addEventListener('change', event => {
             const input = event.target.closest('input[data-backup-kind]');
@@ -577,9 +690,12 @@
         setProjectSelected,
         setCanvasSelected,
         setDetailPageSelected,
+        setMainImageSelected,
+        setImageGenerationSelected,
         setAllSelected,
         buildBackupExportRequest,
         formatBytes,
+        formatBackupDate,
         initBackupManager,
     };
 });

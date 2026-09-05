@@ -351,6 +351,7 @@ window.addEventListener('studio-lang-change', () => {
     syncCanvasChatContext();
 });
 window.addEventListener('studio-ui-scale-change', syncCanvasChatContext);
+window.addEventListener('pagehide', () => flushCanvasWheelViewportWork(true));
 const shell = document.getElementById('shell');
 const canvasGate = document.getElementById('canvasGate');
 const board = document.getElementById('board');
@@ -358,8 +359,19 @@ const world = document.getElementById('world');
 const nodesEl = document.getElementById('nodes');
 const minimap = document.getElementById('minimap');
 const minimapContent = document.getElementById('minimapContent');
+const canvasViewControls = document.getElementById('canvasViewControls');
+const minimapToggle = document.getElementById('minimapToggle');
+const canvasGridSnapToggle = document.getElementById('canvasGridSnapToggle');
+const canvasFitViewBtn = document.getElementById('canvasFitViewBtn');
+const canvasZoomBtn = document.getElementById('canvasZoomBtn');
+const canvasZoomValue = document.getElementById('canvasZoomValue');
+const canvasZoomMenu = document.getElementById('canvasZoomMenu');
+const canvasZoomCustomForm = document.getElementById('canvasZoomCustomForm');
+const canvasZoomInput = document.getElementById('canvasZoomInput');
 const canvasArrangeBtn = document.getElementById('canvasArrangeBtn');
+const canvasPerformanceToggle = document.getElementById('canvasPerformanceToggle');
 let minimapViewport = document.getElementById('minimapViewport');
+const canvasFarLinks = document.getElementById('canvasFarLinks');
 const linksEl = document.getElementById('links');
 const linkControlsEl = document.getElementById('linkControls');
 const dropOverlay = document.getElementById('dropOverlay');
@@ -506,8 +518,12 @@ let minimapDrag = false;
 let minimapState = null;
 let minimapRenderQueued = false;
 let minimapGeometryDirty = true;
+let canvasViewPreferences = {canvasId:'', minimapVisible:true, gridSnapEnabled:false};
 let linksRenderQueued = false;
 let viewportOverlayUpdateQueued = false;
+let canvasWheelViewportFrame = 0;
+let canvasWheelViewportSaveTimer = 0;
+let nodeDragVisualFrame = 0;
 let zoomPreviewState = null;
 let resizeNode = null;
 let llmPaneDrag = null;
@@ -530,10 +546,799 @@ const quickCreateMenuContexts = new WeakMap();
 let internalDrag = false;
 let selected = new Set();
 const SpatialFrames = window.CanvasSpatialFrames;
+const CanvasPerformance = window.ClassicCanvasPerformance;
+const canvasPerformanceFailedIds = new Set();
+let canvasPerformanceRenderMode = 'full';
+let canvasPerformanceInteractionTimer = 0;
+let canvasPerformanceReconcileFrame = 0;
+let canvasPerformanceInteracting = false;
+let canvasGeometryDirty = true;
+let canvasSpatialIndex = null;
+const canvasNodeSizeCache = new Map();
+let canvasNodeSizeCacheCanvasId = '';
+let canvasNodeSizeCacheSaveTimer = 0;
+const canvasPerformanceFarPreviewImages = new Map();
+const canvasPerformanceFarOutputDrawQueue = new Map();
+let canvasPerformanceFarOutputDrawFrame = 0;
+const CANVAS_PERFORMANCE_ESTIMATED_HEIGHTS = {
+    prompt:300, note:260, loop:360, promptGroup:150, group:180, llm:590,
+    generator:520, midjourney:520, msgen:480, video:500, minimax:720,
+    rh:480, comfy:460, ltxDirector:800, image:336
+};
 function isCanvasFrameNode(node){ return Boolean(SpatialFrames?.isFrameNode(node)); }
 function canvasNodeElement(id){
     return nodesEl?.querySelector?.(`[data-id="${CSS.escape(String(id || ''))}"]`) || null;
 }
+function isPureCanvasImageNode(node){
+    return Boolean(node?.type === 'image' && node.url && mediaKindForNode(node) === 'image');
+}
+function canvasPureImageCount(){
+    return (nodes || []).filter(isPureCanvasImageNode).length;
+}
+const CANVAS_PERFORMANCE_NODE_TYPES = new Set([
+    'image','prompt','note','loop','promptGroup','group','output','llm','generator',
+    'midjourney','msgen','video','minimax','rh','comfy','ltxDirector'
+]);
+const CANVAS_PERFORMANCE_ACTIVE_STATUSES = new Set([
+    'queued','submitting','running','generating','recovering','retrying','stopping','cancelling'
+]);
+function canvasPerformanceOutputMediaCount(){
+    return (nodes || []).filter(node => node?.type === 'output')
+        .reduce((total, node) => total + (node.images || []).length + (node._pending || []).length, 0);
+}
+function canvasPerformanceNodeEligible(node){
+    return Boolean(node?.id && CANVAS_PERFORMANCE_NODE_TYPES.has(node.type) && !isCanvasFrameNode(node));
+}
+function canvasPerformanceNodeHasLiveInteraction(node){
+    if(!node?.id) return false;
+    const taskStatuses = [node.runStatus, node.lastTaskStatus, node.taskStatus, node.status]
+        .map(value => String(value || '').toLowerCase());
+    if(node.running || taskStatuses.some(status => CANVAS_PERFORMANCE_ACTIVE_STATUSES.has(status))) return true;
+    if((node._pending || []).length || cascadeRunningIds.has(node.id)) return true;
+    if(classicCascadePreviewNodeClasses(node.id).length) return true;
+    if(promptTemplateModal?.classList.contains('open') && promptTemplateNodeId === node.id) return true;
+    if(cropState?.nodeId === node.id && document.getElementById('imageEditModal')?.classList.contains('open')) return true;
+    if(outputLightbox?.classList.contains('open') && currentOutputLightboxOutId === node.id) return true;
+    if(llmPromptWorkspaceModal?.classList.contains('open') && llmPromptWorkspaceState?.nodeId === node.id) return true;
+    if(linkCreateState?.originId === node.id) return true;
+    const element = canvasNodeElement(node.id);
+    if(element?.contains(document.activeElement)) return true;
+    return [...(element?.querySelectorAll?.('video,audio') || [])].some(media => !media.paused && !media.ended);
+}
+function canvasPerformanceIsAvailable(){
+    return Boolean(CanvasPerformance && canvas?.id);
+}
+function canvasPerformanceIsDisabled(){
+    return Boolean(canvas?.id && CanvasPerformance?.canvasDisabled?.(window.localStorage, canvas.id));
+}
+function canvasPerformanceIsActive(){
+    return canvasPerformanceIsAvailable() && !canvasPerformanceIsDisabled() && !canvasPerformanceFailedIds.has(canvas.id);
+}
+function updateCanvasPerformanceToggle(){
+    if(!canvasPerformanceToggle) return;
+    const available = canvasPerformanceIsAvailable();
+    const active = available && canvasPerformanceIsActive();
+    canvasPerformanceToggle.hidden = false;
+    canvasPerformanceToggle.classList.toggle('visible', available);
+    canvasPerformanceToggle.classList.toggle('is-disabled', available && !active);
+    canvasPerformanceToggle.setAttribute('aria-pressed', active ? 'true' : 'false');
+    canvasPerformanceToggle.querySelector('strong').textContent = active ? '开' : '关';
+    const summary = `${(nodes || []).length} 个节点 · ${canvasPerformanceOutputMediaCount()} 个输出 · ${(connections || []).length} 条连线`;
+    canvasPerformanceToggle.title = active
+        ? `性能模式已开启（${summary}），点击关闭`
+        : `性能模式已关闭（${summary}），点击开启`;
+    document.body.classList.toggle('canvas-performance-available', available);
+    document.body.classList.toggle('canvas-performance-active', active);
+}
+function estimatedCanvasOutputHeight(node, width){
+    const count = Math.max(1, (node?.images || []).length + (node?._pending || []).length);
+    const inner = Math.max(120, Number(width || 460) - 24);
+    const layoutCols = Math.max(0, Number(node?.outputLayout?.cols) || 0);
+    const columns = layoutCols || Math.max(1, Math.floor((inner + 10) / 160));
+    const thumb = Math.max(110, Math.min(180, (inner - Math.max(0, columns - 1) * 10) / columns));
+    return Math.max(150, Math.round(88 + Math.ceil(count / columns) * thumb + Math.max(0, Math.ceil(count / columns) - 1) * 10));
+}
+function canvasPerformanceNodeGeometrySignature(node){
+    if(!node?.id) return '';
+    const arrayKeys = [
+        'images','_pending','items','inputs','inputImages','referenceImages','referenceVideos',
+        'referenceAudios','startImages','endImages','segments','prompts','outputs'
+    ];
+    const textKeys = ['title','text','prompt','localPrompt','systemPrompt','userInput','negativePrompt'];
+    const scalarKeys = [
+        'type','w','h','model','apiProvider','provider','workflowId','workflowName','mode','engine',
+        'showPrompt','imageInput','videoInput','audioInput','displayName','modelDisplayName'
+    ];
+    return JSON.stringify([
+        ...scalarKeys.map(key => node[key] ?? ''),
+        ...arrayKeys.map(key => Array.isArray(node[key]) ? node[key].length : 0),
+        ...textKeys.map(key => String(node[key] || '').length),
+        Number(node?.outputLayout?.cols) || 0,
+    ]);
+}
+function canvasPerformanceCachedNodeSize(node){
+    const cached = canvasNodeSizeCache.get(node?.id);
+    if(!cached) return null;
+    if(cached.signature !== canvasPerformanceNodeGeometrySignature(node)){
+        canvasNodeSizeCache.delete(node.id);
+        return null;
+    }
+    return cached;
+}
+function canvasPerformanceNodeHasExactGeometry(node){
+    const size = defaultNodeSize(node?.type);
+    if(Number(node?.w) > 0 && Number(node?.h) > 0) return true;
+    if(Number(size?.w) > 0 && Number(size?.h) > 0) return true;
+    return Boolean(canvasPerformanceCachedNodeSize(node)?.exact);
+}
+function persistCanvasNodeSizeCache(immediate=false){
+    if(canvasNodeSizeCacheSaveTimer){
+        clearTimeout(canvasNodeSizeCacheSaveTimer);
+        canvasNodeSizeCacheSaveTimer = 0;
+    }
+    const save = () => {
+        const canvasId = canvasNodeSizeCacheCanvasId;
+        if(!canvasId || !CanvasPerformance?.writeNodeGeometryCache) return;
+        const entries = [...canvasNodeSizeCache].filter(([, value]) => value?.exact);
+        CanvasPerformance.writeNodeGeometryCache(window.localStorage, canvasId, entries);
+    };
+    if(immediate) save();
+    else canvasNodeSizeCacheSaveTimer = setTimeout(() => {
+        canvasNodeSizeCacheSaveTimer = 0;
+        save();
+    }, 250);
+}
+function prepareCanvasNodeSizeCache(canvasId){
+    const nextId = String(canvasId || '');
+    if(canvasNodeSizeCacheCanvasId === nextId) return;
+    if(canvasNodeSizeCacheCanvasId) persistCanvasNodeSizeCache(true);
+    canvasNodeSizeCache.clear();
+    canvasNodeSizeCacheCanvasId = nextId;
+    if(!nextId || !CanvasPerformance?.readNodeGeometryCache) return;
+    const byId = new Map((nodes || []).map(node => [node.id, node]));
+    CanvasPerformance.readNodeGeometryCache(
+        window.localStorage,
+        nextId,
+        id => canvasPerformanceNodeGeometrySignature(byId.get(id)),
+    ).forEach((value, id) => canvasNodeSizeCache.set(id, value));
+}
+function cachedCanvasNodeRect(node){
+    const size = defaultNodeSize(node?.type);
+    const cached = canvasPerformanceCachedNodeSize(node) || {};
+    const w = Math.max(1, Number(node?.w || cached.w || size?.w || 260) || 260);
+    const estimatedHeight = node?.type === 'output'
+        ? estimatedCanvasOutputHeight(node, w)
+        : (CANVAS_PERFORMANCE_ESTIMATED_HEIGHTS[node?.type] || 200);
+    const h = Math.max(1, Number(node?.h || cached.h || size?.h || estimatedHeight) || estimatedHeight);
+    return {x:Number(node?.x) || 0, y:Number(node?.y) || 0, w, h};
+}
+function cacheRenderedCanvasNodeSizes(root=nodesEl){
+    let learnedExactGeometry = false;
+    const nodesById = new Map((nodes || []).map(node => [node.id, node]));
+    root?.querySelectorAll?.('.node,.canvas-frame-node').forEach(element => {
+        const id = element.dataset.id;
+        if(!id) return;
+        if(element.classList.contains('canvas-perf-node-far')) return;
+        const node = nodesById.get(id);
+        if(!node) return;
+        const w = Number(element.offsetWidth);
+        const h = Number(element.offsetHeight);
+        if(w > 0 && h > 0){
+            const signature = canvasPerformanceNodeGeometrySignature(node);
+            const previous = canvasNodeSizeCache.get(id);
+            if(!previous?.exact || previous.w !== w || previous.h !== h || previous.signature !== signature){
+                canvasNodeSizeCache.set(id, {w, h, signature, exact:true});
+                learnedExactGeometry = true;
+            }
+        }
+    });
+    if(learnedExactGeometry){
+        persistCanvasNodeSizeCache();
+        if(canvasPerformanceRenderMode === 'far') scheduleCanvasPerformanceReconcile(true);
+    }
+}
+function markCanvasGeometryDirty(){
+    canvasGeometryDirty = true;
+}
+function rebuildCanvasSpatialIndex(){
+    if(!CanvasPerformance) return null;
+    canvasSpatialIndex = CanvasPerformance.createSpatialIndex(nodes || [], cachedCanvasNodeRect);
+    canvasGeometryDirty = false;
+    return canvasSpatialIndex;
+}
+function ensureCanvasSpatialIndex(){
+    return (!canvasSpatialIndex || canvasGeometryDirty) ? rebuildCanvasSpatialIndex() : canvasSpatialIndex;
+}
+function canvasPerformancePinnedIds(){
+    const ids = new Set(selected || []);
+    if(dragNode?.node?.id) ids.add(dragNode.node.id);
+    (dragNode?.children || []).forEach(item => item?.node?.id && ids.add(item.node.id));
+    if(resizeNode?.node?.id) ids.add(resizeNode.node.id);
+    (nodes || []).forEach(node => {
+        if(canvasPerformanceNodeHasLiveInteraction(node)) ids.add(node.id);
+    });
+    return ids;
+}
+function desiredCanvasPerformanceNodeTiers(){
+    if(!canvasPerformanceIsActive()) return null;
+    const index = ensureCanvasSpatialIndex();
+    const viewRect = currentWorldViewRect();
+    const bufferRatio = canvasPerformanceRenderMode === 'far'
+        ? 0.08
+        : (canvasPerformanceRenderMode === 'lite' ? 0.30 : 0.50);
+    const nodesById = new Map((nodes || []).map(node => [node.id, node]));
+    const tiers = CanvasPerformance.desiredNodeTiers({
+        index,
+        nodesById,
+        viewRect,
+        bufferedRect:CanvasPerformance.expandRect(viewRect, bufferRatio, bufferRatio),
+        renderMode:canvasPerformanceRenderMode,
+        pinnedIds:canvasPerformancePinnedIds(),
+        isEligible:canvasPerformanceNodeEligible,
+    });
+    if(canvasPerformanceRenderMode === 'far'){
+        tiers.forEach((tier, id) => {
+            const node = tier === 'far' ? nodesById.get(id) : null;
+            if(node && !canvasPerformanceNodeHasExactGeometry(node)) tiers.set(id, 'lite');
+        });
+    }
+    return tiers;
+}
+function insertCanvasNodeElementInOrder(element, order){
+    element.dataset.nodeOrder = String(order);
+    const before = [...nodesEl.children].find(child => Number(child.dataset.nodeOrder) > order);
+    if(before) nodesEl.insertBefore(element, before);
+    else nodesEl.appendChild(element);
+}
+const CANVAS_PERFORMANCE_LITE_MEDIA_WIDTH = 128;
+const canvasPerformanceFullNodeHandlers = new WeakMap();
+const canvasPerformanceFrozenGeneratorBodies = new WeakMap();
+function canvasPerformanceStaticControl(source, kind, text=''){
+    const replacement = document.createElement('div');
+    replacement.className = `${source.className || ''} canvas-perf-static-control canvas-perf-static-${kind}`.trim();
+    replacement.style.cssText = source.style.cssText || '';
+    replacement.textContent = String(text || '').trim();
+    replacement.setAttribute('aria-hidden', 'true');
+    for(const attr of source.attributes || []){
+        if(attr.name.startsWith('data-')) replacement.setAttribute(attr.name, attr.value);
+    }
+    return replacement;
+}
+function freezeCanvasPerformanceGeneratorBody(element, node){
+    if(!element || node?.type !== 'generator' || canvasPerformanceFrozenGeneratorBodies.has(element)) return;
+    const liveBody = element.querySelector(':scope > .node-body');
+    if(!liveBody) return;
+    const staticBody = liveBody.cloneNode(true);
+    const liveSelects = [...liveBody.querySelectorAll('select')];
+    const staticSelects = [...staticBody.querySelectorAll('select')];
+    staticBody.querySelectorAll('option').forEach(option => option.remove());
+    staticSelects.forEach((select, index) => {
+        const live = liveSelects[index];
+        const label = live?.selectedOptions?.[0]?.textContent || live?.value || '';
+        select.replaceWith(canvasPerformanceStaticControl(select, 'select', label));
+    });
+    const liveFields = [...liveBody.querySelectorAll('textarea, input')];
+    const staticFields = [...staticBody.querySelectorAll('textarea, input')];
+    staticFields.forEach((field, index) => {
+        const live = liveFields[index];
+        field.replaceWith(canvasPerformanceStaticControl(field, 'input', live?.value || ''));
+    });
+    staticBody.querySelectorAll('[contenteditable]').forEach(editor => {
+        editor.removeAttribute('contenteditable');
+        editor.removeAttribute('role');
+        editor.removeAttribute('spellcheck');
+        editor.classList.add('canvas-perf-static-control', 'canvas-perf-static-editor');
+    });
+    staticBody.querySelectorAll('button').forEach(button => {
+        const replacement = canvasPerformanceStaticControl(button, 'button', button.textContent || '');
+        if(button.matches('[data-prompt-template-open], .api-reference-remove')){
+            replacement.classList.add('canvas-perf-static-hidden');
+        }
+        button.replaceWith(replacement);
+    });
+    staticBody.querySelectorAll('[tabindex]').forEach(item => item.removeAttribute('tabindex'));
+    staticBody.querySelectorAll('[draggable]').forEach(item => item.removeAttribute('draggable'));
+    staticBody.dataset.canvasPerformanceStaticBody = 'true';
+    liveBody.replaceWith(staticBody);
+    canvasPerformanceFrozenGeneratorBodies.set(element, {liveBody, staticBody});
+    element.classList.add('canvas-perf-generator-frozen');
+}
+function restoreCanvasPerformanceGeneratorBody(element){
+    const frozen = canvasPerformanceFrozenGeneratorBodies.get(element);
+    if(!frozen) return;
+    if(frozen.staticBody?.isConnected) frozen.staticBody.replaceWith(frozen.liveBody);
+    canvasPerformanceFrozenGeneratorBodies.delete(element);
+    element.classList.remove('canvas-perf-generator-frozen');
+}
+function dehydrateCanvasPerformanceNode(element, node){
+    if(!element || element.dataset.canvasPerformanceTier === 'lite') return element;
+    if(canvasPerformanceNodeHasLiveInteraction(node)) return element;
+    canvasPerformanceFullNodeHandlers.set(element, {
+        onclick:element.onclick,
+        onmousedown:element.onmousedown,
+        oncontextmenu:element.oncontextmenu,
+        ondragstart:element.ondragstart,
+    });
+    element.onclick = null;
+    element.onmousedown = null;
+    element.oncontextmenu = null;
+    element.ondragstart = null;
+    element.classList.add('canvas-perf-node-lite');
+    element.dataset.canvasPerformanceTier = 'lite';
+    freezeCanvasPerformanceGeneratorBody(element, node);
+    element.querySelectorAll('img[data-original-src]').forEach(img => {
+        const original = canvasOriginalMediaUrl(img.dataset.originalSrc || img.dataset.url || img.getAttribute('src') || '');
+        if(!original) return;
+        const fullPreview = img.dataset.previewSrc || img.getAttribute('src') || canvasMediaPreviewUrl(original, 768);
+        if(!img.hasAttribute('data-canvas-performance-full-preview')){
+            img.setAttribute('data-canvas-performance-full-preview', fullPreview);
+        }
+        const preview = canvasMediaPreviewUrl(original, CANVAS_PERFORMANCE_LITE_MEDIA_WIDTH);
+        img.dataset.previewSrc = preview;
+        img.loading = 'lazy';
+        img.decoding = 'async';
+        if(preview && img.getAttribute('src') !== preview) img.src = preview;
+    });
+    element.querySelectorAll('video,audio').forEach(media => {
+        if(!media.hasAttribute('data-canvas-performance-full-preload')){
+            media.setAttribute('data-canvas-performance-full-preload', media.getAttribute('preload') || '');
+        }
+        try { media.pause?.(); } catch(error) {}
+        media.preload = 'none';
+    });
+    return element;
+}
+function rehydrateCanvasPerformanceNode(element, node){
+    if(!element || element.dataset.canvasPerformanceTier !== 'lite') return element;
+    element.querySelectorAll('img[data-canvas-performance-full-preview]').forEach(img => {
+        const preview = img.getAttribute('data-canvas-performance-full-preview') || '';
+        img.removeAttribute('data-canvas-performance-full-preview');
+        if(preview){
+            img.dataset.previewSrc = preview;
+            if(img.getAttribute('src') !== preview) img.src = preview;
+        }
+    });
+    element.querySelectorAll('video[data-canvas-performance-full-preload], audio[data-canvas-performance-full-preload]').forEach(media => {
+        const preload = media.getAttribute('data-canvas-performance-full-preload') || '';
+        media.removeAttribute('data-canvas-performance-full-preload');
+        if(preload) media.setAttribute('preload', preload);
+        else media.removeAttribute('preload');
+    });
+    restoreCanvasPerformanceGeneratorBody(element);
+    const handlers = canvasPerformanceFullNodeHandlers.get(element);
+    if(handlers){
+        element.onclick = handlers.onclick;
+        element.onmousedown = handlers.onmousedown;
+        element.oncontextmenu = handlers.oncontextmenu;
+        element.ondragstart = handlers.ondragstart;
+        canvasPerformanceFullNodeHandlers.delete(element);
+    }
+    element.classList.remove('canvas-perf-node-lite');
+    element.dataset.canvasPerformanceTier = 'full';
+    return element;
+}
+function canvasPerformanceNodeTitle(node){
+    if(node?.type === 'image' && node.url) return nodeTitleForMedia(node);
+    return node?.type === 'image' ? 'Image'
+        : node?.type === 'prompt' ? 'Prompt'
+        : node?.type === 'note' ? '便签'
+        : node?.type === 'loop' ? tr('canvas.loopNode')
+        : node?.type === 'promptGroup' ? 'Prompts'
+        : node?.type === 'group' ? 'Group'
+        : node?.type === 'output' ? 'Output'
+        : node?.type === 'llm' ? 'LLM'
+        : node?.type === 'comfy' ? 'ComfyUI'
+        : node?.type === 'ltxDirector' ? tr('canvas.ltxDirector')
+        : node?.type === 'rh' ? 'RunningHub'
+        : node?.type === 'minimax' ? 'MiniMax H3'
+        : node?.type === 'midjourney' ? 'Midjourney'
+        : node?.type === 'msgen' ? tr('canvas.modelscopeGenerate')
+        : node?.type === 'video' ? tr('canvas.videoGenerateNode')
+        : tr('canvas.apiGenerate');
+}
+function canvasPerformanceFarNodeLabel(node, blueprint){
+    if(node?.type === 'generator' || node?.type === 'llm'){
+        const provider = providerById(node.apiProvider || node.provider);
+        const providerName = provider?.name || provider?.title || '';
+        const modelName = providerModelDisplayName(node.apiProvider || node.provider, node.model, node.type === 'llm' ? 'llm' : 'image');
+        return [providerName, modelName].filter(Boolean).join(' · ');
+    }
+    return blueprint.label || blueprint.summary || '';
+}
+const CANVAS_PERFORMANCE_FAR_OUTPUT_BATCH = 12;
+const CANVAS_PERFORMANCE_FAR_PREVIEW_CONCURRENCY = 8;
+const canvasPerformanceFarPreviewPending = [];
+let canvasPerformanceFarPreviewActive = 0;
+function pumpCanvasPerformanceFarPreviewImages(){
+    while(canvasPerformanceFarPreviewActive < CANVAS_PERFORMANCE_FAR_PREVIEW_CONCURRENCY && canvasPerformanceFarPreviewPending.length){
+        const task = canvasPerformanceFarPreviewPending.shift();
+        canvasPerformanceFarPreviewActive += 1;
+        const image = new Image();
+        image.decoding = 'async';
+        const finish = result => {
+            canvasPerformanceFarPreviewActive = Math.max(0, canvasPerformanceFarPreviewActive - 1);
+            task.resolve(result);
+            setTimeout(() => {
+                if(canvasPerformanceFarPreviewImages.get(task.url) === task.promise) canvasPerformanceFarPreviewImages.delete(task.url);
+            }, 1000);
+            pumpCanvasPerformanceFarPreviewImages();
+        };
+        image.onload = () => finish(image);
+        image.onerror = () => finish(null);
+        image.src = task.url;
+    }
+}
+function loadCanvasPerformanceFarPreview(url){
+    const src = String(url || '');
+    if(!src) return Promise.resolve(null);
+    if(canvasPerformanceFarPreviewImages.has(src)) return canvasPerformanceFarPreviewImages.get(src);
+    let resolveTask;
+    const promise = new Promise(resolve => { resolveTask = resolve; });
+    const task = {url:src, promise, resolve:resolveTask};
+    canvasPerformanceFarPreviewImages.set(src, promise);
+    canvasPerformanceFarPreviewPending.push(task);
+    pumpCanvasPerformanceFarPreviewImages();
+    return promise;
+}
+function flushCanvasPerformanceFarOutputDraws(){
+    canvasPerformanceFarOutputDrawFrame = 0;
+    const batch = [...canvasPerformanceFarOutputDrawQueue.entries()].slice(0, CANVAS_PERFORMANCE_FAR_OUTPUT_BATCH);
+    batch.forEach(([canvasElement, value]) => {
+        canvasPerformanceFarOutputDrawQueue.delete(canvasElement);
+        if(!canvasElement.isConnected) return;
+        try {
+            drawCanvasPerformanceFarOutput(canvasElement, value.node, value.blueprint);
+        } catch(error){
+            console.warn('[canvas] 极远景输出预览绘制失败，已跳过当前预览：', error);
+        }
+    });
+    if(canvasPerformanceFarOutputDrawQueue.size){
+        canvasPerformanceFarOutputDrawFrame = requestAnimationFrame(flushCanvasPerformanceFarOutputDraws);
+    }
+}
+function scheduleCanvasPerformanceFarOutputDraw(canvasElement, node, blueprint){
+    if(!canvasElement) return;
+    canvasPerformanceFarOutputDrawQueue.set(canvasElement, {node, blueprint});
+    if(!canvasPerformanceFarOutputDrawFrame){
+        canvasPerformanceFarOutputDrawFrame = requestAnimationFrame(flushCanvasPerformanceFarOutputDraws);
+    }
+}
+function clearCanvasPerformanceFarOutputDraws(){
+    if(canvasPerformanceFarOutputDrawFrame) cancelAnimationFrame(canvasPerformanceFarOutputDrawFrame);
+    canvasPerformanceFarOutputDrawFrame = 0;
+    canvasPerformanceFarOutputDrawQueue.clear();
+    canvasPerformanceFarPreviewPending.splice(0).forEach(task => {
+        if(canvasPerformanceFarPreviewImages.get(task.url) === task.promise) canvasPerformanceFarPreviewImages.delete(task.url);
+        task.resolve(null);
+    });
+}
+function drawCanvasPerformanceFarOutput(canvasElement, node, blueprint){
+    if(!canvasElement) return;
+    const slots = blueprint.mediaSlots || [];
+    const rect = cachedCanvasNodeRect(node);
+    const cssWidth = Math.max(96, rect.w - 24);
+    const cssHeight = Math.max(56, rect.h - 66);
+    const raster = CanvasPerformance.farOutputRasterSize(
+        cssWidth,
+        cssHeight,
+        viewport.scale,
+        window.devicePixelRatio || 1,
+    );
+    const width = raster.width;
+    const height = raster.height;
+    canvasElement.width = width;
+    canvasElement.height = height;
+    const context = canvasElement.getContext('2d', {alpha:false});
+    if(!context) return;
+    const styles = getComputedStyle(document.body);
+    const background = styles.getPropertyValue('--soft').trim() || '#f1f5f9';
+    const border = styles.getPropertyValue('--line').trim() || '#dbe3ed';
+    const foreground = styles.getPropertyValue('--faint').trim() || '#94a3b8';
+    context.fillStyle = background;
+    context.fillRect(0, 0, width, height);
+    const count = slots.length;
+    if(!count) return;
+    const explicitColumns = Math.max(0, Number(node?.outputLayout?.cols) || 0);
+    const columns = Math.min(count, explicitColumns || Math.max(1, Math.floor((cssWidth + 10) / 160)));
+    const rows = Math.max(1, Math.ceil(count / columns));
+    const gap = Math.max(2, Math.min(7, width * 0.012));
+    const cellWidth = (width - gap * (columns - 1)) / columns;
+    const cellHeight = (height - gap * (rows - 1)) / rows;
+    const drawSlot = (index, image=null) => {
+        if(index >= count || !canvasElement.isConnected) return;
+        const column = index % columns;
+        const row = Math.floor(index / columns);
+        const x = column * (cellWidth + gap);
+        const y = row * (cellHeight + gap);
+        context.fillStyle = background;
+        context.fillRect(x, y, cellWidth, cellHeight);
+        if(image){
+            const ratio = Math.max(cellWidth / image.naturalWidth, cellHeight / image.naturalHeight);
+            const drawWidth = image.naturalWidth * ratio;
+            const drawHeight = image.naturalHeight * ratio;
+            context.save();
+            context.beginPath();
+            context.rect(x, y, cellWidth, cellHeight);
+            context.clip();
+            context.drawImage(image, x + (cellWidth - drawWidth) / 2, y + (cellHeight - drawHeight) / 2, drawWidth, drawHeight);
+            context.restore();
+        } else {
+            context.strokeStyle = border;
+            context.lineWidth = Math.max(1, width / 480);
+            context.strokeRect(x + 0.5, y + 0.5, Math.max(0, cellWidth - 1), Math.max(0, cellHeight - 1));
+            context.fillStyle = foreground;
+            context.globalAlpha = 0.55;
+            const dot = Math.max(3, Math.min(cellWidth, cellHeight) * 0.08);
+            context.beginPath();
+            context.arc(x + cellWidth / 2, y + cellHeight / 2, dot, 0, Math.PI * 2);
+            context.fill();
+            context.globalAlpha = 1;
+        }
+    };
+    for(let index = 0; index < count; index++) drawSlot(index);
+    slots.forEach((slot, index) => {
+        if(slot.pending || !slot.url) return;
+        const preview = canvasMediaPreviewUrl(slot.url, CANVAS_PERFORMANCE_LITE_MEDIA_WIDTH);
+        if(!preview) return;
+        loadCanvasPerformanceFarPreview(preview).then(image => {
+            if(image) drawSlot(index, image);
+        });
+    });
+}
+function renderCanvasPerformanceFarNode(node){
+    const blueprint = CanvasPerformance.farNodeBlueprint(node);
+    const rect = cachedCanvasNodeRect(node);
+    const element = document.createElement('div');
+    element.className = `node ${node.type}-node ${node.url ? 'has-image' : ''} sized canvas-perf-node-far canvas-perf-far-${blueprint.family} ${selected.has(node.id) ? 'selected' : ''} ${classicCascadePreviewNodeClasses(node.id).join(' ')}`;
+    element.style.left = `${rect.x}px`;
+    element.style.top = `${rect.y}px`;
+    element.style.width = `${rect.w}px`;
+    element.style.height = `${rect.h}px`;
+    if(node.type === 'note'){
+        const backgroundColor = /^#[0-9a-f]{6}$/i.test(String(node.backgroundColor || '')) ? node.backgroundColor : '#a86e25';
+        const textColor = /^#[0-9a-f]{6}$/i.test(String(node.textColor || '')) ? node.textColor : '#ffffff';
+        element.style.setProperty('--note-bg', backgroundColor);
+        element.style.setProperty('--note-text', textColor);
+    }
+    element.dataset.id = node.id;
+    element.dataset.canvasPerformanceTier = 'far';
+    element.dataset.canvasPerformanceFamily = blueprint.family;
+
+    const head = document.createElement('div');
+    head.className = 'node-head';
+    const title = document.createElement('span');
+    title.className = 'node-title';
+    title.textContent = canvasPerformanceNodeTitle(node);
+    head.appendChild(title);
+    element.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'node-body canvas-perf-far-body';
+    if(blueprint.family === 'image'){
+        if(blueprint.mediaSlots[0]?.url){
+            const image = document.createElement('img');
+            image.className = 'canvas-perf-far-image';
+            image.loading = 'lazy';
+            image.decoding = 'async';
+            image.alt = '';
+            image.src = canvasMediaPreviewUrl(blueprint.mediaSlots[0].url, CANVAS_PERFORMANCE_LITE_MEDIA_WIDTH);
+            body.appendChild(image);
+        } else {
+            body.insertAdjacentHTML('beforeend', '<div class="canvas-perf-far-empty"></div>');
+        }
+    } else if(blueprint.family === 'output'){
+        const outputCanvas = document.createElement('canvas');
+        outputCanvas.className = 'canvas-perf-far-output';
+        outputCanvas.setAttribute('aria-hidden', 'true');
+        body.appendChild(outputCanvas);
+        scheduleCanvasPerformanceFarOutputDraw(outputCanvas, node, blueprint);
+    } else {
+        const label = canvasPerformanceFarNodeLabel(node, blueprint);
+        const landmarks = document.createElement('div');
+        landmarks.className = 'canvas-perf-far-landmarks';
+        if(label){
+            const labelElement = document.createElement('div');
+            labelElement.className = 'canvas-perf-far-label';
+            labelElement.textContent = label;
+            landmarks.appendChild(labelElement);
+        }
+        const primary = document.createElement('div');
+        primary.className = 'canvas-perf-far-panel canvas-perf-far-panel-primary';
+        landmarks.appendChild(primary);
+        if(['generator','llm','loop'].includes(blueprint.family)){
+            const secondary = document.createElement('div');
+            secondary.className = 'canvas-perf-far-panel canvas-perf-far-panel-secondary';
+            landmarks.appendChild(secondary);
+        }
+        if(blueprint.summary){
+            const summary = document.createElement('div');
+            summary.className = 'canvas-perf-far-summary';
+            summary.textContent = blueprint.summary;
+            landmarks.appendChild(summary);
+        }
+        if(blueprint.showAction){
+            const action = document.createElement('div');
+            action.className = 'canvas-perf-far-action';
+            action.textContent = node.type === 'llm' ? 'LLM' : (node.type === 'loop' ? tr('canvas.loopNode') : canvasPerformanceNodeTitle(node));
+            landmarks.appendChild(action);
+        }
+        body.appendChild(landmarks);
+    }
+    element.appendChild(body);
+    if(blueprint.ports.input) element.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
+    if(blueprint.ports.output) element.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
+    return element;
+}
+function renderCanvasPerformanceNode(node, tier){
+    if(tier === 'far') return renderCanvasPerformanceFarNode(node);
+    const element = renderNode(node);
+    element.dataset.canvasPerformanceTier = 'full';
+    return tier === 'lite' ? dehydrateCanvasPerformanceNode(element, node) : element;
+}
+function reconcileCanvasPerformanceNodes(force=false){
+    canvasPerformanceReconcileFrame = 0;
+    if(!canvasPerformanceIsActive()) return;
+    try {
+        canvasPerformanceRenderMode = canvasPerformanceInteracting && !force
+            ? CanvasPerformance.nextRenderModeDuringInteraction(canvasPerformanceRenderMode, viewport.scale)
+            : CanvasPerformance.nextRenderMode(canvasPerformanceRenderMode, viewport.scale, false);
+        if(canvasPerformanceRenderMode !== 'far') clearCanvasPerformanceFarOutputDraws();
+        const desired = desiredCanvasPerformanceNodeTiers();
+        const existing = new Map();
+        nodesEl.querySelectorAll('.node[data-canvas-performance-tier]').forEach(element => existing.set(element.dataset.id, element));
+        let changed = false;
+        existing.forEach((element, id) => {
+            if(desired.has(id)) return;
+            element.remove();
+            changed = true;
+        });
+        desired.forEach((tier, id) => {
+            const node = nodes.find(item => item.id === id);
+            if(!node) return;
+            const current = existing.get(id);
+            if(current?.isConnected && current.dataset.canvasPerformanceTier === tier){
+                current.classList.toggle('selected', selected.has(id));
+                return;
+            }
+            if(current?.isConnected && current.dataset.canvasPerformanceTier === 'full' && tier === 'lite'){
+                dehydrateCanvasPerformanceNode(current, node);
+                current.classList.toggle('selected', selected.has(id));
+                changed = true;
+                return;
+            }
+            if(current?.isConnected && current.dataset.canvasPerformanceTier === 'lite' && tier === 'full'){
+                rehydrateCanvasPerformanceNode(current, node);
+                current.classList.toggle('selected', selected.has(id));
+                changed = true;
+                return;
+            }
+            const fresh = renderCanvasPerformanceNode(node, tier);
+            const order = nodes.indexOf(node);
+            if(current?.isConnected) current.replaceWith(fresh);
+            else insertCanvasNodeElementInOrder(fresh, order);
+            fresh.dataset.nodeOrder = String(order);
+            changed = true;
+        });
+        if(changed){
+            bindCanvasPreviewImageFallbacks(nodesEl);
+            cacheRenderedCanvasNodeSizes(nodesEl);
+            refreshIcons();
+        }
+        if(force && canvasPerformanceRenderMode === 'far'){
+            nodesEl.querySelectorAll('canvas.canvas-perf-far-output').forEach(outputCanvas => {
+                const node = (nodes || []).find(item => item.id === outputCanvas.closest('.node')?.dataset.id);
+                if(node) scheduleCanvasPerformanceFarOutputDraw(outputCanvas, node, CanvasPerformance.farNodeBlueprint(node));
+            });
+        }
+        if(changed || force) renderLinks();
+    } catch(error){
+        console.error('[canvas] 大画布性能模式异常，已回退全量渲染：', error);
+        canvasPerformanceFailedIds.add(canvas?.id || '');
+        updateCanvasPerformanceToggle();
+        setStatus('性能模式已自动关闭，画布数据未改变');
+        render();
+    }
+}
+function scheduleCanvasPerformanceReconcile(force=false){
+    if(!canvasPerformanceIsActive()) return;
+    if(force && canvasPerformanceReconcileFrame) cancelAnimationFrame(canvasPerformanceReconcileFrame);
+    if(canvasPerformanceReconcileFrame && !force) return;
+    canvasPerformanceReconcileFrame = requestAnimationFrame(() => reconcileCanvasPerformanceNodes(force));
+}
+function markCanvasViewportInteraction(){
+    canvasPerformanceInteracting = true;
+    document.body.classList.add('canvas-viewport-interacting');
+    if(canvasPerformanceInteractionTimer) clearTimeout(canvasPerformanceInteractionTimer);
+    scheduleCanvasPerformanceReconcile(false);
+    canvasPerformanceInteractionTimer = setTimeout(() => {
+        canvasPerformanceInteractionTimer = 0;
+        canvasPerformanceInteracting = false;
+        document.body.classList.remove('canvas-viewport-interacting');
+        scheduleCanvasPerformanceReconcile(true);
+        scheduleCanvasImageResolutionSync(nodesEl, 0);
+    }, 200);
+}
+canvasPerformanceToggle?.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    if(!canvas?.id || !CanvasPerformance) return;
+    const disable = canvasPerformanceIsActive();
+    CanvasPerformance.setCanvasDisabled(window.localStorage, canvas.id, disable);
+    if(!disable) canvasPerformanceFailedIds.delete(canvas.id);
+    canvasPerformanceRenderMode = CanvasPerformance.nextRenderMode('full', viewport.scale, true);
+    markCanvasGeometryDirty();
+    updateCanvasPerformanceToggle();
+    render();
+    setStatus(disable ? '大画布性能模式已关闭' : '大画布性能模式已开启');
+});
+function canvasPerformanceLiteElement(target){
+    return target?.closest?.('.node.canvas-perf-node-lite, .node.canvas-perf-node-far') || null;
+}
+function canvasPerformanceLiteImageDropTarget(element){
+    return element?.querySelector?.('.image-preview-wrap, .blank-image') || null;
+}
+nodesEl?.addEventListener('mousedown', event => {
+    const element = canvasPerformanceLiteElement(event.target);
+    if(!element || event.button !== 0 || event.detail >= 2) return;
+    const node = nodes.find(item => item.id === element.dataset.id);
+    if(node) startNodeDrag(event, node);
+});
+nodesEl?.addEventListener('click', event => {
+    const element = canvasPerformanceLiteElement(event.target);
+    if(!element) return;
+    event.stopPropagation();
+    const id = element.dataset.id;
+    if(event.ctrlKey || event.metaKey) selected.has(id) ? selected.delete(id) : selected.add(id);
+    else if(!selected.has(id)){ selected.clear(); selected.add(id); }
+    refreshSelectionVisuals();
+    scheduleCanvasPerformanceReconcile(true);
+});
+nodesEl?.addEventListener('dblclick', event => {
+    const element = canvasPerformanceLiteElement(event.target);
+    if(!element) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const node = nodes.find(item => item.id === element.dataset.id);
+    if(node?.type === 'image' && node.url && mediaKindForNode(node) === 'image'){
+        openImageEditor(element.dataset.id, (event.shiftKey || event.altKey) ? 'crop' : 'preview');
+        return;
+    }
+    selected.clear();
+    selected.add(element.dataset.id);
+    refreshSelectionVisuals();
+    scheduleCanvasPerformanceReconcile(true);
+});
+nodesEl?.addEventListener('contextmenu', event => {
+    const element = canvasPerformanceLiteElement(event.target);
+    if(!element) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const node = nodes.find(item => item.id === element.dataset.id);
+    if(node?.type === 'image') openImageNodeMenu(node.id, event.clientX, event.clientY);
+    else if(node?.type === 'output') openOutputNodeMenu(node.id, event.clientX, event.clientY);
+    else if(CANVAS_GENERATOR_TYPES.includes(node?.type)) openGeneratorNodeMenu(node.id, event.clientX, event.clientY);
+});
+nodesEl?.addEventListener('dragover', event => {
+    const element = canvasPerformanceLiteElement(event.target);
+    const node = element && nodes.find(item => item.id === element.dataset.id);
+    if(node?.type === 'image' && element.dataset.canvasPerformanceTier === 'lite'){
+        allowImageNodeDropEvent(event, canvasPerformanceLiteImageDropTarget(element));
+    }
+});
+nodesEl?.addEventListener('dragleave', event => {
+    const element = canvasPerformanceLiteElement(event.target);
+    const node = element && nodes.find(item => item.id === element.dataset.id);
+    if(node?.type === 'image' && element.dataset.canvasPerformanceTier === 'lite'){
+        canvasPerformanceLiteImageDropTarget(element)?.classList.remove('drag-over');
+    }
+});
+nodesEl?.addEventListener('drop', event => {
+    const element = canvasPerformanceLiteElement(event.target);
+    const node = element && nodes.find(item => item.id === element.dataset.id);
+    if(node?.type === 'image' && element.dataset.canvasPerformanceTier === 'lite'){
+        handleImageNodeDropEvent(event, element.dataset.id, canvasPerformanceLiteImageDropTarget(element));
+    }
+});
 let saveTimer = null;
 let creatingCanvas = false;
 let createCanvasKind = 'classic';
@@ -550,6 +1355,7 @@ const CANVAS_COLOR_OPTIONS = ['red','orange','amber','green','teal','blue','viol
 // 先绑定返回，避免编辑器后续初始化较慢时丢失来源项目。
 backToManagerBtn?.addEventListener('click', async () => {
     await waitForCanvasLLMSubmissions();
+    if(!await flushClassicCanvasSave()) return;
     window.location.href = canvasListUrlForProject(canvas?.project || requestedCanvasListProject() || rememberedCanvasListProject());
 });
 window.addEventListener('beforeunload', event => {
@@ -769,7 +1575,7 @@ function localViewportForCanvas(canvasId, fallback={x:0, y:0, scale:1}){
     return {
         x:Number.isFinite(Number(item.x)) ? Number(item.x) : Number(fallback.x || 0),
         y:Number.isFinite(Number(item.y)) ? Number(item.y) : Number(fallback.y || 0),
-        scale:Number.isFinite(Number(item.scale)) ? Math.max(.12, Math.min(8, Number(item.scale))) : Number(fallback.scale || 1)
+        scale:Number.isFinite(Number(item.scale)) ? Math.max(.06, Math.min(8, Number(item.scale))) : Number(fallback.scale || 1)
     };
 }
 function saveLocalViewport(){
@@ -785,6 +1591,104 @@ function saveLocalViewport(){
     try {
         sessionStorage.setItem(CANVAS_SESSION_VIEWPORTS_KEY, JSON.stringify(map));
     } catch(e) {}
+}
+const CANVAS_VIEW_PREFERENCES_KEY = 'classicCanvasViewPreferences:v1';
+const CANVAS_GRID_SNAP_SIZE = 24;
+function loadCanvasViewPreferenceMap(){
+    try {
+        const data = JSON.parse(localStorage.getItem(CANVAS_VIEW_PREFERENCES_KEY) || '{}');
+        return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+    } catch(e) {
+        return {};
+    }
+}
+function loadCanvasViewPreferences(canvasId){
+    const id = String(canvasId || '');
+    const item = id ? loadCanvasViewPreferenceMap()[id] : null;
+    canvasViewPreferences = {
+        canvasId:id,
+        minimapVisible:item?.minimapVisible !== false,
+        gridSnapEnabled:item?.gridSnapEnabled === true,
+    };
+    minimapGeometryDirty = true;
+    updateCanvasViewControls();
+}
+function saveCanvasViewPreferences(){
+    const id = String(canvasViewPreferences.canvasId || canvas?.id || '');
+    if(!id) return;
+    const map = loadCanvasViewPreferenceMap();
+    map[id] = {
+        minimapVisible:Boolean(canvasViewPreferences.minimapVisible),
+        gridSnapEnabled:Boolean(canvasViewPreferences.gridSnapEnabled),
+        updatedAt:Date.now(),
+    };
+    try { localStorage.setItem(CANVAS_VIEW_PREFERENCES_KEY, JSON.stringify(map)); } catch(e) {}
+}
+function canvasMinimapIsVisible(){
+    return Boolean(canvas?.id && (canvasViewPreferences.canvasId !== canvas.id || canvasViewPreferences.minimapVisible));
+}
+function canvasGridSnapIsEnabled(){
+    return Boolean(canvas?.id && canvasViewPreferences.canvasId === canvas.id && canvasViewPreferences.gridSnapEnabled);
+}
+function updateCanvasZoomLabel(){
+    const percent = Math.round(Math.max(0.01, Number(viewport.scale) || 1) * 100);
+    if(canvasZoomValue) canvasZoomValue.textContent = `${percent}%`;
+    if(canvasZoomInput && document.activeElement !== canvasZoomInput) canvasZoomInput.value = String(Math.max(6, Math.min(800, percent)));
+}
+function updateCanvasViewControls(){
+    if(!canvasViewControls) return;
+    const available = Boolean(canvas?.id);
+    canvasViewControls.hidden = !available;
+    const minimapVisible = available ? canvasMinimapIsVisible() : true;
+    const snapEnabled = available ? canvasGridSnapIsEnabled() : false;
+    minimap?.classList.toggle('is-hidden', !minimapVisible);
+    minimapToggle?.setAttribute('aria-pressed', minimapVisible ? 'true' : 'false');
+    minimapToggle?.setAttribute('aria-label', minimapVisible ? '关闭小地图' : '打开小地图');
+    minimapToggle?.setAttribute('title', minimapVisible ? '关闭小地图' : '打开小地图');
+    canvasGridSnapToggle?.setAttribute('aria-pressed', snapEnabled ? 'true' : 'false');
+    canvasGridSnapToggle?.setAttribute('aria-label', snapEnabled ? '关闭网格吸附' : '开启网格吸附');
+    canvasGridSnapToggle?.setAttribute('title', snapEnabled ? '关闭网格吸附' : '开启网格吸附');
+    updateCanvasZoomLabel();
+}
+function setCanvasViewPreference(field, value){
+    if(!canvas?.id) return;
+    if(canvasViewPreferences.canvasId !== canvas.id) loadCanvasViewPreferences(canvas.id);
+    canvasViewPreferences[field] = Boolean(value);
+    saveCanvasViewPreferences();
+    updateCanvasViewControls();
+    if(field === 'minimapVisible' && canvasViewPreferences.minimapVisible){
+        minimapGeometryDirty = true;
+        scheduleMinimapRender();
+    }
+}
+function closeCanvasZoomMenu(){
+    if(!canvasZoomMenu) return;
+    canvasZoomMenu.hidden = true;
+    canvasZoomBtn?.setAttribute('aria-expanded', 'false');
+}
+function toggleCanvasZoomMenu(){
+    if(!canvasZoomMenu || !canvas?.id) return;
+    const open = canvasZoomMenu.hidden;
+    canvasZoomMenu.hidden = !open;
+    canvasZoomBtn?.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if(open) updateCanvasZoomLabel();
+}
+function setCanvasZoomPercent(percent){
+    if(!canvas || !Number.isFinite(Number(percent))) return false;
+    const nextScale = Math.max(0.06, Math.min(8, Number(percent) / 100));
+    const boardRect = board.getBoundingClientRect();
+    const center = {x:boardRect.width / 2, y:boardRect.height / 2};
+    const before = screenToWorld(boardRect.left + center.x, boardRect.top + center.y);
+    viewport.scale = nextScale;
+    viewport.x = center.x - before.x * viewport.scale;
+    viewport.y = center.y - before.y * viewport.scale;
+    applyViewport();
+    scheduleViewportSave();
+    updateCanvasZoomLabel();
+    return true;
+}
+function canvasSnapCoordinate(value){
+    return Math.round((Number(value) || 0) / CANVAS_GRID_SNAP_SIZE) * CANVAS_GRID_SNAP_SIZE;
 }
 function applyTheme(theme){
     const dark = theme === 'dark';
@@ -1525,14 +2429,28 @@ function refreshGateViewControls(){
 function setCanvasMode(open){
     shell.classList.toggle('no-canvas', !open);
     if(!open){
+        persistCanvasNodeSizeCache(true);
+        clearCanvasPerformanceFarOutputDraws();
         nodesEl.innerHTML = '';
         linksEl.innerHTML = '';
         linkControlsEl.innerHTML = '';
+        clearCanvasPerformanceFarLinkCache();
         selectionHub.classList.remove('open');
-    } else if(currentCanvasTitle) {
-        currentCanvasTitle.textContent = canvas?.title || tr('canvas.untitled');
-        currentCanvasTime.textContent = formatCanvasTime(canvas?.updated_at || canvas?.created_at);
+        canvasSpatialIndex = null;
+        canvasNodeSizeCache.clear();
+        canvasNodeSizeCacheCanvasId = '';
+        markCanvasGeometryDirty();
+        canvasViewPreferences = {canvasId:'', minimapVisible:true, gridSnapEnabled:false};
+    } else {
+        prepareCanvasNodeSizeCache(canvas?.id);
+        if(currentCanvasTitle){
+            currentCanvasTitle.textContent = canvas?.title || tr('canvas.untitled');
+            currentCanvasTime.textContent = formatCanvasTime(canvas?.updated_at || canvas?.created_at);
+        }
     }
+    loadCanvasViewPreferences(open ? canvas?.id : '');
+    updateCanvasPerformanceToggle();
+    updateCanvasViewControls();
     refreshIcons();
 }
 function ensureCanvas(){
@@ -1565,15 +2483,39 @@ function screenToWorld(clientX, clientY){
 }
 function applyViewport(){
     world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`;
+    if(typeof updateCanvasZoomLabel === 'function') updateCanvasZoomLabel();
     scheduleViewportOverlayUpdate();
-    scheduleCanvasImageResolutionSync(nodesEl, 120);
+    if(typeof markCanvasViewportInteraction === 'function') markCanvasViewportInteraction();
+    else if(typeof scheduleCanvasImageResolutionSync === 'function') scheduleCanvasImageResolutionSync(nodesEl, 200);
+}
+function scheduleCanvasWheelViewportApply(){
+    if(canvasWheelViewportFrame) return;
+    canvasWheelViewportFrame = requestAnimationFrame(() => {
+        canvasWheelViewportFrame = 0;
+        applyViewport();
+    });
+}
+function scheduleCanvasWheelViewportSave(){
+    if(canvasWheelViewportSaveTimer) clearTimeout(canvasWheelViewportSaveTimer);
+    canvasWheelViewportSaveTimer = setTimeout(() => {
+        canvasWheelViewportSaveTimer = 0;
+        saveLocalViewport();
+    }, 200);
+}
+function flushCanvasWheelViewportWork(save=false){
+    if(canvasWheelViewportFrame){
+        cancelAnimationFrame(canvasWheelViewportFrame);
+        canvasWheelViewportFrame = 0;
+        applyViewport();
+    }
+    if(canvasWheelViewportSaveTimer){
+        clearTimeout(canvasWheelViewportSaveTimer);
+        canvasWheelViewportSaveTimer = 0;
+        if(save) saveLocalViewport();
+    }
 }
 function estimatedNodeRect(n){
-    const el = nodesEl?.querySelector?.(`.node[data-id="${CSS.escape(n.id)}"]`);
-    const size = defaultNodeSize(n.type);
-    const w = el?.offsetWidth || n.w || size.w || 260;
-    const h = el?.offsetHeight || n.h || size.h || 160;
-    return {x:n.x || 0, y:n.y || 0, w, h};
+    return cachedCanvasNodeRect(n);
 }
 function currentWorldViewRect(){
     const rect = board.getBoundingClientRect();
@@ -1601,6 +2543,7 @@ function minimapBounds(){
 }
 function scheduleMinimapRender(){
     minimapGeometryDirty = true;
+    if(!canvasMinimapIsVisible()) return;
     if(minimapRenderQueued) return;
     minimapRenderQueued = true;
     requestAnimationFrame(() => {
@@ -1626,7 +2569,8 @@ function viewportRectFitsMinimapBounds(rect, bounds){
 }
 function updateViewportOverlays(){
     const viewRect = currentWorldViewRect();
-    if(!minimapRenderQueued){
+    const minimapVisible = typeof canvasMinimapIsVisible !== 'function' || canvasMinimapIsVisible();
+    if(minimapVisible && !minimapRenderQueued){
         if(!minimapState || minimapGeometryDirty || !viewportRectFitsMinimapBounds(viewRect, minimapState.bounds)) renderMinimap();
         else updateMinimapViewport(viewRect);
     }
@@ -1641,7 +2585,7 @@ function scheduleViewportOverlayUpdate(){
     });
 }
 function renderMinimap(){
-    if(!minimapContent || !minimapViewport) return;
+    if(!minimapContent || !minimapViewport || !canvasMinimapIsVisible()) return;
     canvasArrangeBtn?.classList.toggle('visible', selected.size > 0);
     const bounds = minimapBounds();
     const cw = minimapContent.clientWidth || 172;
@@ -1654,7 +2598,7 @@ function renderMinimap(){
     minimapState = {bounds, scale, ox, oy, cw, ch};
     const nodeHtml = (nodes || []).map(n => {
         const r = estimatedNodeRect(n);
-        return `<div class="minimap-node ${selected.has(n.id) ? 'selected' : ''}" style="left:${ox + (r.x - bounds.x) * scale}px;top:${oy + (r.y - bounds.y) * scale}px;width:${Math.max(3, r.w * scale)}px;height:${Math.max(3, r.h * scale)}px"></div>`;
+        return `<div class="minimap-node ${selected.has(n.id) ? 'selected' : ''}" data-node-id="${escapeAttr(n.id)}" style="left:${ox + (r.x - bounds.x) * scale}px;top:${oy + (r.y - bounds.y) * scale}px;width:${Math.max(3, r.w * scale)}px;height:${Math.max(3, r.h * scale)}px"></div>`;
     }).join('');
     minimapContent.innerHTML = `${nodeHtml}${nodes?.length ? '' : '<div class="minimap-empty">EMPTY</div>'}<div id="minimapViewport" class="minimap-viewport"></div>`;
     minimapViewport = document.getElementById('minimapViewport');
@@ -1686,7 +2630,7 @@ function centerViewportOnWorldPoint(point){
 }
 function safeViewportScale(value){
     const n = Number(value);
-    return Number.isFinite(n) && n > 0 ? n : 1;
+    return Number.isFinite(n) && n > 0 ? Math.max(0.06, Math.min(8, n)) : 1;
 }
 function fitAllNodesViewport(){
     const rect = board.getBoundingClientRect();
@@ -1783,6 +2727,24 @@ function refreshGeometryAfterLayout(){
         refreshGeometry();
         requestAnimationFrame(refreshGeometry);
     });
+}
+async function flushClassicCanvasSave(){
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    const deadline = Date.now() + 8000;
+    while(savingCanvasNow && Date.now() < deadline){
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    if(localCanvasDirty) await saveCanvas();
+    while((savingCanvasNow || localCanvasDirty || saveCanvasAgain) && Date.now() < deadline){
+        if(!savingCanvasNow && localCanvasDirty) await saveCanvas();
+        else await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    if(savingCanvasNow || localCanvasDirty || saveCanvasAgain){
+        setStatus(langIsEn() ? 'Save failed. Please try again.' : '画布保存失败，请重试');
+        return false;
+    }
+    return true;
 }
 function scheduleSave(){
     if(!canvas || applyingRemoteCanvas) return;
@@ -2643,6 +3605,7 @@ function applyRemoteCanvasData(remote, runtimeId=canvasTaskRuntimeId){
         canvas.logs = canvas.logs || [];
         nodes = canvas.nodes || [];
         connections = canvas.connections || [];
+        loadCanvasViewPreferences(canvas.id);
         viewport = localViewport;
         canvas.viewport = {...viewport};
         lastCanvasUpdatedAt = Number(canvas.updated_at || Date.now());
@@ -2777,8 +3740,7 @@ function handleCanvasUpdatedMessage(data){
 }
 async function returnToCanvasManager(){
     await waitForCanvasLLMSubmissions();
-    clearTimeout(saveTimer);
-    if(canvas && localCanvasDirty) await saveCanvas();
+    if(!await flushClassicCanvasSave()) return;
     stopCanvasRemotePolling();
     canvas = null;
     nodes = [];
@@ -2908,6 +3870,13 @@ window.addEventListener('resize', () => requestAnimationFrame(positionCanvasMeta
 window.addEventListener('studio-theme-change', event => {
     applyTheme(event.detail?.theme || 'light');
     syncCanvasChatContext();
+    if(canvasPerformanceRenderMode === 'far'){
+        nodesEl?.querySelectorAll?.('canvas.canvas-perf-far-output').forEach(outputCanvas => {
+            const node = (nodes || []).find(item => item.id === outputCanvas.closest('.node')?.dataset.id);
+            if(node) scheduleCanvasPerformanceFarOutputDraw(outputCanvas, node, CanvasPerformance.farNodeBlueprint(node));
+        });
+        renderLinks();
+    }
 });
 function cropDragModeFromPointer(event){
     const explicit = event.target.closest?.('[data-crop-handle]')?.dataset?.cropHandle;
@@ -6888,17 +7857,28 @@ function render(){
         const node = nodes.find(n => n.id === el.dataset.id);
         if(nodeHasLiveMedia(node)) reusableMediaNodes.set(node.id, el);
     });
+    updateCanvasPerformanceToggle();
+    if(canvasPerformanceIsActive()) canvasPerformanceRenderMode = CanvasPerformance.nextRenderMode(canvasPerformanceRenderMode, viewport.scale, true);
+    markCanvasGeometryDirty();
+    ensureCanvasSpatialIndex();
+    const performanceTiers = desiredCanvasPerformanceNodeTiers();
     applyViewport();
     [...nodesEl.children].forEach(child => {
         if(!reusableMediaNodes.has(child.dataset?.id)) child.remove();
     });
-    nodes.forEach(node => {
+    const fragment = document.createDocumentFragment();
+    nodes.forEach((node, order) => {
         // 单个节点渲染异常不能中断整个循环，否则它后面的节点（含新建节点，通常排在末尾）都不会被
         // 追加进 DOM，连带这些节点的连线也会因找不到 DOM 而画到 (0,0) 变成“消失”。
         try {
-            const fresh = isCanvasFrameNode(node) ? renderCanvasFrameNode(node) : renderNode(node);
+            const performanceTier = performanceTiers?.get(node.id) || '';
+            if(performanceTiers && canvasPerformanceNodeEligible(node) && !performanceTier) return;
+            const fresh = isCanvasFrameNode(node)
+                ? renderCanvasFrameNode(node)
+                : (performanceTier ? renderCanvasPerformanceNode(node, performanceTier) : renderNode(node));
+            fresh.dataset.nodeOrder = String(order);
             const old = reusableMediaNodes.get(node.id);
-            nodesEl.appendChild(fresh);
+            fragment.appendChild(fresh);
             if(old){
                 transplantNodeMediaElement(old, fresh);
                 if(old !== fresh) old.remove();
@@ -6907,13 +7887,17 @@ function render(){
             console.error('[canvas] renderNode 失败，已跳过该节点：', node?.id, node?.type, err);
         }
     });
+    nodesEl.appendChild(fragment);
     restoreMediaPlaybackStates(mediaStates);
     restoreOutputScrolls(outputScrolls);
     refreshGeometry();
     refreshGeometryAfterLayout();
+    cacheRenderedCanvasNodeSizes(nodesEl);
+    markCanvasGeometryDirty();
+    rebuildCanvasSpatialIndex();
     refreshIcons();
     bindCanvasPreviewImageFallbacks(nodesEl);
-    syncCanvasSelectedImageResolution(nodesEl);
+    scheduleCanvasImageResolutionSync(nodesEl, 200);
     measureCanvasOriginalImageNodes(nodesEl);
     refreshOutputTimer();
     scheduleMinimapRender();
@@ -6923,17 +7907,30 @@ function refreshNodes(ids=[]){
     if(!uniqueIds.length) return;
     const outputScrolls = captureOutputScrolls();
     applyViewport();
+    const performanceTiers = desiredCanvasPerformanceNodeTiers();
     for(const id of uniqueIds){
         const node = nodes.find(n => n.id === id);
         if(!node) continue;
         if(node.type === 'output' && refreshOutputNodeContent(node)) continue;
         const current = canvasNodeElement(id);
+        const performanceTier = performanceTiers?.get(id) || '';
+        if(performanceTiers && canvasPerformanceNodeEligible(node) && !performanceTier){
+            current?.remove();
+            continue;
+        }
         if(!current){
+            if(performanceTier){
+                insertCanvasNodeElementInOrder(renderCanvasPerformanceNode(node, performanceTier), nodes.indexOf(node));
+                continue;
+            }
             render();
             return;
         }
         try {
-            const fresh = isCanvasFrameNode(node) ? renderCanvasFrameNode(node) : renderNode(node);
+            const fresh = isCanvasFrameNode(node)
+                ? renderCanvasFrameNode(node)
+                : (performanceTier ? renderCanvasPerformanceNode(node, performanceTier) : renderNode(node));
+            fresh.dataset.nodeOrder = String(nodes.indexOf(node));
             if(nodeHasLiveMedia(node)) transplantNodeMediaElement(current, fresh);
             current.replaceWith(fresh);
         } catch(err){
@@ -6943,9 +7940,12 @@ function refreshNodes(ids=[]){
     restoreOutputScrolls(outputScrolls);
     refreshGeometry();
     refreshGeometryAfterLayout();
+    cacheRenderedCanvasNodeSizes(nodesEl);
+    markCanvasGeometryDirty();
+    rebuildCanvasSpatialIndex();
     refreshIcons();
     bindCanvasPreviewImageFallbacks(nodesEl);
-    syncCanvasSelectedImageResolution(nodesEl);
+    scheduleCanvasImageResolutionSync(nodesEl, 200);
     measureCanvasOriginalImageNodes(nodesEl);
     refreshOutputTimer();
     scheduleMinimapRender();
@@ -7570,9 +8570,12 @@ function bindOutputWrap(wrap, node){
             e.stopPropagation();
             const pid = wrap.dataset.pendingId;
             if(pid){
+                const pending = (node._pending || []).find(item => item.id === pid);
                 node._pending = (node._pending || []).filter(p => p.id !== pid);
+                scheduleSave();
             } else {
                 const url = img?.dataset.url || video?.dataset.url || audio?.dataset.url || wrap.dataset.outputUrl || wrap.dataset.missingUrl || '';
+                const deletedItem = (node.images || []).find(item => outputUrlValue(item) === url) || url;
                 node.images = (node.images || []).filter(item => outputUrlValue(item) !== url);
                 if(node.imageComparisons) delete node.imageComparisons[url];
                 scheduleSave();
@@ -10556,6 +11559,7 @@ function openLLMPromptWorkspace(nodeId, pane='input', event=null){
     llmPromptWorkspaceState = {nodeId:node.id, pane:CLASSIC_LLM_PROMPT_WORKSPACE_PANES.some(item => item.id === pane) ? pane : 'input'};
     placeClassicLLMPromptWorkspacePanel();
     llmPromptWorkspaceModal.classList.add('open');
+    scheduleCanvasPerformanceReconcile(true);
     renderLLMPromptWorkspace();
     requestAnimationFrame(() => {
         if(!llmPromptWorkspaceEditor?.hidden && !llmPromptWorkspaceEditor?.readOnly) llmPromptWorkspaceEditor?.focus();
@@ -10566,6 +11570,7 @@ function closeLLMPromptWorkspace(){
     if(llmPromptWorkspaceModal.classList.contains('open')) saveClassicLLMPromptWorkspaceSize();
     llmPromptWorkspaceModal.classList.remove('open');
     llmPromptWorkspaceState = null;
+    scheduleCanvasPerformanceReconcile(true);
 }
 function clampLLMPromptWorkspacePanelPosition(left, top, width, height){
     const viewportW = Math.max(320, Number(window.innerWidth) || 1024);
@@ -17954,7 +18959,12 @@ function completeCanvasImageTask(taskId, result){
         run: pending.run || {},
     };
     meta.run.request = requestMetaFromResult(result);
-    const images = result.images || [];
+    const sourceImages = (result.image_items || []).length ? result.image_items : (result.images || []);
+    const images = sourceImages.map(item => {
+        const source = item && typeof item === 'object' ? {...item} : {url:item};
+        source.canvas_task_id = source.canvas_task_id || result.canvas_task_id || taskId;
+        return source;
+    }).filter(item => item.url);
     out._pending = (out._pending || []).filter(p => p.id !== pending.id);
     appendOutputImages(out, images, meta.run?.refs?.[0], [meta]);
     const gen = nodes.find(n => n.id === meta.run?.node?.id);
@@ -18082,6 +19092,7 @@ function appendOutputImages(out, images, compareRef, metas=[], layout=null){
         const item = {url:outputUrlValue(url), viewed:false, runMs:meta.runMs || 0, run:meta.run || null};
         if(source.name) item.name = source.name;
         if(source.kind || source.mediaKind) item.kind = source.kind || source.mediaKind;
+        if(source.canvas_task_id || source.canvasTaskId) item.canvas_task_id = source.canvas_task_id || source.canvasTaskId;
         if(meta.kind) item.kind = meta.kind;
         const sourceSize = outputImageResolutionSize(source) || outputImageResolutionSize(meta.grid);
         if(sourceSize){
@@ -19049,9 +20060,8 @@ function groupSelectedImages(){
 function nodeBounds(ids){
     const rects = ids.map(id => {
         const n = nodes.find(item => item.id === id);
-        const el = canvasNodeElement(id);
         if(!n) return null;
-        return {x:n.x, y:n.y, w:el?.offsetWidth || n.w || 260, h:el?.offsetHeight || n.h || 220};
+        return cachedCanvasNodeRect(n);
     }).filter(Boolean);
     const x1 = Math.min(...rects.map(r => r.x));
     const y1 = Math.min(...rects.map(r => r.y));
@@ -19107,6 +20117,7 @@ function startSelection(e){
     e.preventDefault();
     e.stopPropagation();
     if(document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+    setHoveredConnection('');
     selectDrag = {sx:e.clientX, sy:e.clientY, x:e.clientX, y:e.clientY};
     document.body.classList.add('canvas-selecting');
     selectionBox.style.display = 'block';
@@ -19119,27 +20130,71 @@ function updateSelectionBox(x, y){
     selectDrag.x = x; selectDrag.y = y;
     const left = Math.min(selectDrag.sx, x);
     const top = Math.min(selectDrag.sy, y);
-    selectionBox.style.left = `${left}px`;
-    selectionBox.style.top = `${top}px`;
+    const boardRect = board.getBoundingClientRect();
+    selectionBox.style.left = `${left - boardRect.left}px`;
+    selectionBox.style.top = `${top - boardRect.top}px`;
     selectionBox.style.width = `${Math.abs(x - selectDrag.sx)}px`;
     selectionBox.style.height = `${Math.abs(y - selectDrag.sy)}px`;
 }
+function selectionRectFullyContains(selectionRect, elementRect, epsilon=1){
+    return elementRect.left >= selectionRect.left - epsilon
+        && elementRect.right <= selectionRect.right + epsilon
+        && elementRect.top >= selectionRect.top - epsilon
+        && elementRect.bottom <= selectionRect.bottom + epsilon;
+}
+function collapseSelectedFrameMembers(){
+    if(!SpatialFrames?.collectMoveIds) return;
+    const frameIds = [...selected].filter(id => isCanvasFrameNode(nodes.find(node => node.id === id)));
+    if(!frameIds.length) return;
+    const explicitFrames = new Set(frameIds);
+    SpatialFrames.collectMoveIds(nodes, frameIds).forEach(id => {
+        if(!explicitFrames.has(id)) selected.delete(id);
+    });
+}
 function finishSelection(){
     if(!selectDrag) return;
-    const rect = selectionBox.getBoundingClientRect();
+    const screenRect = {
+        left:Math.min(selectDrag.sx, selectDrag.x),
+        top:Math.min(selectDrag.sy, selectDrag.y),
+        right:Math.max(selectDrag.sx, selectDrag.x),
+        bottom:Math.max(selectDrag.sy, selectDrag.y),
+    };
     selectionBox.style.display = 'none';
     selected.clear();
-    nodesEl.querySelectorAll('.node:not(.canvas-frame-node)').forEach(el => {
-        const r = el.getBoundingClientRect();
-        const overlaps = r.left < rect.right && r.right > rect.left && r.top < rect.bottom && r.bottom > rect.top;
-        if(overlaps) selected.add(el.dataset.id);
-    });
+    if(typeof CanvasPerformance !== 'undefined' && CanvasPerformance){
+        const topLeft = screenToWorld(screenRect.left, screenRect.top);
+        const bottomRight = screenToWorld(screenRect.right, screenRect.bottom);
+        const worldRect = {
+            x:Math.min(topLeft.x, bottomRight.x),
+            y:Math.min(topLeft.y, bottomRight.y),
+            w:Math.abs(bottomRight.x - topLeft.x),
+            h:Math.abs(bottomRight.y - topLeft.y),
+        };
+        const index = ensureCanvasSpatialIndex();
+        const nodesById = new Map(nodes.map(node => [node.id, node]));
+        CanvasPerformance.selectionFromWorldRect({
+            index,
+            nodesById,
+            rect:worldRect,
+            isFrame:isCanvasFrameNode,
+            epsilon:1 / Math.max(0.01, viewport.scale || 1),
+        }).forEach(id => selected.add(id));
+    } else {
+        nodesEl.querySelectorAll('.node:not(.canvas-frame-node)').forEach(el => {
+            const r = el.getBoundingClientRect();
+            const overlaps = r.left < screenRect.right && r.right > screenRect.left && r.top < screenRect.bottom && r.bottom > screenRect.top;
+            if(overlaps) selected.add(el.dataset.id);
+        });
+        nodesEl.querySelectorAll('.canvas-frame-node').forEach(el => {
+            if(selectionRectFullyContains(screenRect, el.getBoundingClientRect())) selected.add(el.dataset.id);
+        });
+    }
+    collapseSelectedFrameMembers();
     selectDrag = null;
     document.body.classList.remove('canvas-selecting');
     window.onmousemove = null;
     window.onmouseup = null;
-    render();
-    if(workflowTransferModal?.classList.contains('open')) updateWorkflowTransferMeta();
+    refreshSelectionVisuals();
 }
 function renderSelectionHub(){
     selectionHub.innerHTML = '';
@@ -19180,13 +20235,19 @@ function renderSelectionHub(){
 function positionSelectionHub(){
     if(!selectionHub?.classList?.contains('open')) return;
     const ids = [...selected].filter(id => nodes.some(node => node.id === id));
-    const elements = ids.map(canvasNodeElement).filter(Boolean);
-    if(!elements.length){
+    const selectedNodes = ids.map(id => nodes.find(node => node.id === id)).filter(Boolean);
+    if(!selectedNodes.length){
         selectionHub.classList.remove('open');
         return;
     }
     const boardRect = board.getBoundingClientRect();
-    const rects = elements.map(el => el.getBoundingClientRect());
+    const scale = viewport.scale || 1;
+    const rects = selectedNodes.map(node => {
+        const rect = cachedCanvasNodeRect(node);
+        const left = boardRect.left + viewport.x + rect.x * scale;
+        const top = boardRect.top + viewport.y + rect.y * scale;
+        return {left, top, right:left + rect.w * scale, bottom:top + rect.h * scale};
+    });
     const left = Math.min(...rects.map(rect => rect.left));
     const right = Math.max(...rects.map(rect => rect.right));
     const top = Math.min(...rects.map(rect => rect.top));
@@ -19234,11 +20295,16 @@ function connectSelectionToGenerator(kind, genId){
 }
 
 function snapshotForHistory(){
-    return {nodes:JSON.parse(JSON.stringify(serializableCanvasNodes())), connections:JSON.parse(JSON.stringify(connections))};
+    return {
+        nodes:JSON.parse(JSON.stringify(serializableCanvasNodes())),
+        connections:JSON.parse(JSON.stringify(connections)),
+        logs:JSON.parse(JSON.stringify(canvas?.logs || []))
+    };
 }
 function restoreHistorySnapshot(state){
     nodes = state.nodes;
     connections = state.connections;
+    if(canvas && Array.isArray(state.logs)) canvas.logs = state.logs;
     selected.clear();
     render();
     scheduleSave();
@@ -19584,6 +20650,115 @@ async function importWorkflowFile(file){
         showErrorModal(err.message || '导入工作流失败', '导入工作流');
     }
 }
+function nodeDragMovedNodes(state=dragNode){
+    if(!state?.node) return [];
+    return [state.node, ...(state.children || []).map(item => item?.node)].filter(Boolean);
+}
+function nodeDragElementIsCurrent(element){
+    return Boolean(element) && element.isConnected !== false;
+}
+function captureNodeDragLinkEntries(movedIds){
+    const entries = [];
+    connections.forEach(connection => {
+        const fromMoved = movedIds.has(connection.from);
+        const toMoved = movedIds.has(connection.to);
+        if(!fromMoved && !toMoved) return;
+        const id = CSS.escape(String(connection.id || ''));
+        const visible = linksEl.querySelector(`.link[data-connection-id="${id}"]`);
+        const hit = linksEl.querySelector(`.link-hit[data-connection-id="${id}"]`);
+        const button = linkControlsEl.querySelector(`.link-delete[data-connection-id="${id}"]`);
+        if(!visible || !hit || !button) return;
+        entries.push({
+            connection,
+            visible,
+            hit,
+            button,
+        });
+    });
+    return entries;
+}
+function captureNodeDragMinimapEntries(movedNodes){
+    if(!canvasMinimapIsVisible()) return {state:'hidden', entries:[]};
+    if(!minimapState || minimapGeometryDirty) renderMinimap();
+    if(!minimapState) return null;
+    const entries = movedNodes.map(node => {
+        const id = CSS.escape(String(node.id || ''));
+        const marker = minimapContent?.querySelector?.(`.minimap-node[data-node-id="${id}"]`);
+        const rect = estimatedNodeRect(node);
+        return marker ? {node, marker, w:rect.w, h:rect.h} : null;
+    }).filter(Boolean);
+    return {state:minimapState, entries};
+}
+function prepareNodeDragVisualState(state=dragNode){
+    if(!state?.node) return false;
+    const movedNodes = nodeDragMovedNodes(state);
+    const movedIds = new Set(movedNodes.map(node => node.id));
+    state.visualState = {
+        movedIds,
+        linkEntries:captureNodeDragLinkEntries(movedIds),
+        minimap:captureNodeDragMinimapEntries(movedNodes),
+    };
+    return true;
+}
+function updateNodeDragLinkEntries(entries){
+    const points = new Map();
+    const currentPortPoint = (id, kind) => {
+        const key = `${id}:${kind}`;
+        if(!points.has(key)) points.set(key, portPoint(id, kind));
+        return points.get(key);
+    };
+    for(const entry of entries || []){
+        if(!nodeDragElementIsCurrent(entry.visible) || !nodeDragElementIsCurrent(entry.hit) || !nodeDragElementIsCurrent(entry.button)) return false;
+        const connection = entry.connection;
+        if(!connection) return false;
+        const a = currentPortPoint(connection.from, 'out');
+        const b = currentPortPoint(connection.to, 'in');
+        updateLinkPathGeometry(entry.visible, a, b);
+        updateLinkPathGeometry(entry.hit, a, b);
+        entry.button.style.left = `${(a.x + b.x) / 2}px`;
+        entry.button.style.top = `${(a.y + b.y) / 2}px`;
+    }
+    return true;
+}
+function updateNodeDragMinimapEntries(cache){
+    if(cache?.state === 'hidden' && !canvasMinimapIsVisible()) return true;
+    if(!cache || cache.state !== minimapState || !minimapState) return false;
+    const {bounds, scale, ox, oy} = minimapState;
+    for(const entry of cache.entries || []){
+        if(!nodeDragElementIsCurrent(entry.marker)) return false;
+        const rect = {x:Number(entry.node.x) || 0, y:Number(entry.node.y) || 0, w:entry.w, h:entry.h};
+        if(!viewportRectFitsMinimapBounds(rect, bounds)) return false;
+        entry.marker.style.left = `${ox + (rect.x - bounds.x) * scale}px`;
+        entry.marker.style.top = `${oy + (rect.y - bounds.y) * scale}px`;
+        entry.marker.style.width = `${Math.max(3, rect.w * scale)}px`;
+        entry.marker.style.height = `${Math.max(3, rect.h * scale)}px`;
+    }
+    return true;
+}
+function refreshNodeDragVisuals(){
+    nodeDragVisualFrame = 0;
+    if(!dragNode) return;
+    const visualState = dragNode.visualState;
+    const linksUpdated = Boolean(visualState) && updateNodeDragLinkEntries(visualState.linkEntries);
+    const minimapUpdated = Boolean(visualState) && updateNodeDragMinimapEntries(visualState.minimap);
+    if(!linksUpdated) renderLinks();
+    if(!minimapUpdated && canvasMinimapIsVisible()) renderMinimap();
+    if(!linksUpdated || !minimapUpdated) prepareNodeDragVisualState(dragNode);
+    positionSelectionHub();
+}
+function scheduleNodeDragVisualUpdate(){
+    if(nodeDragVisualFrame || !dragNode) return;
+    nodeDragVisualFrame = requestAnimationFrame(refreshNodeDragVisuals);
+}
+function finishNodeDragVisuals(){
+    if(nodeDragVisualFrame) cancelAnimationFrame(nodeDragVisualFrame);
+    nodeDragVisualFrame = 0;
+    if(!dragNode) return;
+    dragNode.visualState = null;
+    renderLinks();
+    if(canvasMinimapIsVisible()) renderMinimap();
+    positionSelectionHub();
+}
 function startNodeDrag(e, node){
     if(e.button !== 0) return;
     if(startKnifeDrag(e)) return;
@@ -19591,7 +20766,8 @@ function startNodeDrag(e, node){
     e.stopPropagation();
     if(document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
     let dragTarget = node;
-    if(e.altKey){
+    const bypassGridSnap = Boolean(e.altKey && typeof canvasGridSnapIsEnabled === 'function' && canvasGridSnapIsEnabled());
+    if(e.altKey && !bypassGridSnap){
         setKnifeMode(false);
         pushUndo();
         const duplicated = duplicateNodesForAltDrag(node, true);
@@ -19622,15 +20798,23 @@ function startNodeDrag(e, node){
         [...selected].forEach(id => collect(nodes.find(n => n.id === id)));
     }
     const children = [...collected.values()];
-    dragNode = {node: dragTarget, children, rootIds, isFrameDrag:isFrame, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y, historyCaptured:Boolean(e.altKey)};
+    dragNode = {node: dragTarget, children, rootIds, isFrameDrag:isFrame, sx:e.clientX, sy:e.clientY, ox:dragTarget.x, oy:dragTarget.y, visualState:null, historyCaptured:Boolean(e.altKey && !bypassGridSnap)};
+    // 极远景节点没有逐条 SVG 连线。先用 dragNode 作为固定标记同步恢复被拖节点及其连线，
+    // 再抓取拖动缓存，避免第一次 mousemove 前连线停在旧位置。
+    if(canvasPerformanceIsActive()) reconcileCanvasPerformanceNodes(true);
+    prepareNodeDragVisualState(dragNode);
     document.body.classList.add('canvas-node-drag');
     window.onmousemove = onNodeDrag;
     window.onmouseup = endDrag;
 }
 function onNodeDrag(e){
     if(!dragNode) return;
-    const dx = (e.clientX - dragNode.sx) / viewport.scale;
-    const dy = (e.clientY - dragNode.sy) / viewport.scale;
+    let dx = (e.clientX - dragNode.sx) / viewport.scale;
+    let dy = (e.clientY - dragNode.sy) / viewport.scale;
+    if(typeof canvasGridSnapIsEnabled === 'function' && canvasGridSnapIsEnabled() && !e.altKey && typeof canvasSnapCoordinate === 'function'){
+        dx = canvasSnapCoordinate(dragNode.ox + dx) - dragNode.ox;
+        dy = canvasSnapCoordinate(dragNode.oy + dy) - dragNode.oy;
+    }
     if(!dragNode.historyCaptured && (dx !== 0 || dy !== 0)){
         pushUndo();
         dragNode.historyCaptured = true;
@@ -19651,10 +20835,8 @@ function onNodeDrag(e){
             childEl.style.top = `${childDrag.node.y}px`;
         }
     });
-    scheduleLinksRender();
-    scheduleViewportOverlayUpdate();
+    scheduleNodeDragVisualUpdate();
     if(workflowTransferModal?.classList.contains('open')) updateWorkflowTransferMeta();
-    scheduleMinimapRender();
 }
 function startNodeResize(e, node){
     e.preventDefault();
@@ -19917,6 +21099,7 @@ function sanitizeConnections(){
     connections = (connections || []).filter(c => canConnect(c.from, c.to));
 }
 function endDrag(event=null){
+    const hadNodeDrag = Boolean(dragNode);
     const hadContentDrag = Boolean(dragNode || resizeNode || llmPaneDrag || promptSplitResize || knifeChanged || tempLink);
     const hadViewportDrag = Boolean(dragBoard || minimapDrag);
     if(dragNode){
@@ -19928,6 +21111,7 @@ function endDrag(event=null){
             render();
         }
     }
+    if(hadNodeDrag) finishNodeDragVisuals();
     dragNode = null;
     dragBoard = null;
     resizeNode = null;
@@ -19946,15 +21130,19 @@ function endDrag(event=null){
     window.onmousemove = null;
     window.onmouseup = null;
     if(shouldRenderKnife) render();
-    if(hadContentDrag) scheduleMinimapRender();
+    if(hadContentDrag){
+        if(typeof cacheRenderedCanvasNodeSizes === 'function') cacheRenderedCanvasNodeSizes(nodesEl);
+        if(typeof markCanvasGeometryDirty === 'function') markCanvasGeometryDirty();
+        if(typeof rebuildCanvasSpatialIndex === 'function') rebuildCanvasSpatialIndex();
+        if(typeof scheduleCanvasPerformanceReconcile === 'function') scheduleCanvasPerformanceReconcile(true);
+    }
+    if(hadContentDrag && !hadNodeDrag) scheduleMinimapRender();
     if(hadContentDrag) scheduleSave();
     else if(hadViewportDrag) scheduleViewportSave();
 }
 function nodeRect(n){
-    const el = canvasNodeElement(n.id);
-    const w = el?.offsetWidth || n.w || 260;
-    const h = el?.offsetHeight || n.h || 200;
-    return {x:n.x, y:n.y, w, h, cx:n.x + w/2, cy:n.y + h/2};
+    const rect = cachedCanvasNodeRect(n);
+    return {...rect, cx:rect.x + rect.w / 2, cy:rect.y + rect.h / 2};
 }
 function connectedClusterIds(seedId){
     const ids = new Set(nodes.map(n => n.id));
@@ -20149,13 +21337,121 @@ function portPoint(id, kind){
     }
     // 没有 DOM（节点渲染失败被跳过）或没找到端口时，用节点存储的几何坐标兜底，
     // 让连线仍画在节点附近，而不是落到 (0,0) 或干脆消失。
-    const w = (el?.offsetWidth) || n.w || 260, h = (el?.offsetHeight) || n.h || 160;
-    const nx = Number(n.x) || 0, ny = Number(n.y) || 0;
-    return kind === 'out' ? {x:nx + w, y:ny + h / 2} : {x:nx, y:ny + h / 2};
+    const rect = cachedCanvasNodeRect(n);
+    return kind === 'out'
+        ? {x:rect.x + rect.w, y:rect.y + rect.h / 2}
+        : {x:rect.x, y:rect.y + rect.h / 2};
 }
 function canResolvePort(id){
     // 只跳过“真正的孤儿连线”（端点节点已不存在）；节点存在但暂时没 DOM 的，portPoint 会用几何坐标兜底。
     return Boolean(nodes.find(x => x.id === id));
+}
+function cachedCanvasPortPoint(id, kind){
+    const node = nodes.find(item => item.id === id);
+    if(!node) return {x:0, y:0};
+    const rect = cachedCanvasNodeRect(node);
+    return kind === 'out'
+        ? {x:rect.x + rect.w, y:rect.y + rect.h / 2}
+        : {x:rect.x, y:rect.y + rect.h / 2};
+}
+function canvasPerformancePinnedConnectionIds(){
+    const nodeIds = canvasPerformancePinnedIds();
+    const ids = new Set();
+    connections.forEach(connection => {
+        if(connection.id === hoveredConnectionId
+            || nodeIds.has(connection.from)
+            || nodeIds.has(connection.to)
+            || classicCascadePreviewLinkClasses(connection.id).length){
+            ids.add(connection.id);
+        }
+    });
+    return ids;
+}
+function desiredCanvasPerformanceConnectionTiers(){
+    if(!canvasPerformanceIsActive()) return null;
+    const index = ensureCanvasSpatialIndex();
+    const viewRect = currentWorldViewRect();
+    const bufferRatio = canvasPerformanceRenderMode === 'far'
+        ? 0.08
+        : (canvasPerformanceRenderMode === 'lite' ? 0.20 : 0.45);
+    return CanvasPerformance.desiredConnectionTiers({
+        connections,
+        nodeRects:index?.rects,
+        bufferedRect:CanvasPerformance.expandRect(viewRect, bufferRatio, bufferRatio),
+        renderMode:canvasPerformanceRenderMode,
+        pinnedIds:canvasPerformancePinnedConnectionIds(),
+        padding:32,
+    });
+}
+function renderCanvasPerformanceLinkBatch(segments){
+    if(!segments.length) return;
+    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('class', 'link canvas-perf-link-batch');
+    path.setAttribute('d', segments.map(({a, b}) => linkPathData(a.x, a.y, b.x, b.y)).join(' '));
+    path.dataset.connectionCount = String(segments.length);
+    linksEl.appendChild(path);
+}
+function clearCanvasPerformanceFarLinkCache(){
+    if(!canvasFarLinks) return;
+    canvasFarLinks.hidden = true;
+    canvasFarLinks.style.display = 'none';
+    canvasFarLinks.width = 1;
+    canvasFarLinks.height = 1;
+    delete canvasFarLinks.dataset.connectionCount;
+}
+function renderCanvasPerformanceFarLinkCache(segments){
+    if(!canvasFarLinks || !segments.length || canvasPerformanceRenderMode !== 'far'){
+        clearCanvasPerformanceFarLinkCache();
+        return;
+    }
+    const padding = 48;
+    const xs = [];
+    const ys = [];
+    segments.forEach(({a, b}) => {
+        const dx = Math.max(80, Math.abs(b.x - a.x) * 0.45);
+        xs.push(a.x, b.x, a.x + dx, b.x - dx);
+        ys.push(a.y, b.y);
+    });
+    const left = Math.floor(Math.min(...xs) - padding);
+    const top = Math.floor(Math.min(...ys) - padding);
+    const cssWidth = Math.max(1, Math.ceil(Math.max(...xs) - left + padding));
+    const cssHeight = Math.max(1, Math.ceil(Math.max(...ys) - top + padding));
+    const raster = CanvasPerformance.farLinkRasterSize(
+        cssWidth,
+        cssHeight,
+        viewport.scale,
+        window.devicePixelRatio || 1,
+    );
+    const pixelWidth = raster.width;
+    const pixelHeight = raster.height;
+    canvasFarLinks.hidden = false;
+    canvasFarLinks.style.display = 'block';
+    canvasFarLinks.style.left = `${left}px`;
+    canvasFarLinks.style.top = `${top}px`;
+    canvasFarLinks.style.width = `${cssWidth}px`;
+    canvasFarLinks.style.height = `${cssHeight}px`;
+    canvasFarLinks.width = pixelWidth;
+    canvasFarLinks.height = pixelHeight;
+    canvasFarLinks.dataset.connectionCount = String(segments.length);
+    const context = canvasFarLinks.getContext('2d');
+    if(!context) return;
+    const scaleX = pixelWidth / cssWidth;
+    const scaleY = pixelHeight / cssHeight;
+    context.clearRect(0, 0, pixelWidth, pixelHeight);
+    context.setTransform(scaleX, 0, 0, scaleY, -left * scaleX, -top * scaleY);
+    context.strokeStyle = getComputedStyle(document.body).getPropertyValue('--faint').trim() || '#94a3b8';
+    context.globalAlpha = 0.72;
+    context.lineWidth = 2.4;
+    context.lineCap = 'round';
+    context.beginPath();
+    segments.forEach(({a, b}) => {
+        const dx = Math.max(80, Math.abs(b.x - a.x) * 0.45);
+        context.moveTo(a.x, a.y);
+        context.bezierCurveTo(a.x + dx, a.y, b.x - dx, b.y, b.x, b.y);
+    });
+    context.stroke();
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.globalAlpha = 1;
 }
 function renderLinks(){
     linksEl.innerHTML = '';
@@ -20163,14 +21459,29 @@ function renderLinks(){
     // 先批量读取所有端点坐标（portPoint 里有 getBoundingClientRect），再统一写入 DOM。
     // 否则“读一条 rect → append 一条线”交错进行，每次 append 都让布局失效，下一次读 rect 就触发一次
     // 全量强制重排（layout thrashing），连线一多拖动就掉帧。读写分离后每帧只强制重排一次。
-    const segments = [];
+    const tiers = desiredCanvasPerformanceConnectionTiers();
+    const interactiveSegments = [];
+    const batchSegments = [];
+    const cachedSegments = [];
     connections.forEach(c => {
         // 端点无法解析（节点已删除、或尚未渲染出 DOM）就跳过，否则连线会被画到 (0,0)，
         // 看起来像很多连线都从同一个空白处中转。
         if(!canResolvePort(c.from) || !canResolvePort(c.to)) return;
-        segments.push({c, a:portPoint(c.from, 'out'), b:portPoint(c.to, 'in')});
+        const tier = tiers?.get(c.id) || '';
+        if(tiers && !tier) return;
+        if(tier === 'batch'){
+            batchSegments.push({c, a:cachedCanvasPortPoint(c.from, 'out'), b:cachedCanvasPortPoint(c.to, 'in')});
+            return;
+        }
+        if(tier === 'cached'){
+            cachedSegments.push({c, a:cachedCanvasPortPoint(c.from, 'out'), b:cachedCanvasPortPoint(c.to, 'in')});
+            return;
+        }
+        interactiveSegments.push({c, a:portPoint(c.from, 'out'), b:portPoint(c.to, 'in')});
     });
-    segments.forEach(({c, a, b}) => {
+    renderCanvasPerformanceFarLinkCache(cachedSegments);
+    renderCanvasPerformanceLinkBatch(batchSegments);
+    interactiveSegments.forEach(({c, a, b}) => {
         const relClass = isConnectionSelected(c) ? ' link-active' : '';
         const previewClass = classicCascadePreviewLinkClasses(c.id).map(name => ` ${name}`).join('');
         const visibleLink = pathEl(a.x, a.y, b.x, b.y, `link${relClass}${previewClass}`);
@@ -20244,6 +21555,11 @@ function updateConnectionHoverFromMouse(e){
         setHoveredConnection(button.dataset.connectionId);
         return;
     }
+    if(canvasPerformanceIsActive()){
+        const hit = document.elementFromPoint(e.clientX, e.clientY)?.closest?.('.link-hit');
+        setHoveredConnection(hit?.dataset?.connectionId || '');
+        return;
+    }
     const point = screenToWorld(e.clientX, e.clientY);
     const threshold = Math.max(12, 16 / viewport.scale);
     let bestId = '';
@@ -20262,15 +21578,22 @@ function refreshSelectionVisuals(){
         el.classList.toggle('selected', selected.has(el.dataset.id));
     });
     syncCanvasSelectedImageResolution(nodesEl);
+    scheduleCanvasPerformanceReconcile(true);
     renderLinks();
     renderSelectionHub();
     if(workflowTransferModal?.classList.contains('open')) updateWorkflowTransferMeta();
     scheduleMinimapRender();
 }
+function linkPathData(x1,y1,x2,y2){
+    const dx = Math.max(80, Math.abs(x2 - x1) * .45);
+    return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+}
+function updateLinkPathGeometry(element, a, b){
+    element?.setAttribute?.('d', linkPathData(a.x, a.y, b.x, b.y));
+}
 function pathEl(x1,y1,x2,y2,cls){
     const p = document.createElementNS('http://www.w3.org/2000/svg','path');
-    const dx = Math.max(80, Math.abs(x2 - x1) * .45);
-    p.setAttribute('d', `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`);
+    p.setAttribute('d', linkPathData(x1, y1, x2, y2));
     p.setAttribute('class', cls);
     return p;
 }
@@ -20391,6 +21714,51 @@ function isEditableTarget(target){
     const tag = target?.tagName;
     return tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable || target?.closest?.('select, option');
 }
+canvasViewControls?.addEventListener('mousedown', event => {
+    event.stopPropagation();
+});
+canvasViewControls?.addEventListener('click', event => {
+    event.stopPropagation();
+});
+minimapToggle?.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    setCanvasViewPreference('minimapVisible', !canvasMinimapIsVisible());
+});
+canvasGridSnapToggle?.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    setCanvasViewPreference('gridSnapEnabled', !canvasGridSnapIsEnabled());
+});
+canvasFitViewBtn?.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    closeCanvasZoomMenu();
+    fitAllNodesViewport();
+});
+canvasZoomBtn?.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleCanvasZoomMenu();
+});
+canvasZoomMenu?.addEventListener('click', event => {
+    const button = event.target.closest?.('[data-canvas-zoom]');
+    if(!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setCanvasZoomPercent(Number(button.dataset.canvasZoom));
+    closeCanvasZoomMenu();
+});
+canvasZoomCustomForm?.addEventListener('submit', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    const percent = Math.max(6, Math.min(800, Number(canvasZoomInput?.value) || Math.round(viewport.scale * 100)));
+    setCanvasZoomPercent(percent);
+    closeCanvasZoomMenu();
+});
+document.addEventListener('mousedown', event => {
+    if(!event.target.closest?.('#canvasZoomMenu, #canvasZoomBtn')) closeCanvasZoomMenu();
+});
 minimap?.addEventListener('mousedown', e => {
     if(!canvas || e.button !== 0) return;
     if(e.target.closest?.('#canvasArrangeBtn')) return;
@@ -20415,7 +21783,7 @@ canvasArrangeBtn?.addEventListener('click', e => {
     arrangeSelectedCanvasNodes();
 });
 function isZoomPreviewIgnoredTarget(target){
-    return !!target?.closest?.('#createMenu, #linkCreateMenu, #nodeInputMenu, #nodeOutputMenu, #imageNodeMenu, #favoriteNodesModal, .minimap, #canvasAssetPanel, #assetManagerModal, #workflowTransferModal, #logModal, #llmPromptWorkspaceModal, #promptTemplateModal, #imageEditModal, #outputLightbox');
+    return !!target?.closest?.('#canvasViewControls, #canvasPerformanceToggle, #canvasArrangeBtn, #createMenu, #linkCreateMenu, #nodeInputMenu, #nodeOutputMenu, #imageNodeMenu, #favoriteNodesModal, .minimap, #canvasAssetPanel, #assetManagerModal, #workflowTransferModal, #logModal, #llmPromptWorkspaceModal, #promptTemplateModal, #imageEditModal, #outputLightbox');
 }
 board.addEventListener('mousedown', e => {
     if(!zoomPreviewState || e.button !== 0) return;
@@ -20434,7 +21802,7 @@ board.addEventListener('click', e => {
 }, true);
 function startBoardPan(e, opts={}){
     if(!canvas) return false;
-    if(isEditableTarget(e.target) || e.target.closest?.('#createMenu, #linkCreateMenu, #nodeInputMenu, #nodeOutputMenu, #imageNodeMenu, #favoriteNodesModal, .minimap')) return false;
+    if(isEditableTarget(e.target) || e.target.closest?.('#canvasViewControls, #createMenu, #linkCreateMenu, #nodeInputMenu, #nodeOutputMenu, #imageNodeMenu, #favoriteNodesModal, .minimap')) return false;
     e.preventDefault();
     e.stopPropagation();
     closeCreateMenu();
@@ -20483,6 +21851,7 @@ board.onmousedown = e => {
     startBoardPan(e, {clearSelectionOnClick:true});
 };
 board.addEventListener('mousemove', e => {
+    if(selectDrag) return;
     const point = screenToWorld(e.clientX, e.clientY);
     lastMouseBoard = point;
     updateConnectionHoverFromMouse(e);
@@ -20527,8 +21896,8 @@ board.onwheel = e => {
     const rect = board.getBoundingClientRect();
     viewport.x = e.clientX - rect.left - before.x * viewport.scale;
     viewport.y = e.clientY - rect.top - before.y * viewport.scale;
-    applyViewport();
-    scheduleViewportSave();
+    scheduleCanvasWheelViewportApply();
+    scheduleCanvasWheelViewportSave();
 };
 board.addEventListener('dragover', e => {
     if(e.target.closest?.('.image-node')){

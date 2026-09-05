@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="/static/images/logo.png" type="image/png">
+    <title>图片生成</title>
+    <script>
+        (function(){
+            try {
+                var theme = localStorage.getItem('studio_theme') || localStorage.getItem('canvas_theme') || 'light';
+                if(theme === 'dark') document.documentElement.classList.add('studio-theme-dark', 'theme-dark');
+            } catch(_) {}
+        })();
+    </script>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.22-custom.1.1785863189">
+    <link rel="stylesheet" href="/static/css/image-generation.css?v=2026.08.22-custom.1.1788465736">
+    <link rel="stylesheet" href="/static/css/prompt-template-thumbnails.css?v=2026.08.22-custom.1.1786691114">
+    <script src="/static/vendor/js/lucide.js?v=2026.08.22-custom.1.1785863219"></script>
+    <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
+</head>
+<body>
+    <div class="image-generation-app">
+        <header class="page-header">
+            <div class="page-identity">
+                <h1>图片生成</h1>
+            </div>
+            <div class="page-search" role="search">
+                <i data-lucide="search" aria-hidden="true"></i>
+                <input id="modeSearch" type="search" autocomplete="off" placeholder="搜索编号、名称或用途" aria-label="搜索图片生成模式">
+                <button id="clearModeSearch" class="icon-button" type="button" title="清除搜索" aria-label="清除搜索" hidden><i data-lucide="x"></i></button>
+            </div>
+            <div class="header-actions">
+                <div id="pageStatus" class="page-status" aria-live="polite">正在读取模式…</div>
+                <button id="openAdminManager" class="header-command admin-only" type="button" hidden><i data-lucide="settings-2"></i><span>模式管理</span></button>
+                <button id="exitAdminMode" class="header-command admin-only" type="button" hidden><i data-lucide="log-out"></i><span>退出管理</span></button>
+                <button id="openGlobalHistory" class="header-command" type="button"><i data-lucide="history"></i><span>全部记录</span></button>
+            </div>
+        </header>
+
+        <main class="page-content">
+            <section id="modeHall" class="mode-hall" aria-label="图片生成模式">
+                <section id="recentSection" class="mode-band" hidden>
+                    <div class="band-heading"><h2>最近使用</h2><span>快速回到刚才的模式</span></div>
+                    <div id="recentModes" class="mode-strip" aria-label="最近使用的模式"></div>
+                </section>
+
+                <section id="favoriteSection" class="mode-band" hidden>
+                    <div class="band-heading"><h2>常用模式</h2><span>收藏后固定在这里</span></div>
+                    <div id="favoriteModes" class="mode-strip" aria-label="收藏的模式"></div>
+                </section>
+
+                <section class="catalog-band">
+                    <div class="catalog-toolbar">
+                        <div>
+                            <h2>全部模式</h2>
+                            <span id="modeCount">0 个模式</span>
+                        </div>
+                        <nav id="modeCategories" class="category-tabs" aria-label="模式分类"></nav>
+                    </div>
+                    <div id="modeGrid" class="mode-grid" aria-live="polite"></div>
+                    <div id="modeEmpty" class="mode-empty" hidden>
+                        <i data-lucide="search-x"></i>
+                        <strong>没有找到对应模式</strong>
+                        <span>换个编号、名称或用途试试</span>
+                    </div>
+                </section>
+            </section>
+
+            <section id="modeWorkbench" class="workbench" hidden aria-label="模式工作台">
+                <header class="workbench-header">
+                    <button id="backToModes" class="back-button" type="button" title="返回首页（Esc）" aria-keyshortcuts="Escape"><i data-lucide="arrow-left"></i><span>返回首页</span></button>
+                    <div class="workbench-title">
+                        <span id="workbenchModeNo" class="mode-number">#--</span>
+                        <div><h2 id="workbenchModeName">模式</h2></div>
+                    </div>
+                    <div class="workbench-header-actions">
+                        <div class="result-panel-title"><h3 id="resultPanelTitle">生成记录</h3><span id="resultCount" class="result-count">0 张</span></div>
+                        <div class="result-panel-tools">
+                            <div id="resultManageBar" class="result-manage-bar">
+                                <span id="resultSelectionCount" class="result-selection-count" aria-live="polite"></span>
+                                <button id="selectAllResults" class="secondary-button compact-button" type="button"><i data-lucide="check-check"></i><span>全选</span></button>
+                                <button id="downloadSelectedResults" class="secondary-button compact-button" type="button" disabled><i data-lucide="download"></i><span>下载选中</span></button>
+                                <button id="deleteSelectedResults" class="secondary-button danger-button compact-button" type="button" disabled><i data-lucide="trash-2"></i><span>删除所选</span></button>
+                            </div>
+                            <button id="viewModeExample" class="secondary-button compact-button view-example-button" type="button" title="查看案例" aria-label="查看案例" hidden><i data-lucide="images"></i><span>查看案例</span></button>
+                        </div>
+                        <button id="manageCurrentMode" class="icon-button admin-only" type="button" title="管理当前模式" aria-label="管理当前模式" hidden><i data-lucide="settings-2"></i></button>
+                        <button id="workbenchFavorite" class="icon-button favorite-toggle" type="button" aria-pressed="false" title="收藏模式" aria-label="收藏模式"><i data-lucide="star"></i></button>
+                    </div>
+                </header>
+
+                <div class="workbench-scroll">
+                    <div class="workbench-columns">
+                        <section id="inputPanel" class="input-panel" aria-labelledby="inputPanelTitle">
+                            <div class="panel-heading">
+                                <div class="input-heading-copy">
+                                    <div class="input-heading-line">
+                                        <h3 id="inputPanelTitle">上传图片</h3>
+                                        <p id="inputModeHint" class="input-mode-hint">正在读取上传要求…</p>
+                                    </div>
+                                    <p id="inputModeRoles" class="input-mode-roles" aria-live="polite"></p>
+                                </div>
+                                <span id="draftState" class="draft-state">未修改</span>
+                            </div>
+
+                            <div id="historyReadOnlyNotice" class="history-notice" hidden>
+                                <i data-lucide="history"></i>
+                                <div><strong>正在查看历史输入</strong><span>历史记录不会覆盖本模式保存的草稿。</span></div>
+                                <button id="createDraftFromTask" type="button">从本记录创建草稿</button>
+                                <button id="newGenerationDraft" type="button">新建生成</button>
+                            </div>
+
+                            <div id="modeInputSlots" class="input-slots" aria-label="模式图片槽位"></div>
+                            <input id="slotFilePicker" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+
+                            <div id="modeGuidance" class="mode-guidance" hidden>
+                                <p id="workbenchModeSummary"></p>
+                            </div>
+
+                            <div class="field user-prompt-field">
+                                <div class="user-prompt-label-row">
+                                    <label class="user-prompt-label" for="userPrompt">用户描述</label>
+                                    <div class="user-prompt-label-actions">
+                                        <button id="openPromptLibrary" class="user-prompt-library" type="button" title="打开提示词库" aria-label="打开提示词库"><i data-lucide="library"></i><span>提示词</span></button>
+                                        <button id="openUserPromptEditor" class="user-prompt-expand" type="button" title="放大编辑用户描述" aria-label="放大编辑用户描述"><i data-lucide="maximize-2"></i></button>
+                                    </div>
+                                </div>
+                                <textarea id="userPrompt" rows="3" maxlength="20000" placeholder="补充希望得到的效果、场景、文字或限制"></textarea>
+                            </div>
+
+                            <div class="settings-heading">生成设置</div>
+                            <div class="settings-grid">
+                                <label class="field provider-field"><span>图片平台</span><select id="imageProvider"></select></label>
+                                <label class="field model-field"><span>图片模型</span><select id="imageModel"></select></label>
+                                <label class="field ratio-field"><span>图片比例</span><select id="aspectRatio">
+                                    <option value="1:1">1:1</option>
+                                    <option value="1:4">1:4</option>
+                                    <option value="1:8">1:8</option>
+                                    <option value="2:3">2:3</option>
+                                    <option value="3:2">3:2</option>
+                                    <option value="3:4">3:4</option>
+                                    <option value="4:1">4:1</option>
+                                    <option value="4:3">4:3</option>
+                                    <option value="4:5">4:5</option>
+                                    <option value="5:4">5:4</option>
+                                    <option value="8:1">8:1</option>
+                                    <option value="9:16">9:16</option>
+                                    <option value="16:9">16:9</option>
+                                    <option value="21:9">21:9</option>
+                                    <option value="9:21">9:21</option>
+                                    <option value="source">拉伸适配</option>
+                                    <option value="adaptive">自适应</option>
+                                    <option value="custom">自定义</option>
+                                </select></label>
+                                <label class="field resolution-field"><span>分辨率</span><select id="resolution"><option value="1k">1K</option><option value="2k" selected>2K</option><option value="4k">4K</option><option value="auto">自动</option></select></label>
+                                <label class="field count-field"><span>生成数量</span><select id="imageCount"><option selected>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option></select></label>
+                                <div id="customRatioFields" class="custom-ratio-fields wide" hidden>
+                                    <label class="field"><span>自定义宽</span><input id="customRatioWidth" type="number" min="1" max="999" step="1" inputmode="numeric" placeholder="例如 5"></label>
+                                    <span aria-hidden="true">:</span>
+                                    <label class="field"><span>自定义高</span><input id="customRatioHeight" type="number" min="1" max="999" step="1" inputmode="numeric" placeholder="例如 7"></label>
+                                </div>
+                                <p id="sourceRatioHint" class="ratio-mode-hint wide" hidden></p>
+                            </div>
+
+                            <p id="workbenchStatus" class="workbench-status" aria-live="polite" hidden><i id="workbenchStatusIcon" data-lucide="info" aria-hidden="true"></i><span id="workbenchStatusText"></span></p>
+                            <div class="input-actions">
+                                <button id="saveDraft" class="secondary-button" type="button"><i data-lucide="save"></i><span>保存草稿</span></button>
+                                <button id="generateImages" class="primary-button" type="button"><i data-lucide="sparkles"></i><span>生成图片</span></button>
+                            </div>
+                        </section>
+
+                        <section class="result-panel" aria-labelledby="resultPanelTitle">
+                            <section id="modeExample" class="example-section" aria-label="固定效果示范"></section>
+                            <div id="modeResults" class="mode-results"></div>
+                            <details id="historySection" class="history-drawer">
+                                <summary class="history-heading"><h3>生成批次</h3><span id="historyCount">0 条</span><i data-lucide="chevron-down" aria-hidden="true"></i></summary>
+                                <div id="modeHistory" class="mode-history"></div>
+                            </details>
+                        </section>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <dialog id="globalHistoryDialog" class="history-dialog" aria-labelledby="globalHistoryTitle">
+        <form method="dialog" class="dialog-shell">
+            <header class="dialog-header">
+                <div class="history-dialog-title">
+                    <div class="history-title-line"><h2 id="globalHistoryTitle">全部记录</h2><span id="globalHistoryCount" class="global-history-count" aria-live="polite">0 条</span></div>
+                </div>
+                <div class="dialog-header-actions">
+                    <button id="cleanupTerminalRecords" class="header-command terminal-cleanup-command" type="button" title="清理失败和已删除记录" aria-label="清理失败和已删除记录" disabled><i data-lucide="trash-2"></i><span>清理失败/已删除</span><b id="cleanupTerminalRecordsCount" aria-live="polite">0</b></button>
+                    <button id="openDataManagement" class="header-command history-cleanup-command" type="button" title="管理本机历史数据"><i data-lucide="database"></i><span>数据管理</span></button>
+                    <button class="icon-button" value="cancel" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+                </div>
+            </header>
+            <div class="global-history-filters">
+                <label class="history-name-filter">
+                    <span>搜索记录</span>
+                    <span class="history-search-control">
+                        <i data-lucide="search" aria-hidden="true"></i>
+                        <input id="globalHistoryNameFilter" type="search" autocomplete="off" placeholder="搜索记录名称" aria-label="搜索记录名称">
+                        <button id="clearGlobalHistoryNameFilter" class="history-filter-clear" type="button" title="清除名称搜索" aria-label="清除名称搜索" hidden><i data-lucide="x"></i></button>
+                    </span>
+                </label>
+                <label><span>模式</span><select id="globalHistoryModeFilter"><option value="">全部模式</option></select></label>
+                <label><span>状态</span><select id="globalHistoryStatusFilter"><option value="">全部状态</option><option value="active">进行中</option><option value="succeeded">已完成</option><option value="partial">部分成功</option><option value="unknown">待回补</option><option value="failed">失败</option><option value="cancelled">已取消</option><option value="deleted">已删除</option></select></label>
+                <label class="history-date-filter"><span>日期</span><input id="globalHistoryDateFilter" type="date"></label>
+            </div>
+            <div id="globalHistoryList" class="global-history-list" aria-live="polite"></div>
+        </form>
+    </dialog>
+
+    <dialog id="dataManagementDialog" class="data-management-dialog" aria-labelledby="dataManagementTitle">
+        <div class="data-management-shell">
+            <header class="data-management-header">
+                <div><span>本机历史清理</span><h2 id="dataManagementTitle">删除历史数据</h2></div>
+                <button id="closeDataManagement" class="icon-button" type="button" title="关闭数据管理" aria-label="关闭数据管理"><i data-lucide="x"></i></button>
+            </header>
+            <div class="data-management-body">
+                <fieldset class="cleanup-retention-options">
+                    <legend>选择删除范围</legend>
+                    <label><input type="radio" name="cleanupRetention" value="24h" checked><span>过去24小时</span></label>
+                    <label><input type="radio" name="cleanupRetention" value="7d"><span>过去7天</span></label>
+                    <label><input type="radio" name="cleanupRetention" value="30d"><span>过去30天</span></label>
+                    <label><input type="radio" name="cleanupRetention" value="all"><span>全部时间</span></label>
+                </fieldset>
+                <fieldset class="cleanup-fixed-scope">
+                    <legend>删除内容</legend>
+                    <label><input type="checkbox" checked disabled><span>任务记录</span></label>
+                    <label><input type="checkbox" checked disabled><span>用户上传图</span></label>
+                    <label><input type="checkbox" checked disabled><span>用户生成图</span></label>
+                    <label><input type="checkbox" checked disabled><span>生成失败等无用记录</span></label>
+                    <label><input type="checkbox" checked disabled><span>未被引用的上传图片</span></label>
+                </fieldset>
+                <p class="cleanup-case-protection"><i data-lucide="shield-check" aria-hidden="true"></i><span>固定案例、案例图片及案例配置不会删除</span></p>
+                <p id="dataManagementStatus" class="dialog-status data-management-status" role="alert" aria-live="assertive"></p>
+            </div>
+            <div class="data-management-actions">
+                <button id="cancelDataManagement" class="secondary-button" type="button">取消</button>
+                <button id="requestDataCleanup" class="danger-outline-button" type="button"><i data-lucide="trash-2"></i><span>删除</span></button>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog id="dataCleanupConfirmDialog" class="clear-history-confirm-dialog" aria-labelledby="dataCleanupConfirmTitle" aria-describedby="dataCleanupConfirmDescription">
+        <div class="clear-history-confirm-shell">
+            <div class="clear-history-confirm-icon" aria-hidden="true"><i data-lucide="triangle-alert"></i></div>
+            <div class="clear-history-confirm-copy">
+                <span>删除记录</span>
+                <h2 id="dataCleanupConfirmTitle">删除历史数据？</h2>
+                <p id="dataCleanupConfirmDescription">将删除所选时间范围内的记录，并把无引用图片移入 Windows 回收站。</p>
+                <p id="dataCleanupCutoff" class="data-cleanup-cutoff"></p>
+                <ul class="data-cleanup-confirm-list" aria-label="记录删除与 Windows 回收站图片清单">
+                    <li>任务记录</li>
+                    <li>用户上传图</li>
+                    <li>用户生成图</li>
+                    <li>生成失败等无用记录</li>
+                    <li>未被引用的上传图片</li>
+                </ul>
+                <p class="data-cleanup-protection">固定案例、案例图片及案例配置不会删除。</p>
+                <p class="data-cleanup-warning">记录删除后无法恢复；图片可从 Windows 回收站恢复。</p>
+                <p id="dataCleanupConfirmStatus" class="dialog-status clear-history-confirm-status" role="alert" aria-live="assertive"></p>
+            </div>
+            <div class="clear-history-confirm-actions">
+                <button id="cancelDataCleanupConfirm" class="secondary-button" type="button">取消</button>
+                <button id="confirmDataCleanup" class="danger-confirm-button" type="button"><i data-lucide="trash-2"></i><span>确认删除</span></button>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog id="terminalCleanupConfirmDialog" class="clear-history-confirm-dialog terminal-cleanup-confirm-dialog" aria-labelledby="terminalCleanupConfirmTitle" aria-describedby="terminalCleanupConfirmDescription">
+        <div class="clear-history-confirm-shell">
+            <div class="clear-history-confirm-icon" aria-hidden="true"><i data-lucide="triangle-alert"></i></div>
+            <div class="clear-history-confirm-copy">
+                <span>清理无效记录</span>
+                <h2 id="terminalCleanupConfirmTitle">清理失败和已删除记录？</h2>
+                <p id="terminalCleanupConfirmDescription">这些记录不会再继续生成，可以安全从历史列表移除。</p>
+                <ul class="terminal-cleanup-counts" aria-label="待清理记录统计">
+                    <li><span>失败记录</span><strong id="terminalCleanupFailedCount">0 条</strong></li>
+                    <li><span>已删除记录</span><strong id="terminalCleanupDeletedCount">0 条</strong></li>
+                    <li class="is-total"><span>合计</span><strong id="terminalCleanupTotalCount">0 条</strong></li>
+                </ul>
+                <p class="data-cleanup-protection">成功记录、进行中任务、部分成功和待回补记录不会删除；仍被案例、草稿、画布或收藏引用的图片也不会删除。</p>
+                <p class="data-cleanup-warning">记录删除后无法恢复；无引用图片会在后台移入 Windows 回收站，失败时自动重试。</p>
+                <p id="terminalCleanupConfirmStatus" class="dialog-status clear-history-confirm-status" role="alert" aria-live="assertive"></p>
+            </div>
+            <div class="clear-history-confirm-actions">
+                <button id="cancelTerminalCleanup" class="secondary-button" type="button">取消</button>
+                <button id="confirmTerminalCleanup" class="danger-confirm-button" type="button"><i data-lucide="trash-2"></i><span>确认清理</span></button>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog id="userPromptEditorDialog" class="user-prompt-editor-dialog" aria-labelledby="userPromptEditorTitle">
+        <div class="user-prompt-editor-shell">
+            <header class="user-prompt-editor-header">
+                <div class="user-prompt-editor-title"><h2 id="userPromptEditorTitle">编辑用户描述</h2></div>
+                <div class="user-prompt-editor-actions">
+                    <div id="userPromptEditorFont" class="user-prompt-editor-font" role="group" aria-label="编辑器字号">
+                        <button type="button" data-prompt-font="small" aria-pressed="false">小</button>
+                        <button type="button" data-prompt-font="medium" aria-pressed="true">中</button>
+                        <button type="button" data-prompt-font="large" aria-pressed="false">大</button>
+                        <button type="button" data-prompt-font="xlarge" aria-pressed="false">特大</button>
+                    </div>
+                    <button id="closeUserPromptEditor" class="icon-button" type="button" title="保存并关闭" aria-label="保存并关闭"><i data-lucide="x"></i></button>
+                </div>
+            </header>
+            <div class="user-prompt-editor-body">
+                <textarea id="userPromptEditor" class="user-prompt-editor" maxlength="20000" spellcheck="true" placeholder="补充希望得到的效果、场景、文字或限制"></textarea>
+                <span id="userPromptEditorCount" class="user-prompt-editor-count" aria-live="polite">0 / 20000</span>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog id="imageGenerationPromptDialog" class="image-generation-prompt-dialog" aria-labelledby="imageGenerationPromptTitle">
+        <div class="image-generation-prompt-shell">
+            <header class="image-generation-prompt-head">
+                <div>
+                    <h2 id="imageGenerationPromptTitle">提示词库</h2>
+                    <p id="imageGenerationPromptTarget">双击提示词可替换用户描述</p>
+                </div>
+                <button id="closeImageGenerationPrompt" class="icon-button" type="button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <div class="image-generation-prompt-filter-row">
+                <label class="image-generation-prompt-search-wrap" for="imageGenerationPromptSearch">
+                    <i data-lucide="search" aria-hidden="true"></i>
+                    <input id="imageGenerationPromptSearch" type="search" placeholder="搜索提示词、场景或内容" autocomplete="off">
+                </label>
+                <select id="imageGenerationPromptLibrarySelect" class="image-generation-prompt-library-select" title="选择提示词库" aria-label="选择提示词库"></select>
+            </div>
+            <div id="imageGenerationPromptCats" class="image-generation-prompt-cats" role="tablist" aria-label="提示词分类"></div>
+            <div id="imageGenerationPromptBody" class="image-generation-prompt-body"></div>
+        </div>
+    </dialog>
+
+    <dialog id="imagePreviewDialog" class="preview-dialog" aria-label="图片预览">
+        <form method="dialog" class="preview-shell">
+            <button class="preview-close icon-button" value="cancel" title="关闭预览" aria-label="关闭预览"><i data-lucide="x"></i></button>
+            <div id="previewStage" class="preview-stage" data-preview-mode="single" data-preview-align="fit" data-has-source="false">
+                <div class="preview-panzoom">
+                    <div class="preview-image-frame preview-result-frame"><img id="previewImage" alt="生成图片预览"></div>
+                    <div id="previewSourceLayer" class="preview-image-frame preview-source-layer"><img id="previewSourceImage" alt="参考图预览"></div>
+                    <div class="preview-compare-divider" aria-hidden="true"><span><i data-lucide="move-horizontal"></i></span></div>
+                </div>
+                <input id="previewCompareSlider" class="preview-compare-slider" type="range" min="0" max="100" value="50" aria-label="拖动查看处理前后对比">
+                <button id="previewPrevious" class="preview-nav preview-nav-previous" type="button" title="上一张" aria-label="上一张" hidden><i data-lucide="chevron-left"></i></button>
+                <button id="previewNext" class="preview-nav preview-nav-next" type="button" title="下一张" aria-label="下一张" hidden><i data-lucide="chevron-right"></i></button>
+                <span id="previewCounter" class="preview-counter" aria-live="polite" aria-hidden="true" hidden></span>
+            </div>
+            <div class="preview-toolbar" aria-label="预览工具">
+                <div id="previewAlignModes" class="preview-tool-group preview-align-modes" role="group" aria-label="对齐模式">
+                    <span class="preview-tool-label">对齐模式</span>
+                    <div class="preview-segmented">
+                        <button id="previewResetView" class="preview-reset-button" type="button" title="恢复完整显示" aria-label="重置视图"><i data-lucide="maximize"></i><span>重置视图</span></button>
+                        <button type="button" data-preview-align="stretch" aria-pressed="false">强制铺满</button>
+                        <button type="button" data-preview-align="width" aria-pressed="false">宽度对齐</button>
+                        <button type="button" data-preview-align="height" aria-pressed="false">高度对齐</button>
+                    </div>
+                </div>
+                <div id="previewCompareModes" class="preview-tool-group preview-compare-modes" role="group" aria-label="显示模式" hidden>
+                    <span class="preview-tool-label">显示模式</span>
+                    <div class="preview-segmented">
+                        <button type="button" data-preview-mode="single" aria-pressed="true"><i data-lucide="image"></i><span>生成图</span></button>
+                        <button type="button" data-preview-mode="slider" aria-pressed="false"><i data-lucide="columns-2"></i><span>滑块</span></button>
+                        <button type="button" data-preview-mode="side-by-side" aria-pressed="false"><i data-lucide="panels-top-left"></i><span>左右</span></button>
+                    </div>
+                </div>
+                <div class="preview-tool-actions">
+                    <span id="previewZoomLabel" class="preview-zoom-label">100%</span>
+                    <a id="previewDownload" class="preview-download" href="#" download><i data-lucide="download"></i><span>下载图片</span></a>
+                </div>
+            </div>
+        </form>
+    </dialog>
+
+    <dialog id="modeExampleDialog" class="mode-example-dialog" aria-labelledby="modeExampleDialogTitle">
+        <div class="mode-example-shell">
+            <header class="dialog-header">
+                <div><h2 id="modeExampleDialogTitle">案例预览</h2></div>
+                <button class="icon-button" type="button" data-close-dialog="modeExampleDialog" title="关闭案例" aria-label="关闭案例"><i data-lucide="x"></i></button>
+            </header>
+            <div id="modeExampleDialogContent" class="mode-example-dialog-content"></div>
+        </div>
+    </dialog>
+
+    <dialog id="caseImagePreviewDialog" class="case-image-preview-dialog" aria-label="案例图片大图预览">
+        <div class="case-image-preview-shell">
+            <button id="closeCaseImagePreview" class="icon-button case-image-preview-close" type="button" data-close-dialog="caseImagePreviewDialog" title="关闭大图" aria-label="关闭大图"><i data-lucide="x"></i></button>
+            <img id="caseImagePreview" class="case-image-preview" alt="">
+        </div>
+    </dialog>
+
+    <dialog id="adminPasswordDialog" class="admin-password-dialog" aria-labelledby="adminPasswordTitle">
+        <form id="adminPasswordForm" class="admin-password-shell">
+            <header class="dialog-header">
+                <div><span>本机管理</span><h2 id="adminPasswordTitle">进入图片生成管理</h2></div>
+                <button class="icon-button" type="button" data-close-dialog="adminPasswordDialog" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <label class="field"><span>管理密码</span><input id="adminPassword" type="password" autocomplete="current-password" maxlength="256" required></label>
+            <p id="adminPasswordStatus" class="dialog-status" aria-live="polite"></p>
+            <div class="dialog-actions">
+                <button class="secondary-button" type="button" data-close-dialog="adminPasswordDialog">取消</button>
+                <button id="unlockAdminMode" class="primary-button" type="submit"><i data-lucide="unlock"></i><span>进入管理</span></button>
+            </div>
+        </form>
+    </dialog>
+
+    <dialog id="adminManagerDialog" class="admin-manager-dialog" aria-labelledby="adminManagerTitle">
+        <div class="admin-manager-shell">
+            <header class="dialog-header">
+                <div><span>仅本机管理员可见</span><h2 id="adminManagerTitle">图片生成模式管理</h2></div>
+                <button class="icon-button" type="button" data-close-dialog="adminManagerDialog" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+            </header>
+                <div class="admin-manager-layout">
+                    <aside class="admin-mode-browser">
+                        <div class="admin-mode-browser-heading">
+                            <strong>模式列表</strong>
+                            <button id="createAdminMode" class="primary-button compact-button admin-create-mode-button" type="button"><i data-lucide="plus"></i><span>新增模式</span></button>
+                        </div>
+                        <label class="field"><span>模式</span><select id="adminModeSelect"></select></label>
+                    <div id="adminModeList" class="admin-mode-list" aria-label="全部本机模式"></div>
+                </aside>
+                <section class="admin-mode-editor">
+                    <div id="adminModeEmpty" class="result-empty"><i data-lucide="settings-2"></i><strong>选择一个模式开始管理</strong></div>
+                    <div id="adminModeFields" hidden>
+                        <div class="admin-editor-heading">
+                            <div><span id="adminModeNumber">#--</span><h3 id="adminModeNameHeading">模式</h3></div>
+                            <label class="admin-status-toggle" for="adminModeEnabled">
+                                <input id="adminModeEnabled" type="checkbox" role="switch">
+                                <span class="admin-status-track" aria-hidden="true"><span></span></span>
+                                <strong id="adminModeStatus">已启动</strong>
+                            </label>
+                        </div>
+
+                        <section class="admin-example-section" aria-labelledby="adminExampleTitle">
+                            <div class="admin-section-heading"><div><h3 id="adminExampleTitle">当前示例图</h3></div></div>
+                            <div id="adminExamplePreview" class="admin-example-preview"></div>
+                        </section>
+
+                        <div class="admin-field-grid">
+                            <label class="field admin-name-field"><span>名称</span><input id="adminModeName" maxlength="400"></label>
+                            <label class="field admin-sort-field"><span>排序</span><input id="adminModeSort" type="number" min="0" step="1"></label>
+                            <label class="field"><span>分类</span><input id="adminModeCategory" maxlength="200"></label>
+                            <label class="field full"><span>用途说明</span><textarea id="adminModeDescription" rows="4" maxlength="20000"></textarea></label>
+                            <label id="adminExampleCaptionField" class="field full example-notice-field"><span>注意事项</span><textarea id="adminExampleCaption" rows="3" maxlength="2000"></textarea></label>
+                        </div>
+
+                        <section class="admin-section admin-upload-rules" aria-labelledby="adminUploadRulesTitle">
+                            <div class="admin-section-heading">
+                                <div><h3 id="adminUploadRulesTitle">上传规则</h3><p>数量和图片角色会同步到用户工作台。</p></div>
+                                <p id="adminUploadRulePreview" class="admin-upload-rule-preview" aria-live="polite"></p>
+                            </div>
+                            <div class="admin-upload-rule-counts">
+                                <label class="field"><span>必传张数</span><input id="adminRequiredCount" type="number" min="0" max="6" step="1" inputmode="numeric"></label>
+                                <label class="field"><span>可选张数</span><input id="adminOptionalCount" type="number" min="0" max="6" step="1" inputmode="numeric"></label>
+                            </div>
+                            <div id="adminRequiredSlotFields" class="admin-required-slot-fields" aria-label="必传图片角色"></div>
+                        </section>
+
+                        <section class="admin-section" aria-labelledby="promptManagerTitle">
+                            <div class="admin-section-heading"><div><h3 id="promptManagerTitle">预设提示词</h3></div></div>
+                            <textarea id="adminPromptText" class="admin-prompt-text" rows="10" maxlength="20000" aria-labelledby="promptManagerTitle"></textarea>
+                        </section>
+
+                        <div class="admin-save-bar">
+                            <p id="adminManagerStatus" class="dialog-status" aria-live="polite"></p>
+                            <button id="saveAdminMode" class="primary-button" type="button"><i data-lucide="save"></i><span>保存设置</span></button>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog id="setExampleDialog" class="set-example-dialog" aria-labelledby="setExampleTitle">
+        <form id="setExampleForm" class="set-example-shell">
+            <header class="dialog-header">
+                <div><h2 id="setExampleTitle">设为模式示范</h2></div>
+                <button class="icon-button" type="button" data-close-dialog="setExampleDialog" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+            </header>
+            <div class="set-example-body">
+                <div id="setExamplePreview" class="set-example-preview"></div>
+                <label class="field example-notice-field"><span>注意事项</span><textarea id="exampleCaption" rows="2" maxlength="2000" placeholder="填写普通用户需要注意的事项"></textarea></label>
+                <label class="field"><span>当时的用户描述</span><textarea id="exampleUserPrompt" rows="3" maxlength="20000"></textarea></label>
+                <p id="setExampleStatus" class="dialog-status" aria-live="polite"></p>
+            </div>
+            <div class="dialog-actions set-example-actions"><button class="secondary-button" type="button" data-close-dialog="setExampleDialog">取消</button><button class="primary-button" type="submit">保存固定示范</button></div>
+        </form>
+    </dialog>
+
+    <div id="imageGenerationToast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/static/js/adaptive-image-ratio.js?v=2026.08.22-custom.1.1786809997"></script>
+    <script src="/static/js/output-compare-layout.js?v=2026.08.22-custom.1.1786201771"></script>
+    <script src="/static/js/prompt-template-thumbnails.js?v=2026.08.22-custom.1.1786691716"></script>
+    <script src="/static/js/image-generation.js?v=2026.08.22-custom.1.1788511458"></script>
+</body>
+</html>

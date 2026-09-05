@@ -222,6 +222,7 @@ function snapshotForUndo(){
     return {
         nodes: JSON.parse(JSON.stringify(nodes)),
         connections: JSON.parse(JSON.stringify(canvas?.connections || [])),
+        logs: JSON.parse(JSON.stringify(canvas?.logs || [])),
         selectedId,
         selectedIds: selectedIds.slice(),
         selectedImage: {...selectedImage}
@@ -232,6 +233,7 @@ function restoreUndoSnapshot(snap){
     try {
         nodes = snap.nodes;
         if(canvas) canvas.connections = snap.connections;
+        if(canvas && Array.isArray(snap.logs)) canvas.logs = snap.logs;
         selectedId = snap.selectedId;
         selectedIds = snap.selectedIds;
         selectedImage = snap.selectedImage;
@@ -1380,6 +1382,7 @@ function canvasListUrlForProject(projectId){
 async function backToCanvasList(){
     await waitForSmartPromptLLMSubmissions();
     savePromptDraftForCurrent();
+    if(!await flushSmartCanvasSave()) return;
     window.location.href = canvasListUrlForProject(canvas?.project || sourceProjectId || 'default');
 }
 window.addEventListener('beforeunload', event => {
@@ -6725,12 +6728,28 @@ async function loadCanvas(){
         startCanvasMetaPoll();
     } catch(e) { toast(tr('smart.toastCanvasFail')); }
 }
+async function flushSmartCanvasSave(){
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    const deadline = Date.now() + 8000;
+    while(canvasSyncInFlight && Date.now() < deadline){
+        await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    while(Date.now() < deadline){
+        if(await saveCanvas()) return true;
+        clearTimeout(saveTimer);
+        saveTimer = null;
+        await new Promise(resolve => setTimeout(resolve, 120));
+    }
+    toast(window.StudioI18n?.lang?.() === 'en' ? 'Canvas save failed. Please try again.' : '画布保存失败，请重试');
+    return false;
+}
 function scheduleSave(){
     clearTimeout(saveTimer);
     saveTimer = setTimeout(saveCanvas, 450);
 }
 async function saveCanvas(){
-    if(!canvasId || !canvas) return;
+    if(!canvasId || !canvas) return true;
     savePromptDraftForCurrent();
     nodes.forEach(node => {
         node.images = (node.images || []).map(img => mediaItemForStorage(stripImageGenerationMeta(img)));
@@ -6741,6 +6760,7 @@ async function saveCanvas(){
     canvas.viewport = {...viewport};
     const storageCanvas = canvasForStorage();
     canvasSyncInFlight = true;
+    let saved = false;
     try {
         const res = await fetch(`/api/canvases/${encodeURIComponent(canvasId)}`, {
             method:'PUT',
@@ -6760,6 +6780,7 @@ async function saveCanvas(){
         if(res.ok){
             const data = await res.json();
             if(data.canvas && data.canvas.updated_at) canvas.updated_at = data.canvas.updated_at;
+            saved = true;
         } else if(res.status === 409) {
             // 冲突：别人先保存了。合并对方的状态（节点 id 合并、图片取并集，谁都不丢），
             // 然后用对方最新的 updated_at 作为基底重存，把合并结果落盘——而不是直接覆盖对方。
@@ -6778,9 +6799,12 @@ async function saveCanvas(){
             clearTimeout(saveTimer);
             saveTimer = setTimeout(saveCanvas, 300);
         }
-    } catch(e) {} finally {
+    } catch(e) {
+        console.warn('smart canvas save failed', e);
+    } finally {
         canvasSyncInFlight = false;
     }
+    return saved;
 }
 function imageMetaFromNode(node){
     return {};
@@ -11070,6 +11094,7 @@ function deleteImage(id, imageIndex){
     const node = nodes.find(n => n.id === id);
     if(!node || imageIndex < 0) return;
     pushUndo();
+    const deletedItem = (node.images || [])[imageIndex];
     node.images = (node.images || []).filter((_, index) => index !== imageIndex);
     if(node.images.length <= 1) node.title = 'Image';
     if(selectedImage.nodeId === id) selectedImage = {nodeId:id, index:Math.min(selectedImage.index, node.images.length - 1)};
@@ -18258,7 +18283,13 @@ function finalizeSmartPendingTask(node, taskId, images, kind='image'){
     const additions = cleanHistoryImages((mediaItems || []).map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
         const itemKind = (typeof item === 'object' && item.kind) || kind;
-        return stripImageGenerationMeta(copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:itemKind, generatedResult:true}));
+        return stripImageGenerationMeta(copyMediaSizeFields(item, {
+            url,
+            name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`,
+            kind:itemKind,
+            generatedResult:true,
+            canvas_task_id:taskId
+        }));
     }).filter(item => item.url)).filter(item => {
         const key = `${item.kind || ''}|${item.url || ''}`;
         if(seen.has(key)) return false;

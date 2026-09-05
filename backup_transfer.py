@@ -18,9 +18,16 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence,
 
 
 BACKUP_FORMAT = "infinite-canvas-backup"
-BACKUP_VERSION = 2
+BACKUP_VERSION = 4
+BACKUP_MAIN_IMAGE_VERSION = 3
+BACKUP_DETAIL_VERSION = 2
 BACKUP_LEGACY_VERSION = 1
-BACKUP_SUPPORTED_VERSIONS = {BACKUP_LEGACY_VERSION, BACKUP_VERSION}
+BACKUP_SUPPORTED_VERSIONS = {
+    BACKUP_LEGACY_VERSION,
+    BACKUP_DETAIL_VERSION,
+    BACKUP_MAIN_IMAGE_VERSION,
+    BACKUP_VERSION,
+}
 MAX_ARCHIVE_MEMBERS = 20_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
 
@@ -53,10 +60,28 @@ _SENSITIVE_EXACT = {
     "volcengine_secret_key_env",
 }
 _SENSITIVE_QUERY_RE = re.compile(
-    r"([?&])(?:Rh-Comfy-Auth|Rh-Identify|apiKey|api_key|access_token|refresh_token|token|authorization|secret|password)=[^&#\s\"']*",
+    r"([?&])(?:Rh-Comfy-Auth|Rh-Identify|apiKey|api_key|access_token|refresh_token|token|authorization|secret|password|signature|credential|policy|expires)=[^&#\s\"']*",
     re.I,
 )
+_SENSITIVE_QUERY_EXACT = {
+    "awsaccesskeyid",
+    "expires",
+    "key_pair_id",
+    "ossaccesskeyid",
+    "policy",
+    "rh_comfy_auth",
+    "rh_identify",
+    "security_token",
+}
+_AZURE_SAS_QUERY_KEYS = {
+    "se", "si", "sig", "sip", "skoid", "sks", "skt", "sktid", "ske",
+    "skv", "sp", "spr", "sr", "srt", "ss", "st", "sv",
+}
+_HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>，。；！？）】}]+", re.I)
 _DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
+_IMAGE_GENERATION_MEDIA_URL_RE = re.compile(
+    r"^/assets/image-generation/media/[a-f0-9]{2}/([a-f0-9]{64})\.(?:png|jpg|webp|gif)$"
+)
 _RUNTIME_KEYS = {
     "llmTask",
     "backgroundTask",
@@ -85,9 +110,27 @@ _RUNTIME_KEYS = {
     "data_url",
 }
 
+_IMAGE_GENERATION_PRIVATE_KEYS = _RUNTIME_KEYS | {
+    "path",
+    "runtime_id",
+    "submission_id",
+    "submission_ids",
+    "config_fingerprint",
+    "background_task",
+    "candidate_tasks",
+    "client_id",
+    "cancel_requested",
+}
+
 
 def _normalized_key(key: Any) -> str:
-    return re.sub(r"[-\s]+", "_", str(key or "").strip().lower())
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key or "").strip())
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower()
+
+
+_IMAGE_GENERATION_PRIVATE_KEYS_NORMALIZED = {
+    _normalized_key(key) for key in _IMAGE_GENERATION_PRIVATE_KEYS
+}
 
 
 def is_sensitive_config_key(key: Any) -> bool:
@@ -108,10 +151,49 @@ def is_sensitive_config_key(key: Any) -> bool:
     )
 
 
+def _sanitize_http_url(value: str) -> str:
+    """Strip temporary authentication from one HTTP(S) URL."""
+    text = str(value)
+    trailing = ""
+    while text and text[-1] in ").,;]}，。；！？）】":
+        trailing = text[-1] + trailing
+        text = text[:-1]
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        if parsed.scheme.lower() in {"http", "https"} and parsed.query:
+            query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            normalized_query_keys = {_normalized_key(key) for key, _item in query_items}
+            has_azure_sas = "sig" in normalized_query_keys and bool(
+                normalized_query_keys & {"se", "sp", "sv", "sr"}
+            )
+            safe_query = []
+            for key, item in query_items:
+                normalized = _normalized_key(key)
+                if (
+                    normalized in _SENSITIVE_QUERY_EXACT
+                    or (has_azure_sas and normalized in _AZURE_SAS_QUERY_KEYS)
+                    or normalized.startswith(("x_amz_", "x_goog_"))
+                    or any(part in normalized for part in (
+                        "api_key", "authorization", "credential", "signature", "token"
+                    ))
+                ):
+                    continue
+                safe_query.append((key, item))
+            text = urllib.parse.urlunsplit(parsed._replace(
+                query=urllib.parse.urlencode(safe_query, doseq=True)
+            ))
+    except ValueError:
+        pass
+    return text.rstrip("?&") + trailing
+
+
 def _sanitize_string(value: str) -> str:
     text = str(value)
     if text.lower().startswith("data:"):
         return ""
+    # Error and warning fields often embed a signed download URL inside prose.
+    # Sanitize each URL independently while preserving the surrounding message.
+    text = _HTTP_URL_RE.sub(lambda match: _sanitize_http_url(match.group(0)), text)
     text = _SENSITIVE_QUERY_RE.sub(r"\1", text)
     text = text.replace("?&", "?")
     return text.rstrip("?&")
@@ -218,6 +300,77 @@ def collect_detail_page_media_urls(task: Mapping[str, Any]) -> List[str]:
     return result
 
 
+def collect_main_image_media_urls(task: Mapping[str, Any]) -> List[str]:
+    """Collect media from the main-image task fields shared with detail-page records."""
+    return collect_detail_page_media_urls(task)
+
+
+def collect_image_generation_media_urls(
+    *,
+    task: Mapping[str, Any] | None = None,
+    modes: Sequence[Mapping[str, Any]] | None = None,
+    drafts: Sequence[Mapping[str, Any]] | None = None,
+) -> List[str]:
+    """Collect only media-bearing image-generation fields, never prompt text."""
+    result: List[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, Mapping):
+            add(value.get("url") or value.get("image_url") or value.get("value"))
+            return
+        if not isinstance(value, str):
+            return
+        url = value.strip()
+        if not url or url in seen or not url.startswith((
+            "/assets/", "/output/", "/api/storage-files/",
+            "/static/image-generation-examples/", "http://", "https://",
+        )):
+            return
+        seen.add(url)
+        result.append(url)
+
+    if isinstance(task, Mapping):
+        for item in task.get("inputs") or []:
+            if isinstance(item, Mapping):
+                add(item.get("media") or item)
+        for candidate in task.get("candidates") or []:
+            if not isinstance(candidate, Mapping):
+                continue
+            add(candidate.get("image"))
+            result_value = candidate.get("result")
+            if isinstance(result_value, Mapping):
+                add(result_value.get("image"))
+                add(result_value.get("image_url"))
+                for image in result_value.get("images") or []:
+                    add(image)
+    for mode in modes or []:
+        if not isinstance(mode, Mapping):
+            continue
+        example = mode.get("example")
+        if not isinstance(example, Mapping):
+            continue
+        for item in example.get("input_media") or []:
+            if isinstance(item, Mapping):
+                add(item.get("media") or item)
+        add(example.get("output_media"))
+    for draft in drafts or []:
+        if not isinstance(draft, Mapping):
+            continue
+        for item in draft.get("inputs") or []:
+            if isinstance(item, Mapping):
+                add(item.get("media") or item)
+    return result
+
+
+def image_generation_media_id_from_url(value: Any) -> str:
+    """Return the content hash encoded by one canonical image-generation CAS URL."""
+    if not isinstance(value, str):
+        return ""
+    match = _IMAGE_GENERATION_MEDIA_URL_RE.fullmatch(value.strip())
+    return match.group(1) if match else ""
+
+
 def rewrite_nested_values(value: Any, mapping: Mapping[str, str]) -> Any:
     """Recursively rewrite exact string values without mutating ``value``."""
     if isinstance(value, str):
@@ -310,6 +463,42 @@ def _clear_runtime_state(value: Any) -> Any:
             continue
         clean[str(key)] = _clear_runtime_state(item)
     return clean
+
+
+def _clear_image_generation_private_state(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_clear_image_generation_private_state(item) for item in value]
+    if not isinstance(value, Mapping):
+        return copy.deepcopy(value)
+    clean: Dict[str, Any] = {}
+    for key, item in value.items():
+        normalized = _normalized_key(key)
+        if normalized in _IMAGE_GENERATION_PRIVATE_KEYS_NORMALIZED:
+            continue
+        if normalized == "running":
+            clean[key] = False
+            continue
+        clean[str(key)] = _clear_image_generation_private_state(item)
+    return clean
+
+
+def _clear_image_generation_task_identifiers(value: Any) -> Any:
+    """Remove provider task identifiers while retaining local task ``id`` fields."""
+    if isinstance(value, list):
+        return [_clear_image_generation_task_identifiers(item) for item in value]
+    if not isinstance(value, Mapping):
+        return copy.deepcopy(value)
+    clean: Dict[str, Any] = {}
+    for key, item in value.items():
+        if _normalized_key(key) in {"task_id", "upstream_task_id"}:
+            continue
+        clean[str(key)] = _clear_image_generation_task_identifiers(item)
+    return clean
+
+
+def prepare_exported_image_generation_config(value: Any) -> Any:
+    """Strip secrets, local paths and runtime-only fields from mode configuration."""
+    return _clear_image_generation_private_state(sanitize_portable_config(value))
 
 
 def prepare_exported_canvas(canvas: Mapping[str, Any], include_logs: bool = False) -> Dict[str, Any]:
@@ -436,6 +625,197 @@ def prepare_imported_detail_task(
     return clean
 
 
+def prepare_exported_main_image_task(task: Mapping[str, Any]) -> Dict[str, Any]:
+    """Create a portable, credential-free main-image history snapshot."""
+    if not isinstance(task, Mapping) or str(task.get("type") or "") != "main-image":
+        raise ValueError("主图任务数据无效")
+    settings = task.get("settings")
+    if settings is not None and not isinstance(settings, Mapping):
+        raise ValueError("主图任务设置无效")
+    screens = task.get("screens")
+    if screens is not None and not isinstance(screens, list):
+        raise ValueError("主图结果数据无效")
+    if len(screens or []) > 12:
+        raise ValueError("主图数量异常")
+    for screen in screens or []:
+        if not isinstance(screen, Mapping):
+            raise ValueError("主图结果数据无效")
+        candidates = screen.get("candidates")
+        if candidates is not None and not isinstance(candidates, list):
+            raise ValueError("主图候选数据无效")
+        if len(candidates or []) > 1000 or any(not isinstance(item, Mapping) for item in candidates or []):
+            raise ValueError("主图候选数据无效")
+    clean = sanitize_portable_config(copy.deepcopy(dict(task)))
+    if not isinstance(clean, dict):
+        raise ValueError("主图任务数据无效")
+    for key in (
+        "runtime_id", "submission_id", "submission_ids", "config_fingerprint",
+        "background_task", "screen_tasks", "client_id",
+    ):
+        clean.pop(key, None)
+    return _clear_runtime_state(clean)
+
+
+def prepare_imported_main_image_task(
+    task: Mapping[str, Any],
+    *,
+    new_task_id: str,
+    new_submission_id: str,
+    new_group_no: int,
+    runtime_id: str,
+    imported_at: float,
+    url_mapping: Mapping[str, str] | None = None,
+    provider_id_map: Mapping[str, str] | None = None,
+) -> Dict[str, Any]:
+    """Import main-image history as an independent, non-resumable task copy."""
+    source = prepare_exported_main_image_task(task)
+    source_task_id = str(source.get("id") or "")
+    try:
+        source_group_no = int(source.get("group_no") or 0)
+    except (TypeError, ValueError):
+        source_group_no = 0
+    clean = rewrite_nested_values(source, url_mapping or {})
+    clean = rewrite_provider_references(clean, provider_id_map or {})
+    source_status = str(clean.get("status") or "")
+    if source_status in _DETAIL_ACTIVE_STATUSES:
+        clean["status"] = "interrupted"
+        clean["error"] = "任务在导出时仍在运行，导入后已安全中断；不会自动恢复或回补上游任务"
+    for screen in clean.get("screens") or []:
+        if not isinstance(screen, MutableMapping):
+            continue
+        if str(screen.get("status") or "") in _DETAIL_ACTIVE_STATUSES:
+            screen["status"] = "interrupted"
+            screen["error"] = "导入时已中断"
+        for candidate in screen.get("candidates") or []:
+            if not isinstance(candidate, MutableMapping):
+                continue
+            if str(candidate.get("status") or "") in _DETAIL_ACTIVE_STATUSES:
+                candidate["status"] = "interrupted"
+                candidate["error"] = "导入时已中断，不能回补源设备的上游任务"
+                candidate.pop("upstream_task_id", None)
+                candidate.pop("provider_snapshot", None)
+                candidate.pop("query_attempts", None)
+                candidate.pop("last_query_at", None)
+    clean.update({
+        "id": str(new_task_id),
+        "type": "main-image",
+        "group_no": int(new_group_no),
+        "runtime_id": str(runtime_id or ""),
+        "submission_id": str(new_submission_id),
+        "submission_ids": [str(new_submission_id)],
+        "config_fingerprint": "",
+        "cancel_requested": False,
+        "imported_at": float(imported_at),
+        "imported_from": {"task_id": source_task_id, "group_no": source_group_no},
+    })
+    return clean
+
+
+_IMAGE_GENERATION_ACTIVE_STATUSES = {"queued", "submitting", "generating", "recovering"}
+_MAX_IMAGE_GENERATION_BACKUP_CANDIDATES = 1000
+
+
+def prepare_exported_image_generation_task(task: Mapping[str, Any]) -> Dict[str, Any]:
+    """Create a prompt-complete but runtime/credential-free task snapshot."""
+    if not isinstance(task, Mapping) or str(task.get("type") or "") != "image-generation":
+        raise ValueError("图片生成任务数据无效")
+    inputs = task.get("inputs")
+    candidates = task.get("candidates")
+    if inputs is not None and (
+        not isinstance(inputs, list) or len(inputs) > 6
+        or any(not isinstance(item, Mapping) for item in inputs)
+    ):
+        raise ValueError("图片生成输入数据无效")
+    if candidates is not None and (
+        not isinstance(candidates, list)
+        or len(candidates) > _MAX_IMAGE_GENERATION_BACKUP_CANDIDATES
+        or any(not isinstance(item, Mapping) for item in candidates)
+    ):
+        raise ValueError("图片生成候选数据无效")
+    clean = sanitize_portable_config(copy.deepcopy(dict(task)))
+    if not isinstance(clean, dict):
+        raise ValueError("图片生成任务数据无效")
+    for key in (
+        "runtime_id", "submission_id", "submission_ids", "config_fingerprint",
+        "background_task", "candidate_tasks", "client_id", "cancel_requested",
+    ):
+        clean.pop(key, None)
+    clean = _clear_image_generation_task_identifiers(
+        _clear_image_generation_private_state(clean)
+    )
+    for candidate in clean.get("candidates") or []:
+        if not isinstance(candidate, MutableMapping):
+            continue
+    return clean
+
+
+def prepare_imported_image_generation_task(
+    task: Mapping[str, Any],
+    *,
+    new_task_id: str,
+    new_submission_id: str,
+    new_group_no: int,
+    imported_at: float,
+    url_mapping: Mapping[str, str] | None = None,
+    provider_id_map: Mapping[str, str] | None = None,
+    mode_id_map: Mapping[str, str] | None = None,
+    version_id_map: Mapping[str, str] | None = None,
+    candidate_id_map: Mapping[str, str] | None = None,
+) -> Dict[str, Any]:
+    """Import one independent task copy which can never resume source work."""
+    source = prepare_exported_image_generation_task(task)
+    source_task_id = str(source.get("id") or "")
+    try:
+        source_group_no = int(source.get("group_no") or 0)
+    except (TypeError, ValueError):
+        source_group_no = 0
+    clean = rewrite_nested_values(source, url_mapping or {})
+    clean = rewrite_provider_references(clean, provider_id_map or {})
+    old_mode_id = str(clean.get("mode_id") or "")
+    clean["mode_id"] = str((mode_id_map or {}).get(old_mode_id, old_mode_id))
+    old_version_id = str(clean.get("prompt_version_id") or "")
+    if version_id_map is not None and old_version_id:
+        mapped_version_id = str(version_id_map.get(old_version_id) or "")
+        if mapped_version_id:
+            clean["prompt_version_id"] = mapped_version_id
+        else:
+            clean.pop("prompt_version_id", None)
+    if str(clean.get("status") or "") in _IMAGE_GENERATION_ACTIVE_STATUSES:
+        clean["status"] = "interrupted"
+        clean["error_summary"] = "任务在导出时仍在运行，导入后已安全中断；不会自动查询或重新生成"
+    for candidate in clean.get("candidates") or []:
+        if not isinstance(candidate, MutableMapping):
+            continue
+        old_candidate_id = str(candidate.get("id") or "")
+        if candidate_id_map is not None and old_candidate_id:
+            candidate["id"] = str(candidate_id_map.get(old_candidate_id) or old_candidate_id)
+        regenerated_from = str(candidate.get("regenerated_from") or "")
+        if candidate_id_map is not None and regenerated_from:
+            mapped_regenerated_from = str(candidate_id_map.get(regenerated_from) or "")
+            if mapped_regenerated_from:
+                candidate["regenerated_from"] = mapped_regenerated_from
+            else:
+                candidate.pop("regenerated_from", None)
+        if str(candidate.get("status") or "") in _IMAGE_GENERATION_ACTIVE_STATUSES:
+            candidate["status"] = "interrupted"
+            candidate["error"] = "导入时已中断，不会继续源设备的上游任务"
+        for key in ("upstream_task_id", "provider_snapshot", "query_attempts", "last_query_at"):
+            candidate.pop(key, None)
+    clean.update({
+        "id": str(new_task_id),
+        "type": "image-generation",
+        "group_no": int(new_group_no),
+        "submission_id": str(new_submission_id),
+        "submission_ids": [str(new_submission_id)],
+        "runtime_id": "",
+        "config_fingerprint": "",
+        "cancel_requested": False,
+        "imported_at": float(imported_at),
+        "imported_from": {"task_id": source_task_id, "group_no": source_group_no},
+    })
+    return clean
+
+
 def is_safe_archive_member(name: Any) -> bool:
     text = str(name or "")
     if not text or "\x00" in text or len(text) > 500:
@@ -452,6 +832,7 @@ def is_safe_archive_member(name: Any) -> bool:
 def validate_archive_infos(infos: Iterable[Any]) -> Dict[str, int]:
     count = 0
     total = 0
+    member_names: set[str] = set()
     for info in infos:
         count += 1
         if count > MAX_ARCHIVE_MEMBERS:
@@ -459,6 +840,10 @@ def validate_archive_infos(infos: Iterable[Any]) -> Dict[str, int]:
         name = getattr(info, "filename", "")
         if not is_safe_archive_member(name):
             raise ValueError(f"备份包含不安全路径：{name}")
+        canonical_name = str(name).replace("\\", "/")
+        if canonical_name in member_names:
+            raise ValueError(f"备份包含重复文件：{canonical_name}")
+        member_names.add(canonical_name)
         size = max(0, int(getattr(info, "file_size", 0) or 0))
         total += size
         if total > MAX_ARCHIVE_UNCOMPRESSED_BYTES:

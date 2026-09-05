@@ -169,6 +169,7 @@ class DetailPageAsyncProviderTests(unittest.TestCase):
                     self.assertEqual(details["task_id"], "task-edit-1")
 
             with patch.object(main, "get_api_provider", return_value=provider), \
+                    patch.object(main, "provider_env_key_value", return_value="unit-test-key"), \
                     patch.object(main.httpx, "AsyncClient", return_value=client), \
                     patch.object(main, "output_file_from_url", return_value=None):
                 image, raw = await main.generate_ai_image(
@@ -199,7 +200,9 @@ class DetailPageAsyncProviderTests(unittest.TestCase):
                 [{"data": {"task_id": "task-generation-1", "status": "SUCCESS", "data": {"data": [{"url": "https://files.example/generated.png"}]}}}],
                 events,
             )
-            with patch.object(main, "get_api_provider", return_value=provider), patch.object(main.httpx, "AsyncClient", return_value=client):
+            with patch.object(main, "get_api_provider", return_value=provider), \
+                    patch.object(main, "provider_env_key_value", return_value="unit-test-key"), \
+                    patch.object(main.httpx, "AsyncClient", return_value=client):
                 await main.generate_ai_image(
                     "prompt", "1024x1024", "auto", "gpt-image-2", [], "custom-api",
                     async_task_observer=AsyncMock(),
@@ -226,6 +229,7 @@ class DetailPageAsyncProviderTests(unittest.TestCase):
                 events.append(event)
 
             with patch.object(main, "get_api_provider", return_value=provider), \
+                    patch.object(main, "provider_env_key_value", return_value="unit-test-key"), \
                     patch.object(main.httpx, "AsyncClient", return_value=client), \
                     patch.object(main.asyncio, "sleep", new=AsyncMock()):
                 image, _raw = await main.generate_ai_image(
@@ -247,13 +251,14 @@ class DetailPageAsyncProviderTests(unittest.TestCase):
                     return FakeResponse({"data": {"task_id": "task-timeout-1", "status": "IN_PROGRESS"}})
 
             client = InProgressClient()
-            with self.assertRaises(main.DetailPageAsyncTaskUnknown) as captured:
-                await main.wait_for_detail_page_image_task(
-                    client,
-                    "task-timeout-1",
-                    {"id": "custom-api", "base_url": "https://ai.comfly.org"},
-                    timeout=0.01,
-                )
+            with patch.object(main, "provider_env_key_value", return_value="unit-test-key"):
+                with self.assertRaises(main.DetailPageAsyncTaskUnknown) as captured:
+                    await main.wait_for_detail_page_image_task(
+                        client,
+                        "task-timeout-1",
+                        {"id": "custom-api", "base_url": "https://ai.comfly.org"},
+                        timeout=0.01,
+                    )
             return captured.exception
 
         error = asyncio.run(scenario())
@@ -277,7 +282,7 @@ class DetailPageCandidateRecoveryTests(unittest.TestCase):
             record["screens"] = main.detail_page_screen_records([{"screen_no": 1, "prompt": "prompt"}])
             main.CANVAS_TASKS[task_id] = record
 
-            async def fake_build(_request, async_task_observer=None):
+            async def fake_build(_request, async_task_observer=None, **_kwargs):
                 candidate = main.CANVAS_TASKS[task_id]["screens"][0]["candidates"][0]
                 self.assertEqual(candidate["status"], "submitting")
                 await async_task_observer("submitted", {
@@ -295,17 +300,29 @@ class DetailPageCandidateRecoveryTests(unittest.TestCase):
                 return {"images": ["/output/recovered.png"], "task_id": "task-42"}
 
             with patch.object(main, "DETAIL_PAGE_TASK_DIR", folder), \
-                    patch.object(main, "build_online_image_result", side_effect=fake_build):
+                    patch.object(main, "detail_page_async_snapshot_for_request", return_value={
+                        "id": "custom-api", "base_url": "https://ai.comfly.org",
+                        "protocol": "openai", "image_async_enabled": True,
+                        "image_task_endpoint": "/v1/images/tasks/{task_id}", "model": "gpt-image-2",
+                    }), \
+                    patch.object(main, "build_online_image_result", side_effect=fake_build), \
+                    patch.object(main, "annotate_one_click_history_record") as annotate:
                 await main.run_detail_page_screen(task_id, request_payload, 1)
-            return main.CANVAS_TASKS[task_id]
+            return main.CANVAS_TASKS[task_id], annotate.call_args
 
         with tempfile.TemporaryDirectory() as folder:
-            task = asyncio.run(scenario(folder))
+            task, annotation = asyncio.run(scenario(folder))
         candidate = task["screens"][0]["candidates"][0]
         self.assertEqual(candidate["status"], "succeeded")
         self.assertEqual(candidate["upstream_task_id"], "task-42")
         self.assertEqual(candidate["query_attempts"], 2)
         self.assertEqual(task["screens"][0]["status"], "succeeded")
+        self.assertEqual(annotation.args[1], "detail-page")
+        self.assertEqual(annotation.args[3], {
+            "source_type": "detail-page",
+            "source_task_id": "detail_page_async_test_candidate",
+            "source_screen_no": 1,
+        })
 
     def test_unknown_candidate_with_task_id_can_be_refilled_by_query_only(self):
         async def scenario(folder):
@@ -333,17 +350,23 @@ class DetailPageCandidateRecoveryTests(unittest.TestCase):
                     "data": [{"url": "https://files.example/refilled.png"}],
                 }},
             }], [])
+            recovered_media = {
+                "id": "a" * 64,
+                "url": "/assets/image-generation/media/aa/" + "a" * 64 + ".png",
+            }
             with patch.object(main, "DETAIL_PAGE_TASK_DIR", folder), \
+                    patch.object(main, "provider_env_key_value", return_value="unit-test-key"), \
                     patch.object(main.httpx, "AsyncClient", return_value=client), \
-                    patch.object(main, "save_ai_image_to_output", AsyncMock(return_value="/output/refilled.png")):
+                    patch.object(main, "save_ai_image_to_media", AsyncMock(return_value=recovered_media)), \
+                    patch.object(main, "image_generation_adopt_result", AsyncMock(return_value=recovered_media)):
                 await main.run_detail_page_candidate_recovery(task_id, 1, "candidate_unknown")
-            return main.CANVAS_TASKS[task_id], client.calls
+            return main.CANVAS_TASKS[task_id], client.calls, recovered_media
 
         with tempfile.TemporaryDirectory() as folder:
-            task, calls = asyncio.run(scenario(folder))
+            task, calls, recovered_media = asyncio.run(scenario(folder))
         candidate = task["screens"][0]["candidates"][0]
         self.assertEqual(candidate["status"], "succeeded")
-        self.assertEqual(candidate["image_url"], "/output/refilled.png")
+        self.assertEqual(candidate["image_url"], recovered_media["url"])
         self.assertTrue(calls)
         self.assertTrue(all(method == "GET" for method, _url, _kwargs in calls))
 

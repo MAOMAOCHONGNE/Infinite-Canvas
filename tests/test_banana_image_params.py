@@ -56,7 +56,7 @@ class BananaImageParameterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_banana_forwards_extreme_explicit_aspect_ratios(self):
         provider = {"id": "comfly", "name": "Comfly", "base_url": "https://ai.example.test", "protocol": "openai"}
-        for ratio in ("1:8", "4:1", "8:1"):
+        for ratio in ("1:8", "4:1", "8:1", "21:9", "9:21"):
             with self.subTest(ratio=ratio):
                 body = await self.call_image(provider, "nano-banana-2", aspect_ratio=ratio)
                 self.assertEqual(body["aspect_ratio"], ratio)

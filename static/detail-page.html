@@ -14,7 +14,7 @@
         })();
     </script>
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.08.22-custom.1.1785863189">
-    <link rel="stylesheet" href="/static/css/detail-page.css?v=2026.08.22-custom.1.1787486400">
+    <link rel="stylesheet" href="/static/css/detail-page.css?v=2026.08.22-custom.1.1788417523">
     <script src="/static/vendor/js/lucide.js?v=2026.08.22-custom.1.1785863219"></script>
     <script src="/static/js/theme.js?v=2026.08.22-custom.1.1785863206"></script>
     <script src="/static/js/model-config.js?v=2026.08.22-custom.1.1786809997"></script>
@@ -318,8 +318,18 @@
         <button id="previewNextScreen" class="preview-nav preview-nav-next" type="button" title="下一屏" aria-label="下一屏"><i data-lucide="chevron-right"></i></button>
         <span id="previewName"></span>
     </div>
+    <dialog id="deleteTaskDialog" class="delete-task-dialog" aria-labelledby="deleteTaskDialogTitle" aria-describedby="deleteTaskDialogDescription">
+        <form method="dialog" class="delete-task-dialog-form">
+            <h2 id="deleteTaskDialogTitle">删除当前详情页分组？</h2>
+            <p id="deleteTaskDialogDescription">分组记录会立即删除，图片将在后台清理；仍被其他分组使用的图片会保留。</p>
+            <footer class="delete-task-dialog-actions">
+                <button id="deleteTaskCancelBtn" type="button">取消</button>
+                <button id="deleteTaskConfirmBtn" class="danger" type="button">删除分组</button>
+            </footer>
+        </form>
+    </dialog>
     <div id="detailToast" class="detail-toast" role="status" aria-live="polite"></div>
 
-    <script src="/static/js/detail-page.js?v=2026.08.22-custom.1.1787486400"></script>
+    <script src="/static/js/detail-page.js?v=2026.08.22-custom.1.1788546920"></script>
 </body>
 </html>

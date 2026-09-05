@@ -2,6 +2,7 @@ import copy
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -112,6 +113,14 @@ class BackupTransferTests(unittest.TestCase):
             with self.subTest(unsafe=unsafe):
                 self.assertFalse(backup_transfer.is_safe_archive_member(unsafe))
         self.assertTrue(backup_transfer.is_safe_archive_member("resources/ab/file.png"))
+
+    def test_archive_member_validation_rejects_duplicate_member_names(self):
+        infos = [
+            SimpleNamespace(filename="resources/ab/file.png", file_size=3),
+            SimpleNamespace(filename="resources/ab/file.png", file_size=3),
+        ]
+        with self.assertRaisesRegex(ValueError, "重复"):
+            backup_transfer.validate_archive_infos(infos)
 
     def test_import_name_is_predictable_without_overwriting(self):
         names = {"A项目", "A项目（导入）", "A项目（导入 2）"}
