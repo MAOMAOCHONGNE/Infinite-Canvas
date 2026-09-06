@@ -1020,6 +1020,104 @@ class ImageGenerationBackupServiceTests(unittest.TestCase):
         self.assertNotEqual(first_task["group_no"], second_task["group_no"])
         self.assertEqual(first_task["mode_id"], second_task["mode_id"])
 
+    def test_main_image_only_cas_media_round_trip_with_modes_and_legacy_shared_scope(self):
+        main_only_media = self.media.adopt_bytes(
+            _png_bytes((72, 126, 214, 255)), "main-only.png",
+        )
+        source = {
+            "id": "main-image-cas-only",
+            "type": "main-image",
+            "group_no": 32,
+            "status": "succeeded",
+            "settings": {},
+            "screens": [{
+                "screen_no": 1,
+                "status": "succeeded",
+                "result": {
+                    "image_url": main_only_media["url"],
+                    "images": [main_only_media["url"]],
+                    "image_items": [{"url": main_only_media["url"]}],
+                },
+                "candidates": [],
+            }],
+        }
+        main.CANVAS_TASKS[source["id"]] = source
+        archive_path, _ = main.build_backup_archive(main.BackupExportRequest(
+            main_image_task_ids=[source["id"]],
+            include_image_generation_modes=True,
+            include_assets=True,
+        ))
+        self.addCleanup(lambda: os.path.exists(archive_path) and os.remove(archive_path))
+
+        # Reproduce backups exported before the cross-module CAS fix: the URL is
+        # canonical CAS, but the archive member and scope were labelled shared.
+        legacy_archive = Path(self.temp.name) / "legacy-shared-main-image-cas.zip"
+        with zipfile.ZipFile(archive_path, "r") as source_archive:
+            members = {info.filename: source_archive.read(info) for info in source_archive.infolist()}
+        manifest = json.loads(members["manifest.json"])
+        resource = next(
+            item for item in manifest["resources"]
+            if item.get("url") == main_only_media["url"]
+        )
+        original_member = resource["file"]
+        self.assertEqual(resource["scope"], "image-generation")
+        self.assertTrue(original_member.startswith("image-generation-resources/"))
+        extension = Path(original_member).suffix
+        legacy_member = (
+            f"resources/{main_only_media['id'][:2]}/{main_only_media['id']}{extension}"
+        )
+        members[legacy_member] = members[original_member]
+        resource["file"] = legacy_member
+        resource["scope"] = "shared"
+        members["manifest.json"] = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+        with zipfile.ZipFile(legacy_archive, "w", zipfile.ZIP_DEFLATED) as target:
+            for name, content in members.items():
+                target.writestr(name, content)
+
+        invalid_archive = Path(self.temp.name) / "invalid-main-image-cas-identity.zip"
+        invalid_members = dict(members)
+        invalid_manifest = json.loads(invalid_members["manifest.json"])
+        invalid_resource = next(
+            item for item in invalid_manifest["resources"]
+            if item.get("url") == main_only_media["url"]
+        )
+        replacement = _png_bytes((214, 72, 126, 255))
+        invalid_resource["sha256"] = __import__("hashlib").sha256(replacement).hexdigest()
+        invalid_resource["size"] = len(replacement)
+        invalid_members[legacy_member] = replacement
+        invalid_members["manifest.json"] = json.dumps(
+            invalid_manifest, ensure_ascii=False,
+        ).encode("utf-8")
+        with zipfile.ZipFile(invalid_archive, "w", zipfile.ZIP_DEFLATED) as target:
+            for name, content in invalid_members.items():
+                target.writestr(name, content)
+        before_invalid = self.store.snapshot_backup_state()
+        with self.assertRaisesRegex(ValueError, "媒体标识"):
+            main.import_backup_path(str(invalid_archive), {
+                "main_image_task_ids": [source["id"]],
+                "include_image_generation_modes": True,
+                "include_assets": True,
+            })
+        self.assertEqual(self.store.snapshot_backup_state(), before_invalid)
+        self.assertEqual(set(main.CANVAS_TASKS), {source["id"]})
+
+        Path(main_only_media["path"]).unlink()
+        result = main.import_backup_path(str(legacy_archive), {
+            "main_image_task_ids": [source["id"]],
+            "include_image_generation_modes": True,
+            "include_assets": True,
+        })
+
+        self.assertEqual(result["main_images"], 1)
+        imported = next(
+            task for task in main.CANVAS_TASKS.values()
+            if task.get("type") == "main-image" and task.get("id") != source["id"]
+        )
+        restored_url = imported["screens"][0]["result"]["image_url"]
+        self.assertEqual(restored_url, main_only_media["url"])
+        self.assertNotIn("backup_resources", restored_url)
+        self.assertIsNotNone(self.media.media_record(main_only_media["id"]))
+
     def test_import_without_media_marks_task_example_and_draft_missing(self):
         archive_path = self.export_image_generation(include_assets=False)
         result = main.import_backup_path(archive_path, {

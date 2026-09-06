@@ -28603,10 +28603,15 @@ def build_backup_archive(payload):
                         urls.append(url)
                 written_resources = {}
                 for url in urls:
-                    parsed_url = urllib.parse.urlsplit(str(url))
-                    is_image_generation_cas = (
-                        url in image_generation_urls
-                        and parsed_url.path.startswith("/assets/image-generation/media/")
+                    # Storage identity comes from the canonical URL itself, not
+                    # from the feature that currently references it. Main-image,
+                    # detail-page and canvas records may legitimately retain CAS
+                    # media after the original image-generation record is gone.
+                    is_image_generation_cas = bool(
+                        backup_io.image_generation_media_id_from_url(url)
+                    )
+                    is_image_generation_resource = (
+                        url in image_generation_urls or is_image_generation_cas
                     )
                     path = None if is_image_generation_cas else output_file_from_url(url)
                     content = None
@@ -28639,7 +28644,10 @@ def build_backup_archive(payload):
                         continue
                     member = written_resources.get(digest)
                     if member is None:
-                        prefix = "image-generation-resources" if url in image_generation_urls else "resources"
+                        prefix = (
+                            "image-generation-resources"
+                            if is_image_generation_resource else "resources"
+                        )
                         member = f"{prefix}/{digest[:2]}/{digest}{extension}"
                         if content is None:
                             archive.write(path, member)
@@ -28651,7 +28659,10 @@ def build_backup_archive(payload):
                         "file": member,
                         "sha256": digest,
                         "size": size,
-                        "scope": "image-generation" if url in image_generation_urls else "shared",
+                        "scope": (
+                            "image-generation"
+                            if is_image_generation_resource else "shared"
+                        ),
                     })
             if provider_configs:
                 manifest["configs"]["providers"] = "configs/providers.json"
@@ -29264,6 +29275,15 @@ def import_backup_path(path, selection):
             )
             referenced_urls.update(config_urls)
             image_generation_referenced_urls.update(config_urls)
+            # A canonical CAS URL keeps its storage identity even when only a
+            # different feature (for example one-click main image) references
+            # it. Keep this separate from semantic image-generation references
+            # so missing-media counts remain scoped to the selected package.
+            image_generation_resource_urls = set(image_generation_referenced_urls)
+            image_generation_resource_urls.update(
+                url for url in referenced_urls
+                if backup_io.image_generation_media_id_from_url(url)
+            )
             current_detail_count = backup_detail_page_count()
             if current_detail_count + len(detail_sources) > DETAIL_PAGE_BACKUP_MAX_RECORDS:
                 remaining = max(0, DETAIL_PAGE_BACKUP_MAX_RECORDS - current_detail_count)
@@ -29289,7 +29309,7 @@ def import_backup_path(path, selection):
                 backup_prevalidate_image_generation(image_generation_bundle, image_generation_sources)
             if selection.get("include_assets", True) or image_generation_bundle["modes"]:
                 backup_validate_selected_resources(
-                    archive, manifest, referenced_urls, image_generation_referenced_urls,
+                    archive, manifest, referenced_urls, image_generation_resource_urls,
                 )
 
             created_resource_paths = []
@@ -29345,11 +29365,12 @@ def import_backup_path(path, selection):
                         url = str(item.get("url") or "") if isinstance(item, dict) else ""
                         if not isinstance(item, dict) or url not in referenced_urls:
                             continue
-                        if url in image_generation_referenced_urls:
+                        if url in image_generation_resource_urls:
                             restored_url = backup_adopt_image_generation_resource(
                                 archive, item, created_resource_paths,
                             )
-                            unavailable_image_generation_urls.discard(url)
+                            if url in image_generation_referenced_urls:
+                                unavailable_image_generation_urls.discard(url)
                         else:
                             restored_url = backup_copy_resource(archive, item, created_resource_paths)
                         url_mapping[url] = restored_url
