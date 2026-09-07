@@ -148,6 +148,47 @@ class UpdaterCancellationTests(unittest.TestCase):
             self.assertFalse(any((data_dir / "update_backups").glob("*")))
             safe_static.assert_not_called()
 
+    def test_restore_local_examples_keeps_cases_without_overwriting_new_static(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            backup_static = root_path / "backup" / "static"
+            live_static = root_path / "live" / "static"
+            old_case = backup_static / "image-generation-examples" / "mode-a" / "case.png"
+            old_case.parent.mkdir(parents=True)
+            old_case.write_bytes(b"local-case")
+            (backup_static / "index.html").write_text("old-index", encoding="utf-8")
+            live_static.mkdir(parents=True)
+            (live_static / "index.html").write_text("new-index", encoding="utf-8")
+
+            restored = main.restore_local_image_generation_examples(
+                str(backup_static), str(live_static)
+            )
+
+            self.assertEqual(restored, 1)
+            self.assertEqual(
+                (live_static / "image-generation-examples" / "mode-a" / "case.png").read_bytes(),
+                b"local-case",
+            )
+            self.assertEqual((live_static / "index.html").read_text(encoding="utf-8"), "new-index")
+
+    def test_restore_local_examples_does_not_overwrite_new_case(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            backup_static = root_path / "backup" / "static"
+            live_static = root_path / "live" / "static"
+            relative = Path("image-generation-examples") / "mode-a" / "case.png"
+            (backup_static / relative).parent.mkdir(parents=True)
+            (backup_static / relative).write_bytes(b"old-case")
+            (live_static / relative).parent.mkdir(parents=True)
+            (live_static / relative).write_bytes(b"new-case")
+
+            restored = main.restore_local_image_generation_examples(
+                str(backup_static), str(live_static)
+            )
+
+            self.assertEqual(restored, 0)
+            self.assertEqual((live_static / relative).read_bytes(), b"new-case")
+
 
 if __name__ == "__main__":
     unittest.main()

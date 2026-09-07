@@ -106,6 +106,8 @@ $include = @(
     "tests/test_media_preview_dedup.py",
     "tests/test_storage_cleanup.py",
     "tests/test_storage_cleanup_transaction.py",
+    "tests/test_updater_cancel.py",
+    "tests/test_access_log_filter.py",
     "tests/one_click_delete_ui.test.cjs",
     "tools/build-release-candidate.ps1",
     "tools/export-image-generation-presets.py",

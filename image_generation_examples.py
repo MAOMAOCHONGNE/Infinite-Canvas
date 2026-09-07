@@ -208,7 +208,7 @@ class ImageGenerationExampleOptimizer:
         self.state_path = state_path or (self.root / "data" / "image_generation_example_resize.json")
         self._lock = threading.RLock()
 
-    def _static_path_from_url(self, url: str) -> Path:
+    def _static_path_from_url(self, url: str, *, require_exists: bool = True) -> Path:
         if not isinstance(url, str):
             raise ValueError("案例媒体地址无效")
         parsed = urlsplit(url)
@@ -219,19 +219,55 @@ class ImageGenerationExampleOptimizer:
         relative = parsed.path[len(EXAMPLE_STATIC_PREFIX):]
         if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
             raise ValueError("案例媒体地址无效")
-        path = _safe_under(self.static_root / relative, self.static_root, require_exists=True)
-        if path.suffix.lower() not in _IMAGE_EXTENSIONS or not path.is_file():
+        path = _safe_under(
+            self.static_root / relative,
+            self.static_root,
+            require_exists=require_exists,
+        )
+        if path.suffix.lower() not in _IMAGE_EXTENSIONS:
             raise ValueError("案例媒体文件无效")
+        if path.exists() and not path.is_file():
+            raise ValueError("案例媒体文件无效")
+        if require_exists and not path.is_file():
+            raise ValueError("案例媒体不存在")
         return path
+
+    @staticmethod
+    def _missing_static_cas_media_id(media: Mapping[str, Any], path: Path) -> str:
+        """Return a CAS id only when every recorded static identity agrees."""
+        url_media_id = path.stem
+        if not _HASH.fullmatch(url_media_id):
+            raise ValueError("案例静态媒体文件名不是有效哈希")
+        identities: list[str] = []
+        for key in ("id", "media_id", "sha256"):
+            value = media.get(key)
+            if value in (None, ""):
+                continue
+            if not isinstance(value, str) or not _HASH.fullmatch(value):
+                raise ValueError("案例媒体身份无效")
+            identities.append(value)
+        primary_id = media.get("id") or media.get("media_id")
+        if not isinstance(primary_id, str) or not _HASH.fullmatch(primary_id):
+            raise ValueError("案例媒体缺少可验证身份")
+        if any(value != url_media_id for value in identities):
+            raise ValueError("案例媒体身份与静态地址不一致")
+        return url_media_id
 
     def _source_bytes(self, media: Mapping[str, Any]) -> tuple[bytes, Path | None]:
         url = media.get("url")
         if isinstance(url, str) and url.startswith(EXAMPLE_STATIC_PREFIX):
-            path = self._static_path_from_url(url)
+            path = self._static_path_from_url(url, require_exists=False)
+            if path.is_file():
+                try:
+                    return path.read_bytes(), path
+                except OSError as exc:
+                    raise ValueError("案例媒体不可读") from exc
+            media_id = self._missing_static_cas_media_id(media, path)
             try:
-                return path.read_bytes(), path
-            except OSError as exc:
-                raise ValueError("案例媒体不可读") from exc
+                content, _extension, _media_type = self.media_store.read_bytes(media_id)
+            except ValueError as exc:
+                raise ValueError("案例静态副本与原始素材均不存在或不可读") from exc
+            return content, None
         media_id = media.get("id") or media.get("media_id")
         if not (isinstance(media_id, str) and _HASH.fullmatch(media_id)):
             media_id = self._legacy_cas_media_id(url)

@@ -138,10 +138,14 @@ class QuietAccessLogFilter(logging.Filter):
         if len(args) >= 3:
             path = str(args[2]).split("?", 1)[0]
             status = int(args[4]) if len(args) >= 5 and str(args[4]).isdigit() else 0
+            if status == 304:
+                return False
             quiet_dynamic = any(path.startswith(prefix) and path.endswith("/meta") for prefix in QUIET_ACCESS_PREFIXES)
             if (path in QUIET_ACCESS_PATHS or quiet_dynamic) and status < 400:
                 return False
         message = record.getMessage()
+        if '" 304' in message:
+            return False
         if any(f'"GET {path}' in message and '" 200' in message for path in QUIET_ACCESS_PATHS):
             return False
         if 'GET /api/canvases/' in message and '/meta' in message and '" 200' in message:
@@ -298,7 +302,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.09.07-custom.7"
+APP_VERSION = "2026.09.07-custom.8"
 CUSTOM_MAINTAINER = "qianse70"
 CUSTOM_UPDATE_BRANCH = "my-custom"
 UPSTREAM_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
@@ -3786,6 +3790,49 @@ def write_update_backup_manifest(backup_dir: str, payload: Dict[str, Any]) -> No
 def count_regular_files(path: str) -> int:
     return sum(len(files) for _, _, files in os.walk(path)) if os.path.isdir(path) else 0
 
+def restore_local_image_generation_examples(backup_static_dir: str, static_dir: str) -> int:
+    """Merge missing local example media back after replacing application static files."""
+    backup_static_abs = os.path.abspath(backup_static_dir)
+    static_abs = os.path.abspath(static_dir)
+    source_root = os.path.abspath(
+        os.path.join(backup_static_abs, "image-generation-examples")
+    )
+    target_root = os.path.abspath(
+        os.path.join(static_abs, "image-generation-examples")
+    )
+    if (
+        os.path.commonpath([backup_static_abs, source_root]) != backup_static_abs
+        or os.path.commonpath([static_abs, target_root]) != static_abs
+    ):
+        raise ValueError("图片生成案例恢复路径不安全")
+    if not os.path.isdir(source_root) or os.path.islink(source_root):
+        return 0
+    restored = 0
+    for dirpath, dirnames, filenames in os.walk(source_root):
+        dirnames[:] = [
+            name for name in dirnames
+            if not os.path.islink(os.path.join(dirpath, name))
+        ]
+        relative_dir = os.path.relpath(dirpath, source_root)
+        destination_dir = target_root if relative_dir == "." else os.path.abspath(
+            os.path.join(target_root, relative_dir)
+        )
+        if os.path.commonpath([target_root, destination_dir]) != target_root:
+            raise ValueError("图片生成案例恢复路径不安全")
+        for filename in filenames:
+            source = os.path.join(dirpath, filename)
+            if os.path.islink(source) or not os.path.isfile(source):
+                continue
+            destination = os.path.abspath(os.path.join(destination_dir, filename))
+            if os.path.commonpath([target_root, destination]) != target_root:
+                raise ValueError("图片生成案例恢复路径不安全")
+            if os.path.exists(destination):
+                continue
+            os.makedirs(destination_dir, exist_ok=True)
+            shutil.copy2(source, destination)
+            restored += 1
+    return restored
+
 def prune_update_backups(keep_names: Optional[set] = None) -> List[str]:
     """Keep the newest restore points while never deleting an active protected point."""
     keep_names = {str(name) for name in (keep_names or set()) if str(name)}
@@ -3977,6 +4024,11 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             shutil.rmtree(static_dir)
         try:
             shutil.copytree(staged_static_dir, static_dir)
+            restored_examples = restore_local_image_generation_examples(
+                backup_static_dir, static_dir
+            )
+            if restored_examples:
+                print(f"[update] 已保留本地图片生成案例文件：{restored_examples} 个")
         except Exception:
             if os.path.isdir(static_dir):
                 shutil.rmtree(static_dir, ignore_errors=True)

@@ -193,6 +193,116 @@ class ImageGenerationExampleOptimizerTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual(store.modes[mode["id"]]["example"], mode["example"])
 
+    def test_migration_recovers_missing_static_output_from_matching_cas(self):
+        source = self.media.adopt_bytes(image_bytes(), "source.png", "image/png")
+        original_path = Path(source["path"])
+        original_bytes = original_path.read_bytes()
+        optimizer = ImageGenerationExampleOptimizer(self.root, FakeModeStore([]), self.media)
+        static_record, _created = optimizer.materialize_media("mode-output", source)
+        static_path = self.root / static_record["url"].removeprefix("/")
+        static_path.unlink()
+        mode = mode_with_example("mode-output", {
+            "id": "case-output",
+            "input_media": [],
+            "output_media": static_record,
+        })
+        store = FakeModeStore([mode])
+        optimizer = ImageGenerationExampleOptimizer(self.root, store, self.media)
+
+        result = optimizer.migrate_all()
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["failed"], [])
+        recovered_url = store.modes["mode-output"]["example"]["output_media"]["url"]
+        recovered_path = self.root / recovered_url.removeprefix("/")
+        self.assertTrue(recovered_path.is_file())
+        self.assertEqual(original_path.read_bytes(), original_bytes)
+
+    def test_migration_recovers_missing_static_input_from_matching_cas(self):
+        source = self.media.adopt_bytes(image_bytes(color=(90, 50, 10)), "input.png", "image/png")
+        optimizer = ImageGenerationExampleOptimizer(self.root, FakeModeStore([]), self.media)
+        static_record, _created = optimizer.materialize_media("mode-input", source)
+        static_path = self.root / static_record["url"].removeprefix("/")
+        static_path.unlink()
+        mode = mode_with_example("mode-input", {
+            "id": "case-input",
+            "input_media": [{"media": static_record}],
+            "output_media": source,
+        })
+        store = FakeModeStore([mode])
+        optimizer = ImageGenerationExampleOptimizer(self.root, store, self.media)
+
+        result = optimizer.migrate_all()
+
+        self.assertEqual(result["status"], "succeeded")
+        recovered = store.modes["mode-input"]["example"]["input_media"][0]["media"]
+        recovered_path = self.root / recovered["url"].removeprefix("/")
+        self.assertTrue(recovered_path.is_file())
+
+    def test_missing_static_media_identity_conflict_fails_closed(self):
+        source = self.media.adopt_bytes(image_bytes(), "source.png", "image/png")
+        optimizer = ImageGenerationExampleOptimizer(self.root, FakeModeStore([]), self.media)
+        static_record, _created = optimizer.materialize_media("mode-conflict", source)
+        static_path = self.root / static_record["url"].removeprefix("/")
+        static_path.unlink()
+        conflicting = copy.deepcopy(static_record)
+        conflicting["sha256"] = "f" * 64
+        mode = mode_with_example("mode-conflict", {
+            "id": "case-conflict",
+            "input_media": [],
+            "output_media": conflicting,
+        })
+        store = FakeModeStore([mode])
+        optimizer = ImageGenerationExampleOptimizer(self.root, store, self.media)
+
+        result = optimizer.migrate_all()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(store.modes["mode-conflict"]["example"], mode["example"])
+        self.assertFalse(static_path.exists())
+
+    def test_missing_static_and_cas_media_fails_closed(self):
+        digest = "a" * 64
+        media = {
+            "id": digest,
+            "sha256": digest,
+            "url": f"/static/image-generation-examples/missing/{digest}.png",
+        }
+        mode = mode_with_example("mode-missing", {
+            "id": "case-missing",
+            "input_media": [],
+            "output_media": media,
+        })
+        store = FakeModeStore([mode])
+        optimizer = ImageGenerationExampleOptimizer(self.root, store, self.media)
+
+        result = optimizer.migrate_all()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(store.modes["mode-missing"]["example"], mode["example"])
+
+    def test_missing_static_url_validation_fails_closed(self):
+        digest = "a" * 64
+        invalid_urls = [
+            f"/static/image-generation-examples/mode/{digest}.png?cache=1",
+            f"/static/image-generation-examples/../{digest}.png",
+            "/static/image-generation-examples/mode/not-a-hash.png",
+        ]
+        for index, url in enumerate(invalid_urls):
+            media = {"id": digest, "sha256": digest, "url": url}
+            mode = mode_with_example(
+                f"invalid-static-{index}",
+                {"id": f"case-static-{index}", "input_media": [], "output_media": media},
+            )
+            store = FakeModeStore([mode])
+            optimizer = ImageGenerationExampleOptimizer(self.root, store, self.media)
+
+            result = optimizer.migrate_all()
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(store.modes[mode["id"]]["example"], mode["example"])
+
     def test_invalid_case_fails_closed_without_replacing_reference(self):
         mode = mode_with_example("broken", {
             "id": "case-broken",
