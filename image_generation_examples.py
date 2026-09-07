@@ -233,6 +233,8 @@ class ImageGenerationExampleOptimizer:
             except OSError as exc:
                 raise ValueError("案例媒体不可读") from exc
         media_id = media.get("id") or media.get("media_id")
+        if not (isinstance(media_id, str) and _HASH.fullmatch(media_id)):
+            media_id = self._legacy_cas_media_id(url)
         if isinstance(media_id, str) and _HASH.fullmatch(media_id):
             try:
                 content, _extension, _media_type = self.media_store.read_bytes(media_id)
@@ -240,6 +242,37 @@ class ImageGenerationExampleOptimizer:
                 raise ValueError("案例素材不存在或不可读") from exc
             return content, None
         raise ValueError("案例媒体必须是受控 CAS 或静态地址")
+
+    @staticmethod
+    def _legacy_cas_media_id(url: Any) -> str | None:
+        """Extract a CAS identity from the pre-identity media URL format.
+
+        Older backups stored only ``/assets/image-generation/media/<shard>/<hash>.<ext>``
+        in an example record. The URL is still local and content-addressed, so it
+        is safe to recover the identity after validating the shard, hash and
+        extension. External URLs, query strings and malformed paths are rejected.
+        """
+        if not isinstance(url, str):
+            return None
+        parsed = urlsplit(url)
+        if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+            return None
+        prefix = "/assets/image-generation/media/"
+        if not parsed.path.startswith(prefix):
+            return None
+        relative = parsed.path[len(prefix):]
+        parts = relative.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
+        filename = Path(parts[1])
+        media_id = filename.stem
+        if not _HASH.fullmatch(media_id):
+            return None
+        if parts[0].lower() != media_id[:2]:
+            return None
+        if filename.suffix.lower() not in _IMAGE_EXTENSIONS:
+            return None
+        return media_id
 
     def _iter_static_images(self):
         if not self.static_root.exists():

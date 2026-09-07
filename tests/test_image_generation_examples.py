@@ -136,6 +136,63 @@ class ImageGenerationExampleOptimizerTests(unittest.TestCase):
         self.assertEqual(len(list((self.root / "static" / "image-generation-examples").rglob("*.png"))), 1)
         self.assertTrue((self.root / "data" / "image_generation_example_resize.json").is_file())
 
+    def test_migration_accepts_legacy_cas_url_without_media_identity(self):
+        source = self.media.adopt_bytes(image_bytes(size=(1800, 1200)), "source.png", "image/png")
+        legacy_example = {
+            "id": "legacy-case",
+            "input_media": [],
+            "output_media": {"url": source["url"]},
+        }
+        store = FakeModeStore([mode_with_example("legacy-mode", legacy_example)])
+        optimizer = ImageGenerationExampleOptimizer(self.root, store, self.media)
+
+        result = optimizer.migrate_all()
+
+        self.assertEqual(result["status"], "succeeded")
+        migrated = store.modes["legacy-mode"]["example"]["output_media"]
+        self.assertTrue(migrated["url"].startswith("/static/image-generation-examples/"))
+        self.assertEqual(migrated["id"], migrated["sha256"])
+        migrated_path = self.root / "static" / migrated["url"].removeprefix("/static/")
+        self.assertEqual(hashlib.sha256(migrated_path.read_bytes()).hexdigest(), migrated["id"])
+
+    def test_migration_accepts_legacy_cas_url_for_input_media(self):
+        source = self.media.adopt_bytes(image_bytes(size=(32, 24)), "source.png", "image/png")
+        legacy_example = {
+            "id": "legacy-input-case",
+            "input_media": [{"media": {"url": source["url"]}}],
+            "output_media": source,
+        }
+        store = FakeModeStore([mode_with_example("legacy-input-mode", legacy_example)])
+        optimizer = ImageGenerationExampleOptimizer(self.root, store, self.media)
+
+        result = optimizer.migrate_all()
+
+        self.assertEqual(result["status"], "succeeded")
+        migrated = store.modes["legacy-input-mode"]["example"]["input_media"][0]["media"]
+        self.assertTrue(migrated["url"].startswith("/static/image-generation-examples/"))
+        self.assertEqual(migrated["id"], migrated["sha256"])
+
+    def test_legacy_cas_url_validation_fails_closed(self):
+        digest = "a" * 64
+        invalid_urls = [
+            f"https://example.com/assets/image-generation/media/aa/{digest}.png",
+            f"/assets/image-generation/media/bb/{digest}.png",
+            f"/assets/image-generation/media/aa/{digest}.png?cache=1",
+            f"/assets/image-generation/media/aa/{digest}.txt",
+        ]
+        for index, url in enumerate(invalid_urls):
+            mode = mode_with_example(
+                f"invalid-legacy-{index}",
+                {"id": f"case-{index}", "input_media": [], "output_media": {"url": url}},
+            )
+            store = FakeModeStore([mode])
+            optimizer = ImageGenerationExampleOptimizer(self.root, store, self.media)
+
+            result = optimizer.migrate_all()
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(store.modes[mode["id"]]["example"], mode["example"])
+
     def test_invalid_case_fails_closed_without_replacing_reference(self):
         mode = mode_with_example("broken", {
             "id": "case-broken",
